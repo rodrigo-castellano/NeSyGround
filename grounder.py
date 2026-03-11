@@ -347,14 +347,12 @@ class BCGrounder(Grounder):
         rule_success: Tensor,       # [B, S, K_r]
         top_ridx: Tensor,           # [B, S]
         sub_rule_idx: Tensor,       # [B, S, K_r]
-        *,
-        init_gbody: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """Flatten S×K children and compact to [B, S_out, ...].
 
-        Args:
-            init_gbody: If True (depth 0), use rule body as grounding_body
-                        and sub_rule_idx as top_ridx for rule children.
+        Auto-detects whether grounding body / rule index need initialization
+        (first depth) or propagation (subsequent depths) based on sentinel
+        values: top_ridx == -1 means uninitialized.
 
         Returns:
             new_gbody: [B, S_out, M, 3]
@@ -379,13 +377,25 @@ class BCGrounder(Grounder):
         flat_f_ridx = top_ridx.unsqueeze(2).expand(B, S_in, K_f).reshape(B, n_f)
 
         # Flatten rule results: [B, S, K_r, ...] → [B, S*K_r, ...]
-        if init_gbody:
-            # Depth 0: grounding_body = substituted rule body (first M atoms of goals)
-            flat_r_gbody = rule_goals[:, :, :, :M, :].reshape(B, n_r, M, 3)
-            flat_r_ridx = sub_rule_idx.reshape(B, n_r)
-        else:
-            flat_r_gbody = rule_gbody.reshape(B, n_r, M, 3)
-            flat_r_ridx = top_ridx.unsqueeze(2).expand(B, S_in, K_r).reshape(B, n_r)
+        # Auto-detect init vs propagate: top_ridx == -1 means uninitialized (first depth)
+        ridx_uninit = (top_ridx == -1)  # [B, S]
+        ridx_uninit_exp = ridx_uninit.unsqueeze(2).expand(B, S_in, K_r)  # [B, S, K_r]
+
+        # gbody: init from rule body (first M goals) or propagate existing
+        rule_body_as_gbody = rule_goals[:, :, :, :M, :].reshape(B, n_r, M, 3)
+        propagated_gbody = rule_gbody.reshape(B, n_r, M, 3)
+        flat_r_gbody = torch.where(
+            ridx_uninit_exp.reshape(B, n_r, 1, 1).expand_as(rule_body_as_gbody),
+            rule_body_as_gbody,
+            propagated_gbody,
+        )
+
+        # ridx: init from matched rule or propagate parent's
+        flat_r_ridx = torch.where(
+            ridx_uninit_exp.reshape(B, n_r),
+            sub_rule_idx.reshape(B, n_r),
+            top_ridx.unsqueeze(2).expand(B, S_in, K_r).reshape(B, n_r),
+        )
 
         flat_r_goals = rule_goals.reshape(B, n_r, G, 3)
         flat_r_valid = rule_success.reshape(B, n_r)
@@ -462,20 +472,14 @@ class BCGrounder(Grounder):
         top_ridx: Tensor,           # [B, S]
         state_valid: Tensor,        # [B, S]
         next_var_indices: Tensor,   # [B]
-        *,
-        skip_facts: bool = False,
-        init_gbody: bool = False,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Single backward-chaining proof step: SELECT → RESOLVE → PACK.
 
-        Args:
-            grounding_body:   [B, S, M, 3]
-            proof_goals:      [B, S, G, 3]
-            top_ridx:         [B, S]
-            state_valid:      [B, S]
-            next_var_indices: [B]
-            skip_facts:       zero out fact results (depth 0)
-            init_gbody:       use rule body as grounding body (depth 0)
+        Behaviour adapts automatically based on tensor content:
+        - When grounding_body is all-padding (first depth), fact resolution is
+          suppressed and rule body atoms initialize the grounding body.
+        - When grounding_body has been initialized (subsequent depths), both fact
+          and rule resolution run, and the existing grounding body is propagated.
 
         Returns:
             new_gbody:     [B, S_out, M, 3]
@@ -486,6 +490,7 @@ class BCGrounder(Grounder):
         """
         B = proof_goals.shape[0]
         S = proof_goals.shape[1]
+        pad = self.padding_idx
 
         # Stage 1: SELECT
         queries, remaining, active_mask = self._select(proof_goals)
@@ -494,8 +499,10 @@ class BCGrounder(Grounder):
         fact_goals, fact_gbody, fact_success = self._resolve_facts(
             queries, remaining, grounding_body, state_valid, active_mask)
 
-        if skip_facts:
-            fact_success = torch.zeros_like(fact_success)
+        # Auto-skip facts when gbody is uninitialized (all padding = first depth).
+        # Fact matches at depth 0 have no rule body and would waste output slots.
+        gbody_uninit = (grounding_body[:, :, 0, 0] == pad)  # [B, S]
+        fact_success = fact_success & ~gbody_uninit.unsqueeze(-1)
 
         # Stage 3: RESOLVE RULES
         rule_goals, rule_gbody, rule_success, sub_rule_idx = self._resolve_rules(
@@ -512,7 +519,7 @@ class BCGrounder(Grounder):
         new_gbody, new_goals, new_ridx, new_valid = self._pack_step(
             fact_goals, fact_gbody, fact_success,
             rule_goals, rule_gbody, rule_success,
-            top_ridx, sub_rule_idx, init_gbody=init_gbody)
+            top_ridx, sub_rule_idx)
 
         # Update next_var_indices
         V = self.max_vars_per_rule
@@ -564,11 +571,14 @@ class BCGrounder(Grounder):
         collected_ridx = queries.new_zeros(B, tG)
 
         # --- Initialize proof state: 1 state per query ---
-        grounding_body = queries.new_zeros(B, 1, M, 3)
+        # gbody = all padding (sentinel: not yet initialized)
+        # top_ridx = -1 (sentinel: not yet assigned a rule)
+        grounding_body = torch.full(
+            (B, 1, M, 3), pad, dtype=torch.long, device=dev)
         proof_goals = torch.full(
             (B, 1, G, 3), pad, dtype=torch.long, device=dev)
         proof_goals[:, 0, 0, :] = queries
-        top_ridx = queries.new_zeros(B, 1, dtype=torch.long)
+        top_ridx = torch.full((B, 1), -1, dtype=torch.long, device=dev)
         state_valid = query_mask.unsqueeze(1)  # [B, 1]
         next_var_indices = torch.full((B,), E, dtype=torch.long, device=dev)
 
@@ -582,13 +592,10 @@ class BCGrounder(Grounder):
                 state_valid = state_valid.clone()
                 next_var_indices = next_var_indices.clone()
 
-            # d=0: rule resolution only (skip_facts + init grounding body)
-            # d>0: full resolution (facts + rules)
             (grounding_body, proof_goals, top_ridx,
              state_valid, next_var_indices) = self._fn_step(
                 grounding_body, proof_goals, top_ridx,
-                state_valid, next_var_indices,
-                skip_facts=(_d == 0), init_gbody=(_d == 0))
+                state_valid, next_var_indices)
             next_var_indices = next_var_indices.clone()
 
             # Postprocess: prune ground facts + compact + collect groundings
