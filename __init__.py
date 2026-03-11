@@ -56,11 +56,22 @@ from grounder.standardization import (
     standardize_vars_offset,
 )
 
+# --- Filters ---
+from grounder.filters import cap_ground_children, prune_dead_nonground_rules
+
+# --- Feature encoding ---
+from grounder.features import (
+    build_predicate_var_count_table,
+    build_rule_feature_encoding,
+    build_rule_var_count_table,
+    compute_shared_slot_indices,
+)
+
 # --- Types ---
 from grounder.types import ForwardResult, PackResult, ResolveResult, StepResult
 
 # --- Class hierarchy ---
-from grounder.grounder import (
+from grounder.grounders import (
     BCGrounder,
     Grounder,
     PrologGrounder,
@@ -93,6 +104,14 @@ __all__ = [
     # Standardization
     "standardize_vars_canonical",
     "standardize_vars_offset",
+    # Filters
+    "cap_ground_children",
+    "prune_dead_nonground_rules",
+    # Feature encoding
+    "build_predicate_var_count_table",
+    "build_rule_feature_encoding",
+    "build_rule_var_count_table",
+    "compute_shared_slot_indices",
     # Types
     "ForwardResult",
     "PackResult",
