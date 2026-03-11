@@ -259,18 +259,15 @@ class BCGrounder(Grounder):
         return self.K_f + self.K_r
 
     def _build_compiled_fns(self) -> None:
-        """Build torch.compile wrappers for step functions."""
+        """Build torch.compile wrapper for step function."""
         if (
             self.compile_mode
             and self.depth > 1
             and self._device.type == "cuda"
         ):
-            self._fn_d0 = torch.compile(
-                self._d0_step, fullgraph=True, mode=self.compile_mode)
             self._fn_step = torch.compile(
                 self._step_impl, fullgraph=True, mode=self.compile_mode)
         else:
-            self._fn_d0 = self._d0_step
             self._fn_step = self._step_impl
 
     # ------------------------------------------------------------------
@@ -458,21 +455,6 @@ class BCGrounder(Grounder):
     # Step (single proof step)
     # ------------------------------------------------------------------
 
-    def _d0_step(
-        self,
-        grounding_body: Tensor,
-        proof_goals: Tensor,
-        top_ridx: Tensor,
-        state_valid: Tensor,
-        next_var_indices: Tensor,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Depth-0 step: rule resolution only, initialize grounding body."""
-        return self._step_impl(
-            grounding_body, proof_goals, top_ridx,
-            state_valid, next_var_indices,
-            skip_facts=True, init_gbody=True,
-        )
-
     def _step_impl(
         self,
         grounding_body: Tensor,     # [B, S, M, 3]
@@ -602,11 +584,11 @@ class BCGrounder(Grounder):
 
             # d=0: rule resolution only (skip_facts + init grounding body)
             # d>0: full resolution (facts + rules)
-            step_fn = self._fn_d0 if _d == 0 else self._fn_step
             (grounding_body, proof_goals, top_ridx,
-             state_valid, next_var_indices) = step_fn(
+             state_valid, next_var_indices) = self._fn_step(
                 grounding_body, proof_goals, top_ridx,
-                state_valid, next_var_indices)
+                state_valid, next_var_indices,
+                skip_facts=(_d == 0), init_gbody=(_d == 0))
             next_var_indices = next_var_indices.clone()
 
             # Postprocess: prune ground facts + compact + collect groundings
