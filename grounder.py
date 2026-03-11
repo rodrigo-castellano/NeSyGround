@@ -590,49 +590,30 @@ class BCGrounder(Grounder):
         state_valid = query_mask.unsqueeze(1)  # [B, 1]
         next_var_indices = torch.full((B,), E, dtype=torch.long, device=dev)
 
-        # --- Depth 0: rule resolution only ---
-        (grounding_body, proof_goals, top_ridx,
-         state_valid, next_var_indices) = self._fn_d0(
-            grounding_body, proof_goals, top_ridx,
-            state_valid, next_var_indices)
-        next_var_indices = next_var_indices.clone()
-
-        # Postprocess: prune + compact + collect
-        proof_goals, collected_body, collected_mask, collected_ridx, state_valid = \
-            self._postprocess(
-                grounding_body, proof_goals, state_valid, top_ridx,
-                collected_body, collected_mask, collected_ridx)
-
-        # --- Depth 1..D-1: full steps ---
-        for _d in range(max(0, self.depth - 1)):
+        # --- Proof loop: depth steps ---
+        for _d in range(self.depth):
             # Clone CUDA graph outputs before passing to next compiled region
-            grounding_body = grounding_body.clone()
-            proof_goals = proof_goals.clone()
-            top_ridx = top_ridx.clone()
-            state_valid = state_valid.clone()
-            next_var_indices = next_var_indices.clone()
+            if _d > 0:
+                grounding_body = grounding_body.clone()
+                proof_goals = proof_goals.clone()
+                top_ridx = top_ridx.clone()
+                state_valid = state_valid.clone()
+                next_var_indices = next_var_indices.clone()
 
+            # d=0: rule resolution only (skip_facts + init grounding body)
+            # d>0: full resolution (facts + rules)
+            step_fn = self._fn_d0 if _d == 0 else self._fn_step
             (grounding_body, proof_goals, top_ridx,
-             state_valid, next_var_indices) = self._fn_step(
+             state_valid, next_var_indices) = step_fn(
                 grounding_body, proof_goals, top_ridx,
                 state_valid, next_var_indices)
             next_var_indices = next_var_indices.clone()
 
+            # Postprocess: prune ground facts + compact + collect groundings
             proof_goals, collected_body, collected_mask, collected_ridx, state_valid = \
                 self._postprocess(
                     grounding_body, proof_goals, state_valid, top_ridx,
                     collected_body, collected_mask, collected_ridx)
-
-        # --- Final postprocess for remaining states ---
-        grounding_body = grounding_body.clone()
-        proof_goals = proof_goals.clone()
-        top_ridx = top_ridx.clone()
-        state_valid = state_valid.clone()
-
-        proof_goals, collected_body, collected_mask, collected_ridx, _ = \
-            self._postprocess(
-                grounding_body, proof_goals, state_valid, top_ridx,
-                collected_body, collected_mask, collected_ridx)
 
         collected_count = collected_mask.sum(dim=1)
 
