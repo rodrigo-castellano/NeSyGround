@@ -113,8 +113,12 @@ def unify_one_to_one(
     mask = pred_ok & ~const_conflict  # [L]
 
     # Compute substitutions in single vectorized pass — all cases are [L, 2]
-    case1 = qv & ~tv & (t_args != 0)
-    case2 = ~qv & (q_args != 0) & tv
+    # case1: query=var, target=const → bind var to const
+    # case2: query=const, target=var → bind var to const
+    # case3: both vars → bind target var to query var
+    # Use t_const/q_const instead of != 0 to support 0-indexed entities.
+    case1 = qv & t_const
+    case2 = q_const & tv
     case3 = qv & tv
 
     # Nested torch.where: cases are mutually exclusive, so collapse to 2 ops
