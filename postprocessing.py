@@ -1,6 +1,6 @@
 """Post-processing: ground-fact pruning, grounding collection, deduplication.
 
-Provides both BE-style (hash-based) and TS-style (index-based) pruning,
+Provides hash-based pruning of known ground facts from proof states,
 plus TS-specific grounding collection and deduplication.
 
 Depends on ``fact_index.fact_contains`` for hash-based membership tests
@@ -8,7 +8,7 @@ and ``packing.compact_atoms`` for atom compaction.
 """
 
 from __future__ import annotations
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -17,12 +17,12 @@ from grounder.fact_index import fact_contains
 
 
 # ---------------------------------------------------------------------------
-# BE-style prune_ground_facts (hash-based, from BE _postprocessing.py)
+# Unified ground-fact pruning (shape-agnostic, hash-based)
 # ---------------------------------------------------------------------------
 
 def prune_ground_facts(
-    candidates: Tensor,         # [B, K, M, 3]
-    valid_mask: Tensor,         # [B, K]
+    candidates: Tensor,         # [..., M, 3] — any leading dims (e.g. [B,K,M,3])
+    valid_mask: Tensor,         # [...] matching leading dims
     fact_hashes: Tensor,        # [F] sorted fact hashes
     pack_base: int,
     constant_no: int,
@@ -32,11 +32,12 @@ def prune_ground_facts(
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Remove known ground facts from candidates (fixed shape, fully vectorized).
 
+    Works on any 4D state tensor [..., M, 3] (e.g. [B,K,M,3] or [B,S,G,3]).
     Also treats True predicate atoms as "facts" (proof indicators).
 
     Args:
-        candidates: [B, K, M, 3] candidate derived states
-        valid_mask: [B, K] which candidates are valid
+        candidates: [..., M, 3] candidate derived states
+        valid_mask: [...] which candidates are valid
         fact_hashes: [F] sorted int64 fact hashes for membership testing
         pack_base: packing base for hash computation
         constant_no: highest constant index
@@ -45,9 +46,9 @@ def prune_ground_facts(
         excluded_queries: [B, 1, 3] atoms NOT to prune (cycle prevention)
 
     Returns:
-        pruned_states: [B, K, M, 3] with facts removed
-        pruned_counts: [B, K] new atom counts per candidate
-        is_proof: [B, K] whether candidate became empty (proof found)
+        pruned_states: [..., M, 3] with facts removed
+        pruned_counts: [...] new atom counts per candidate
+        is_proof: [...] whether candidate became empty (proof found)
     """
     B, K, M, _ = candidates.shape
     pad = padding_idx
@@ -98,114 +99,6 @@ def prune_ground_facts(
     )
 
     return pruned_states, pruned_counts, is_proof
-
-
-def prune_ground_facts_3d(
-    proof_goals: Tensor,        # [B, S, G, 3]
-    state_valid: Tensor,        # [B, S]
-    fact_hashes: Tensor,        # [F] sorted fact hashes
-    pack_base: int,
-    constant_no: int,
-    padding_idx: int,
-) -> Tensor:
-    """Remove known ground facts from proof goals (hash-based, 3D variant).
-
-    Unlike ``prune_ground_facts`` which returns counts/is_proof for [B, K, M, 3],
-    this simpler variant works on [B, S, G, 3] and just replaces known facts
-    with padding.  Call compact_atoms afterwards to left-align.
-
-    Args:
-        proof_goals: [B, S, G, 3] proof-goal states
-        state_valid: [B, S] validity mask (unused but kept for API symmetry)
-        fact_hashes: [F] sorted int64 fact hashes
-        pack_base:   multiplier for pack_triples_64
-        constant_no: highest constant index
-        padding_idx: padding index
-
-    Returns:
-        [B, S, G, 3] with known ground facts replaced by padding
-    """
-    B, S, G, _ = proof_goals.shape
-    pad = padding_idx
-
-    preds = proof_goals[:, :, :, 0]
-    valid_atom = (preds != pad)
-    is_ground = (
-        (proof_goals[:, :, :, 1] <= constant_no)
-        & (proof_goals[:, :, :, 2] <= constant_no)
-    )
-    ground_atoms = valid_atom & is_ground
-
-    flat_atoms = proof_goals.reshape(-1, 3)
-    is_fact_flat = fact_contains(flat_atoms, fact_hashes, pack_base)
-    is_fact = is_fact_flat.view(B, S, G) & ground_atoms
-
-    keep = valid_atom & ~is_fact
-    return torch.where(
-        keep.unsqueeze(-1).expand_as(proof_goals),
-        proof_goals,
-        torch.tensor(pad, dtype=torch.long, device=proof_goals.device),
-    )
-
-
-# ---------------------------------------------------------------------------
-# TS-style prune_ground_facts (index-based, from TS _prune_ground_facts)
-# ---------------------------------------------------------------------------
-
-def prune_ground_facts_exists(
-    proof_goals: Tensor,        # [B, S, G, 3]
-    state_valid: Tensor,        # [B, S]
-    exists_fn: Callable[[Tensor, Tensor, Tensor], Tensor],
-    constant_no: int,
-    pad_idx: int,
-) -> Tensor:
-    """Remove known ground facts from proof_goals using an exists_fn callable.
-
-    TS variant that uses fact_index.exists(pred, subj, obj) -> bool instead of
-    hash-based membership.  Call compact_atoms afterwards to left-align.
-
-    Args:
-        proof_goals: [B, S, G, 3] proof goal atoms
-        state_valid: [B, S] which states are active
-        exists_fn: callable(pred [N], subj [N], obj [N]) -> [N] bool
-        constant_no: highest constant index
-        pad_idx: padding value
-
-    Returns:
-        proof_goals: [B, S, G, 3] pruned (not yet left-aligned)
-    """
-    B, S, G, _ = proof_goals.shape
-    E = constant_no + 1
-
-    preds = proof_goals[:, :, :, 0]                      # [B, S, G]
-    valid_atom = (preds != pad_idx)
-    is_ground = (
-        (proof_goals[:, :, :, 1] < E)
-        & (proof_goals[:, :, :, 2] < E)
-    )
-    ground_atoms = valid_atom & is_ground                 # [B, S, G]
-
-    # Vectorized existence check via the provided callable
-    # Clamp to safe ranges for the index lookup
-    num_preds = preds.max().item() + 1 if preds.numel() > 0 else 1
-    safe_pred = preds.clamp(0, max(num_preds - 1, 0))
-    safe_subj = proof_goals[:, :, :, 1].clamp(0, E - 1)
-    safe_obj = proof_goals[:, :, :, 2].clamp(0, E - 1)
-    is_fact = exists_fn(
-        safe_pred.reshape(-1),
-        safe_subj.reshape(-1),
-        safe_obj.reshape(-1),
-    ).view(B, S, G)
-
-    is_known_fact = ground_atoms & is_fact
-
-    # Replace known facts with padding
-    keep = valid_atom & ~is_known_fact
-    return torch.where(
-        keep.unsqueeze(-1).expand_as(proof_goals),
-        proof_goals,
-        torch.tensor(pad_idx, dtype=torch.long, device=proof_goals.device),
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -272,7 +165,7 @@ def collect_groundings(
     cm = torch.cat([collected_mask, valid_grounding], dim=1)
     cr = torch.cat([collected_ridx, ridx_new], dim=1)
 
-    cm = dedup_groundings(cb, cr, cm, M, E)
+    cm = _dedup_groundings(cb, cr, cm, M, E)
 
     n_k = min(tG, n_cat)
     _, ki = cm.to(torch.int8).topk(
@@ -302,7 +195,7 @@ def collect_groundings(
 # TS grounding deduplication (from TS BCPrologStatic._dedup_groundings)
 # ---------------------------------------------------------------------------
 
-def dedup_groundings(
+def _dedup_groundings(
     body: Tensor,       # [B, N, M, 3]
     ridx: Tensor,       # [B, N]
     mask: Tensor,       # [B, N]

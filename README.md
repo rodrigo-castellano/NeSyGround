@@ -47,7 +47,7 @@ grounder/
 +-- rule_index.py         # RuleIndex (segment + table lookup)
 +-- operations.py         # mgu_resolve_atom_facts, mgu_resolve_atom_rules
 +-- packing.py            # pack_combined, compact_atoms, pack_fact_rule
-+-- postprocessing.py     # prune_ground_facts, collect_groundings, dedup_groundings
++-- postprocessing.py     # prune_ground_facts, collect_groundings
 +-- standardization.py    # standardize_vars_offset, standardize_vars_canonical
 +-- types.py              # ForwardResult, StepResult, etc.
 +-- tests/

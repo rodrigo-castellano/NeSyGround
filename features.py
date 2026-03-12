@@ -73,20 +73,22 @@ def build_rule_feature_encoding(
     return torch.stack((is_var_f, slot_norm, arg_pos, rv_norm, slot_in_rule), dim=-1)
 
 
+def _count_unique_vars(rule: object) -> int:
+    """Count unique uppercase-initial variables in a rule."""
+    unique_vars: set = set()
+    for atom in [rule.head] + list(rule.body):
+        for arg in atom.args:
+            if isinstance(arg, str) and arg and arg[0].isupper():
+                unique_vars.add(arg)
+    return len(unique_vars)
+
+
 def build_rule_var_count_table(rules: Sequence[object], device: Optional[torch.device] = None) -> Tensor:
     """Create ``rule_id -> unique_var_count`` lookup table for feature encoding.
 
     Table includes a padding row at index 0.
     """
-    counts = [0]
-    for rule in rules:
-        unique_vars = set()
-        atoms = [rule.head] + list(rule.body)
-        for atom in atoms:
-            for arg in atom.args:
-                if isinstance(arg, str) and arg and arg[0].isupper():
-                    unique_vars.add(arg)
-        counts.append(len(unique_vars))
+    counts = [0] + [_count_unique_vars(r) for r in rules]
     return torch.tensor(counts, dtype=torch.float32, device=device)
 
 
@@ -113,13 +115,7 @@ def build_predicate_var_count_table(
         if p_idx is None or p_idx < 0 or p_idx >= table.numel():
             continue
 
-        unique_vars = set()
-        atoms = [rule.head] + list(rule.body)
-        for atom in atoms:
-            for arg in atom.args:
-                if isinstance(arg, str) and arg and arg[0].isupper():
-                    unique_vars.add(arg)
-        count = float(len(unique_vars))
+        count = float(_count_unique_vars(rule))
 
         if reduce == "max":
             table[p_idx] = torch.maximum(table[p_idx], torch.tensor(count, dtype=table.dtype, device=table.device))

@@ -344,11 +344,3 @@ def mgu_resolve_atom_rules(
     return rule_states, rule_success
 
 
-def _remove_atom(states: Tensor, pos: int) -> Tensor:
-    """Remove atom at position ``pos`` from [B, M, 3] → [B, M-1, 3]."""
-    M = states.shape[1]
-    if pos == 0:
-        return states[:, 1:, :]
-    elif pos == M - 1:
-        return states[:, :pos, :]
-    return torch.cat([states[:, :pos, :], states[:, pos + 1:, :]], dim=1)

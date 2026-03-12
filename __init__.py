@@ -44,10 +44,7 @@ from grounder.packing import compact_atoms, pack_combined, pack_fact_rule
 # --- Post-processing ---
 from grounder.postprocessing import (
     collect_groundings,
-    dedup_groundings,
     prune_ground_facts,
-    prune_ground_facts_3d,
-    prune_ground_facts_exists,
 )
 
 # --- Standardization ---
@@ -100,10 +97,7 @@ __all__ = [
     "pack_fact_rule",
     # Post-processing
     "collect_groundings",
-    "dedup_groundings",
     "prune_ground_facts",
-    "prune_ground_facts_3d",
-    "prune_ground_facts_exists",
     # Standardization
     "standardize_vars_canonical",
     "standardize_vars_offset",

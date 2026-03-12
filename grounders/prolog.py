@@ -247,11 +247,7 @@ class PrologGrounder(BCGrounder):
         M_g = grounding_body.shape[2]
         dev = queries.device
         pad = self.padding_idx
-        c_no = self.constant_no
-        E = c_no + 1
         K_r = self.K_r
-        V = self.max_vars_per_rule
-        Bmax = self.rule_index.rules_bodies_sorted.shape[1] if self.num_rules > 0 else 1
 
         if self.num_rules == 0:
             return (
@@ -261,104 +257,15 @@ class PrologGrounder(BCGrounder):
                 torch.zeros(B, S, 0, dtype=torch.long, device=dev),
             )
 
-        query_preds = queries[:, :, 0]
-
-        # Segment-based rule lookup (returns positions into sorted arrays)
-        N = B * S
-        sorted_pos_flat, sub_rule_mask_flat, _ = self.rule_index.lookup_by_segments(
-            query_preds.reshape(-1), K_r)
-        sub_rule_mask = sub_rule_mask_flat.view(B, S, K_r)
-
-        # Clamp for safe indexing (invalid positions masked by sub_rule_mask)
-        R = self.rule_index.rules_heads_sorted.shape[0]
-        safe_pos = sorted_pos_flat.clamp(0, max(R - 1, 0))
-
-        # Get original rule indices for sub_rule_idx (used by _pack_step)
-        sub_rule_idx = self.rule_index.rules_idx_sorted[safe_pos].view(B, S, K_r)
-
-        # Gather rule data using sorted positions
-        flat_sorted_pos = safe_pos.reshape(-1)  # [B*S*K_r]
-        sub_heads = self.rule_index.rules_heads_sorted[flat_sorted_pos]  # [N_r, 3]
-        sub_bodies = self.rule_index.rules_bodies_sorted[flat_sorted_pos]  # [N_r, Bmax, 3]
-        sub_lens = self.rule_index.rule_lens_sorted[flat_sorted_pos]  # [N_r]
-
-        N_r = B * S * K_r
-
-        # ---- Standardization Apart ----
-        # Each (batch, state) pair gets a unique variable namespace.
-        # Rules within the same state share a namespace (they produce
-        # independent children that never combine within a step).
-        nv_exp = next_var_indices.view(B, 1, 1).expand(B, S, K_r)  # [B, S, K_r]
-        state_offsets = torch.arange(S, device=dev).view(1, S, 1).expand(1, S, K_r) * V
-        rule_var_base = (nv_exp + state_offsets).reshape(N_r)  # [N_r]
-
-        # Rename head variables
-        template_start = E
-        std_heads = sub_heads.clone()
-        is_var_h = (std_heads[:, 1:] >= template_start)
-        h_offset = rule_var_base.unsqueeze(1).expand(N_r, 2)
-        std_heads_args = torch.where(
-            is_var_h,
-            std_heads[:, 1:] - template_start + h_offset,
-            std_heads[:, 1:],
-        )
-        std_heads = torch.cat([std_heads[:, 0:1], std_heads_args], dim=1)
-
-        # Rename body variables
-        std_bodies = sub_bodies.clone()
-        is_var_b = (std_bodies[:, :, 1:] >= template_start)
-        b_offset = rule_var_base.view(N_r, 1, 1).expand(N_r, Bmax, 2)
-        std_bodies_args = torch.where(
-            is_var_b,
-            std_bodies[:, :, 1:] - template_start + b_offset,
-            std_bodies[:, :, 1:],
-        )
-        std_bodies = torch.cat([std_bodies[:, :, 0:1], std_bodies_args], dim=2)
-
-        # ---- Unification ----
-        flat_queries = queries.unsqueeze(2).expand(B, S, K_r, 3).reshape(N_r, 3)
-        ok_flat, subs_flat = unify_one_to_one(flat_queries, std_heads, c_no, pad)
-        rule_success = ok_flat.view(B, S, K_r)
-        rule_subs = subs_flat.view(B, S, K_r, 2, 2)
-
-        rule_success = (
-            rule_success & sub_rule_mask
-            & state_valid.unsqueeze(-1) & active_mask.unsqueeze(-1)
-        )
-
-        # ---- Apply subs to [body, remaining] (+ grounding_body if tracked) ----
-        subs_flat_apply = rule_subs.reshape(N_r, 2, 2)
-        rem_exp = remaining.unsqueeze(2).expand(B, S, K_r, G, 3).reshape(N_r, G, 3)
-
-        if self.track_grounding_body:
-            gbody_exp = grounding_body.unsqueeze(2).expand(
-                B, S, K_r, M_g, 3).reshape(N_r, M_g, 3)
-            combined = torch.cat([std_bodies, rem_exp, gbody_exp], dim=1)
-            combined = apply_substitutions(combined, subs_flat_apply, pad)
-            rule_body_subst = combined[:, :Bmax, :].view(B, S, K_r, Bmax, 3)
-            rule_remaining = combined[:, Bmax:Bmax + G, :].view(B, S, K_r, G, 3)
-            rule_gbody_out = combined[:, Bmax + G:, :].view(B, S, K_r, M_g, 3)
-        else:
-            combined = torch.cat([std_bodies, rem_exp], dim=1)
-            combined = apply_substitutions(combined, subs_flat_apply, pad)
-            rule_body_subst = combined[:, :Bmax, :].view(B, S, K_r, Bmax, 3)
-            rule_remaining = combined[:, Bmax:, :].view(B, S, K_r, G, 3)
-            rule_gbody_out = torch.zeros(B, S, K_r, M_g, 3, dtype=torch.long, device=dev)
-
-        # Mask body atoms beyond rule length
-        sub_lens_v = sub_lens.view(B, S, K_r)
-        atom_idx = torch.arange(Bmax, device=dev).view(1, 1, 1, Bmax)
-        inactive = atom_idx >= sub_lens_v.unsqueeze(-1)
-        rule_body_subst = torch.where(
-            inactive.unsqueeze(-1).expand(B, S, K_r, Bmax, 3),
-            torch.tensor(pad, dtype=torch.long, device=dev),
-            rule_body_subst,
-        )
+        # Shared rule-head unification (lookup + standardize + unify + apply subs)
+        rule_body_subst, rule_remaining, rule_gbody_out, rule_success, sub_rule_idx, _, Bmax = \
+            self._resolve_rule_heads(
+                queries, remaining, grounding_body,
+                state_valid, active_mask, next_var_indices)
 
         # Build new goals = body + remaining
         if not self.track_grounding_body:
             # RL mode: wider output (Bmax+G) to preserve all remaining atoms.
-            # get_derived_states_compiled truncates to M afterwards.
             G_out = Bmax + G
             rule_goals = torch.full(
                 (B, S, K_r, G_out, 3), pad, dtype=torch.long, device=dev)

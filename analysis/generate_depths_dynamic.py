@@ -25,7 +25,7 @@ torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None  # type:
 
 from grounder.data_loader import KGDataset
 from grounder.packing import compact_atoms
-from grounder.postprocessing import prune_ground_facts_3d
+from grounder.postprocessing import prune_ground_facts
 from grounder.analysis._dedup import (
     dedup_within_depth,
     dedup_cross_depth,
@@ -43,7 +43,7 @@ def _build_compiled_pass(grounder):
     def _one_pass(proof_goals, dummy_gbody, dummy_ridx, state_valid, next_vars):
         new_gbody, new_goals, new_ridx, new_valid, new_next_var = grounder._step_impl(
             dummy_gbody, proof_goals, dummy_ridx, state_valid, next_vars)
-        new_goals = prune_ground_facts_3d(
+        new_goals, _, _ = prune_ground_facts(
             new_goals, new_valid, grounder.fact_hashes, grounder.pack_base,
             grounder.constant_no, grounder.padding_idx)
         new_goals = compact_atoms(new_goals, grounder.padding_idx)
