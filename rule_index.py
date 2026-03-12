@@ -185,7 +185,6 @@ class RuleIndex(nn.Module):
             rule_idx: [N, R_eff] original rule indices per query predicate
             mask:     [N, R_eff] validity mask
         """
-        safe_preds = query_preds.long().clamp(0, self.pred_rule_indices.shape[0] - 1)
-        rule_idx = self.pred_rule_indices[safe_preds]   # [N, R_eff]
-        mask = self.pred_rule_mask[safe_preds]           # [N, R_eff]
+        rule_idx = self.pred_rule_indices[query_preds.long()]   # [N, R_eff]
+        mask = self.pred_rule_mask[query_preds.long()]           # [N, R_eff]
         return rule_idx, mask

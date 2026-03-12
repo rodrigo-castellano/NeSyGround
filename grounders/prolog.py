@@ -179,10 +179,8 @@ class PrologGrounder(BCGrounder):
 
         # Enumerate candidates
         N = B * S
-        safe_pred = pred.clamp(0).reshape(-1)
-        safe_bound = bound_arg.clamp(0, E - 1).reshape(-1)
         cands, cand_mask = self.fact_index.enumerate(
-            safe_pred, safe_bound, direction.reshape(-1))
+            pred.reshape(-1), bound_arg.reshape(-1), direction.reshape(-1))
         K_f = cands.shape[1]
         cands = cands.view(B, S, K_f)
         cand_mask = cand_mask.view(B, S, K_f)

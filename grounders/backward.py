@@ -123,6 +123,11 @@ class BCGrounder(Grounder):
         """
         active_mask = proof_goals[:, :, 0, 0] != self.padding_idx  # [B, S]
         queries = proof_goals[:, :, 0, :]  # [B, S, 3]
+
+        # Zero padded atoms so downstream lookups never see out-of-range
+        # indices (padding_idx lives above the entity/predicate space).
+        queries = queries * active_mask.unsqueeze(-1).to(queries.dtype)
+
         remaining = proof_goals.clone()
         remaining[:, :, 0, :] = self.padding_idx
         return queries, remaining, active_mask
@@ -621,13 +626,6 @@ class BCGrounder(Grounder):
                 prev_count = current_count
 
         collected_count = collected_mask.sum(dim=1)
-
-        # Clamp body atom args to valid entity range
-        body_args = collected_body[:, :, :, 1:3]
-        collected_body = torch.cat([
-            collected_body[:, :, :, 0:1],
-            body_args.clamp(0, E - 1),
-        ], dim=3)
 
         return ForwardResult(
             collected_body=collected_body,
