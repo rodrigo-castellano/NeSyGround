@@ -70,6 +70,11 @@ class BCGrounder(Grounder):
         if max_derived_per_state is not None:
             self.K = int(max_derived_per_state)
 
+        # Cap K_f to K to avoid OOM on intermediate tensors [B, S, K_f, ...]
+        # Extra fact candidates beyond K are discarded during PACK anyway.
+        if self.K_f > self.K:
+            self.K_f = self.K
+
         # S computation
         if max_states is not None:
             self.S = max_states
