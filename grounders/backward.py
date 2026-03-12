@@ -406,12 +406,16 @@ class BCGrounder(Grounder):
         self,
         queries: Tensor,        # [B, 3]
         query_mask: Tensor,     # [B] bool
+        on_depth_complete=None,  # Optional[Callable[[int, Tensor], None]]
     ) -> ForwardResult:
         """Multi-depth backward-chaining proof.
 
         Args:
             queries:    [B, 3] query atoms to prove
             query_mask: [B] bool mask for valid queries
+            on_depth_complete: Optional callback called after each depth with
+                (depth, newly_proved) where newly_proved is [B] bool mask of
+                queries that were first proved at this depth.
 
         Returns:
             ForwardResult with collected_body, collected_mask, collected_count,
@@ -451,6 +455,9 @@ class BCGrounder(Grounder):
         state_valid = query_mask.unsqueeze(1)  # [B, 1]
         next_var_indices = torch.full((B,), E, dtype=torch.long, device=dev)
 
+        # --- Track cumulative proof count for on_depth_complete callback ---
+        prev_count = torch.zeros(B, dtype=torch.long, device=dev)
+
         # --- Proof loop: depth steps ---
         for _d in range(self.depth):
             # Clone CUDA graph outputs before passing to next compiled region
@@ -472,6 +479,13 @@ class BCGrounder(Grounder):
                 self._postprocess(
                     grounding_body, proof_goals, state_valid, top_ridx,
                     collected_body, collected_mask, collected_ridx)
+
+            # Invoke depth callback if provided
+            if on_depth_complete is not None:
+                current_count = collected_mask.sum(dim=1)  # [B]
+                newly_proved = (current_count > 0) & (prev_count == 0)
+                on_depth_complete(_d + 1, newly_proved)
+                prev_count = current_count
 
         collected_count = collected_mask.sum(dim=1)
 

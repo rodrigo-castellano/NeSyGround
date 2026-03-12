@@ -108,6 +108,11 @@ class Grounder(nn.Module):
         self.register_buffer("fact_hashes", self.fact_index.fact_hashes)
 
         # --- Build rule index ---
+        # predicate_no must be >= padding_idx so the segment lookup table
+        # can handle padding values that appear as predicate indices in
+        # inactive proof states at depth >= 2.
+        if predicate_no is not None and predicate_no < padding_idx:
+            predicate_no = padding_idx
         self.rule_index = RuleIndex(
             rules_heads_idx, rules_bodies_idx, rule_lens, device,
             predicate_no=predicate_no, padding_idx=padding_idx,

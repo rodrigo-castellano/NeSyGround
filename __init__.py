@@ -70,6 +70,9 @@ from grounder.features import (
 # --- Types ---
 from grounder.types import ForwardResult, PackResult, ResolveResult, StepResult
 
+# --- Data loading ---
+from grounder.data_loader import KGDataset
+
 # --- Class hierarchy ---
 from grounder.grounders import (
     BCGrounder,
@@ -112,6 +115,8 @@ __all__ = [
     "build_rule_feature_encoding",
     "build_rule_var_count_table",
     "compute_shared_slot_indices",
+    # Data loading
+    "KGDataset",
     # Types
     "ForwardResult",
     "PackResult",

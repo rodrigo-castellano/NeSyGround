@@ -61,9 +61,9 @@ def prune_ground_facts(
     ground_atoms = valid_atom & is_ground        # [B, K, M]
 
     # Check ALL atoms against fact hashes (fully vectorized)
-    flat_atoms = candidates.view(-1, 3)          # [B*K*M, 3]
+    flat_atoms = candidates.reshape(-1, 3)        # [B*K*M, 3]
     is_fact_flat = fact_contains(flat_atoms, fact_hashes, pack_base)
-    is_fact = is_fact_flat.view(B, K, M)
+    is_fact = is_fact_flat.reshape(B, K, M)
 
     # Only mark as fact if it was actually a ground atom
     is_fact = is_fact & ground_atoms
