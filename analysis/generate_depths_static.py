@@ -72,7 +72,7 @@ def generate_depths_static(
         depth=max_depth,
         max_states=max_states if max_states is not None else min(grounder_cls.__name__ == "RTFGrounder" and hard_cap or hard_cap, hard_cap),
         compile_mode=compile_mode if dev.type == "cuda" else None,
-        track_grounding_body=True,
+        track_grounding_body=False,
     )
 
     # Auto-calculate S if not provided

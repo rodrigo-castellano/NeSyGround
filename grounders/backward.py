@@ -593,8 +593,8 @@ class BCGrounder(Grounder):
         state_valid = query_mask.unsqueeze(1)  # [B, 1]
         next_var_indices = torch.full((B,), E, dtype=torch.long, device=dev)
 
-        # --- Track cumulative proof count for on_depth_complete callback ---
-        prev_count = torch.zeros(B, dtype=torch.long, device=dev)
+        # --- Track which queries have been proved for on_depth_complete ---
+        prev_proved = torch.zeros(B, dtype=torch.bool, device=dev)
 
         # --- Proof loop: depth steps ---
         for _d in range(self.depth):
@@ -613,6 +613,9 @@ class BCGrounder(Grounder):
             next_var_indices = next_var_indices.clone()
 
             # Postprocess: prune ground facts + compact + collect groundings
+            # Save state_valid before postprocess deactivates proved states
+            sv_before = state_valid if on_depth_complete is None else state_valid.clone()
+
             proof_goals, collected_body, collected_mask, collected_ridx, state_valid = \
                 self._postprocess(
                     grounding_body, proof_goals, state_valid, top_ridx,
@@ -620,10 +623,14 @@ class BCGrounder(Grounder):
 
             # Invoke depth callback if provided
             if on_depth_complete is not None:
-                current_count = collected_mask.sum(dim=1)  # [B]
-                newly_proved = (current_count > 0) & (prev_count == 0)
+                # Detect proofs from goal state: a query is proved when any
+                # of its states has all goals resolved (all padding) and is
+                # still valid (before collect_groundings deactivated it).
+                all_done = (proof_goals[:, :, :, 0] == pad).all(dim=2)  # [B, S]
+                has_proof = (all_done & sv_before).any(dim=1)  # [B]
+                newly_proved = has_proof & ~prev_proved
                 on_depth_complete(_d + 1, newly_proved)
-                prev_count = current_count
+                prev_proved = prev_proved | newly_proved
 
         collected_count = collected_mask.sum(dim=1)
 
