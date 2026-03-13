@@ -165,7 +165,7 @@ def collect_groundings(
     cm = torch.cat([collected_mask, valid_grounding], dim=1)
     cr = torch.cat([collected_ridx, ridx_new], dim=1)
 
-    cm = _dedup_groundings(cb, cr, cm, M, E)
+    cm = _dedup_groundings(cb, cr, cm, M)
 
     n_k = min(tG, n_cat)
     _, ki = cm.to(torch.int8).topk(
@@ -200,7 +200,6 @@ def _dedup_groundings(
     ridx: Tensor,       # [B, N]
     mask: Tensor,       # [B, N]
     M: int,
-    E: int,
 ) -> Tensor:
     """Remove duplicate groundings based on (ridx, body) hash.
 
@@ -209,20 +208,19 @@ def _dedup_groundings(
         ridx: [B, N] rule index per grounding
         mask: [B, N] validity mask
         M: number of body atoms
-        E: entity count (constant_no + 1), used as hash base
 
     Returns:
         mask: [B, N] updated mask with duplicates removed
     """
     B, N = mask.shape
     dev = mask.device
-    PRIME = 1_000_003
-    g_hash = ridx.long()
-    for j in range(M):
-        atom_h = (body[:, :, j, 0].long() * (E * E)
-                  + body[:, :, j, 1].long() * E
-                  + body[:, :, j, 2].long())
-        g_hash = g_hash * PRIME + atom_h
+    # Vectorized prime-mixing hash (overflow-safe, no E*E needed)
+    P1, P2, P3, P4 = 1_000_003, 999_983, 999_979, 999_961
+    atom_hashes = (body[..., 0].long() * P1
+                   + body[..., 1].long() * P2
+                   + body[..., 2].long() * P3)               # [B, N, M]
+    powers = P4 ** torch.arange(M - 1, -1, -1, device=dev)   # [M]
+    g_hash = ridx.long() * P1 + (atom_hashes * powers).sum(dim=-1)  # [B, N]
     sentinel = torch.tensor(-1, dtype=torch.long, device=dev)
     gh = torch.where(mask, g_hash, sentinel.expand(B, N))
     sorted_gh, sort_idx = gh.sort(dim=1)
