@@ -98,16 +98,20 @@ class BCGrounder(Grounder):
         return self.K_f + self.K_r
 
     def _build_compiled_fns(self) -> None:
-        """Build torch.compile wrapper for step function."""
+        """Build torch.compile wrapper for fused step+postprocess."""
         if (
             self.compile_mode
             and self.depth > 1
             and self._device.type == "cuda"
         ):
             self._fn_step = torch.compile(
-                self._step_impl, fullgraph=True, mode=self.compile_mode)
+                self._step_and_postprocess, fullgraph=True,
+                mode=self.compile_mode)
+            # CUDA graphs need clones between replays to avoid buffer overwrite
+            self._clone_between_steps = (self.compile_mode == 'reduce-overhead')
         else:
-            self._fn_step = self._step_impl
+            self._fn_step = self._step_and_postprocess
+            self._clone_between_steps = False
 
     # ------------------------------------------------------------------
     # Stage 1: SELECT
@@ -541,6 +545,51 @@ class BCGrounder(Grounder):
         return new_gbody, new_goals, new_ridx, new_valid, new_next_var
 
     # ------------------------------------------------------------------
+    # Fused step + postprocess (single compiled unit per depth)
+    # ------------------------------------------------------------------
+
+    def _step_and_postprocess(
+        self,
+        grounding_body: Tensor,     # [B, S, M, 3]
+        proof_goals: Tensor,        # [B, S, G, 3]
+        top_ridx: Tensor,           # [B, S]
+        state_valid: Tensor,        # [B, S]
+        next_var_indices: Tensor,   # [B]
+        collected_body: Tensor,     # [B, tG, M, 3]
+        collected_mask: Tensor,     # [B, tG]
+        collected_ridx: Tensor,     # [B, tG]
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """Fused step + postprocess: single compiled unit per depth.
+
+        Runs the 5-stage pipeline (select → resolve → pack → prune → collect)
+        as one function so it can be captured as a single CUDA graph.
+
+        Returns:
+            grounding_body:  [B, S, M, 3]
+            proof_goals:     [B, S, G, 3]
+            top_ridx:        [B, S]
+            state_valid:     [B, S]
+            next_var_indices:[B]
+            collected_body:  [B, tG, M, 3]
+            collected_mask:  [B, tG]
+            collected_ridx:  [B, tG]
+        """
+        # Step: SELECT -> RESOLVE -> PACK
+        grounding_body, proof_goals, top_ridx, state_valid, next_var_indices = \
+            self._step_impl(
+                grounding_body, proof_goals, top_ridx,
+                state_valid, next_var_indices)
+
+        # Postprocess: prune ground facts + compact + collect groundings
+        proof_goals, collected_body, collected_mask, collected_ridx, state_valid = \
+            self._postprocess(
+                grounding_body, proof_goals, state_valid, top_ridx,
+                collected_body, collected_mask, collected_ridx)
+
+        return (grounding_body, proof_goals, top_ridx, state_valid,
+                next_var_indices, collected_body, collected_mask, collected_ridx)
+
+    # ------------------------------------------------------------------
     # Forward (multi-depth proof loop)
     # ------------------------------------------------------------------
 
@@ -603,28 +652,28 @@ class BCGrounder(Grounder):
 
         # --- Proof loop: depth steps ---
         for _d in range(self.depth):
-            # Clone CUDA graph outputs before passing to next compiled region
-            if _d > 0:
+            # Clone between CUDA graph replays to prevent buffer overwrite.
+            # Each step's CUDA graph writes to fixed output addresses;
+            # cloning ensures the next replay doesn't corrupt live inputs.
+            if _d > 0 and self._clone_between_steps:
                 grounding_body = grounding_body.clone()
                 proof_goals = proof_goals.clone()
                 top_ridx = top_ridx.clone()
                 state_valid = state_valid.clone()
                 next_var_indices = next_var_indices.clone()
+                collected_body = collected_body.clone()
+                collected_mask = collected_mask.clone()
+                collected_ridx = collected_ridx.clone()
 
-            (grounding_body, proof_goals, top_ridx,
-             state_valid, next_var_indices) = self._fn_step(
-                grounding_body, proof_goals, top_ridx,
-                state_valid, next_var_indices)
-            next_var_indices = next_var_indices.clone()
-
-            # Postprocess: prune ground facts + compact + collect groundings
-            # Save state_valid before postprocess deactivates proved states
+            # Save state_valid before step+postprocess deactivates proved states
             sv_before = state_valid if on_depth_complete is None else state_valid.clone()
 
-            proof_goals, collected_body, collected_mask, collected_ridx, state_valid = \
-                self._postprocess(
-                    grounding_body, proof_goals, state_valid, top_ridx,
-                    collected_body, collected_mask, collected_ridx)
+            (grounding_body, proof_goals, top_ridx, state_valid,
+             next_var_indices, collected_body, collected_mask,
+             collected_ridx) = self._fn_step(
+                grounding_body, proof_goals, top_ridx,
+                state_valid, next_var_indices,
+                collected_body, collected_mask, collected_ridx)
 
             # Invoke depth callback if provided
             if on_depth_complete is not None:
