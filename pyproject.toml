@@ -1,0 +1,15 @@
+[project]
+name = "nesyground"
+version = "0.1.0"
+description = "NeSyGround: Compiled CUDA-graph-safe FOL grounding for neuro-symbolic reasoning"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.0"]
+license = "MIT"
+readme = "README.md"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+include = ["grounder*"]
