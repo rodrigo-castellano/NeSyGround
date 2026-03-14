@@ -55,17 +55,17 @@ from grounder.fact_index import (
 # --- Rule indexing ---
 from grounder.rule_index import RuleIndex
 
-# --- Packing ---
-from grounder.packing import compact_atoms, pack_combined, pack_fact_rule
-
-# --- Post-processing ---
-from grounder.postprocessing import (
+# --- Packing + post-processing ---
+from grounder.bc.common import (
+    compact_atoms,
     collect_groundings,
+    pack_combined,
+    pack_fact_rule,
     prune_ground_facts,
 )
 
 # --- Standardization ---
-from grounder.standardization import (
+from grounder.resolution.standardization import (
     standardize_vars_canonical,
     standardize_vars_offset,
 )
@@ -82,7 +82,7 @@ from grounder.features import (
 )
 
 # --- Types ---
-from grounder.types import ForwardResult, PackResult, ResolveResult, StepResult
+from grounder.types import ForwardResult, GroundingResult, PackResult, ResolveResult, StepResult
 
 # --- Data loading ---
 from grounder.data_loader import KGDataset
@@ -91,28 +91,32 @@ from grounder.data_loader import KGDataset
 from grounder.compilation import CompiledRule, compile_rules
 
 # --- Forward chaining ---
-from grounder.forward_chaining import run_forward_chaining
+from grounder.fc.fc import run_forward_chaining
 
 # --- Factory ---
 from grounder.factory import create_grounder, parse_grounder_type
 
-# --- Class hierarchy ---
-from grounder.grounders import (
-    BCGrounder,
-    BCPruneGrounder,
-    BCProvsetGrounder,
-    FullBCGrounder,
-    GroundingAttention,
-    Grounder,
-    KGEGrounder,
-    LazyGrounder,
-    NeuralGrounder,
-    ParametrizedBCGrounder,
-    PrologGrounder,
-    ProvabilityMLP,
-    RTFGrounder,
-    SamplerGrounder,
-    SoftGrounder,
+# --- Base + BC grounders ---
+from grounder.base import Grounder
+from grounder.bc.bc import BCGrounder, PrologGrounder, RTFGrounder
+
+# --- Other grounders (still in grounders/) ---
+from grounder.grounders.parametrized import ParametrizedBCGrounder
+from grounder.grounders.full import FullBCGrounder
+from grounder.grounders.prune import BCPruneGrounder
+from grounder.grounders.provset import BCProvsetGrounder
+from grounder.grounders.lazy import LazyGrounder
+
+# --- NeSy grounders ---
+from grounder.nesy.kge import GroundingAttention, KGEGrounder, NeuralGrounder
+from grounder.nesy.soft import ProvabilityMLP, SoftGrounder
+from grounder.nesy.sampler import SamplerGrounder
+
+# --- NeSy hook protocols ---
+from grounder.nesy.hooks import (
+    PostResolutionHook,
+    ProvabilityHook,
+    ResolutionHook,
 )
 
 __all__ = [
@@ -150,6 +154,7 @@ __all__ = [
     "KGDataset",
     # Types
     "ForwardResult",
+    "GroundingResult",
     "PackResult",
     "ResolveResult",
     "StepResult",
@@ -172,8 +177,11 @@ __all__ = [
     "LazyGrounder",
     "NeuralGrounder",
     "ParametrizedBCGrounder",
+    "PostResolutionHook",
     "PrologGrounder",
+    "ProvabilityHook",
     "ProvabilityMLP",
+    "ResolutionHook",
     "RTFGrounder",
     "SamplerGrounder",
     "SoftGrounder",

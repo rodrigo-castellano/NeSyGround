@@ -473,6 +473,7 @@ class InvertedFactIndex(_FactIndexBase):
         """
         N = preds.size(0)
         E = self._num_entities
+        P = self._num_predicates
         M = self._max_facts_per_query
         dev = preds.device
 
@@ -628,6 +629,13 @@ class BlockSparseFactIndex(InvertedFactIndex):
         self.register_buffer("_po_blocks", po_blocks.to(device))
         self.register_buffer("_po_block_counts", po_block_counts.to(device))
 
+    @property
+    def max_fact_pairs(self) -> int:
+        """Actual max facts per (predicate, entity) combo from data."""
+        if self._use_dense:
+            return self._K
+        return self._max_facts_per_query
+
     # -- Overrides ------------------------------------------------------------
 
     def enumerate(
@@ -641,6 +649,7 @@ class BlockSparseFactIndex(InvertedFactIndex):
             return super().enumerate(preds, bound_args, direction)
 
         K = self._K
+        E = self._num_entities
         dev = preds.device
         is_obj = (direction == 0)
 
@@ -655,11 +664,6 @@ class BlockSparseFactIndex(InvertedFactIndex):
 
         pos_indices = torch.arange(K, device=dev).unsqueeze(0)
         valid = pos_indices < counts.unsqueeze(1)
-
-        # Pad to max_facts_per_query (static size for torch.compile)
-        if self._pad_size > 0:
-            candidates = torch.nn.functional.pad(candidates, (0, self._pad_size))
-            valid = torch.nn.functional.pad(valid, (0, self._pad_size))
 
         return candidates, valid
 

@@ -34,8 +34,15 @@ class StepResult:
 
 @dataclass
 class ForwardResult:
-    """Output of multi-depth forward (TS grounding collection)."""
+    """Output of multi-depth forward (TS grounding collection).
+
+    Alias: GroundingResult (preferred for new code).
+    """
     collected_body: Tensor   # [B, tG, M, 3]
     collected_mask: Tensor   # [B, tG]
     collected_count: Tensor  # [B]
     collected_ridx: Tensor   # [B, tG]
+
+
+# Alias for new code — ForwardResult is kept for backward compat.
+GroundingResult = ForwardResult

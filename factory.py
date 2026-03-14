@@ -16,9 +16,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.grounders.base import Grounder
-from grounder.grounders.prolog import PrologGrounder
-from grounder.grounders.rtf import RTFGrounder
+from grounder.base import Grounder
+from grounder.bc.bc import PrologGrounder, RTFGrounder
 from grounder.types import ForwardResult
 
 
@@ -28,9 +27,9 @@ def _lazy_imports():
     from grounder.grounders.full import FullBCGrounder
     from grounder.grounders.prune import BCPruneGrounder
     from grounder.grounders.provset import BCProvsetGrounder
-    from grounder.grounders.sampler import SamplerGrounder
-    from grounder.grounders.kge import KGEGrounder, NeuralGrounder
-    from grounder.grounders.soft import SoftGrounder
+    from grounder.nesy.sampler import SamplerGrounder
+    from grounder.nesy.kge import KGEGrounder, NeuralGrounder
+    from grounder.nesy.soft import SoftGrounder
     from grounder.grounders.lazy import LazyGrounder
     return {
         "ParametrizedBCGrounder": ParametrizedBCGrounder,
