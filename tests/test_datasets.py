@@ -16,7 +16,7 @@ from grounder import BCGrounder
 DEVICE = torch.device("cpu")
 DATA_ROOT = Path(os.environ.get(
     "GROUNDER_DATA_ROOT",
-    os.path.join(os.path.dirname(__file__), "..", "..", "data"),
+    os.path.join(os.path.dirname(__file__), "..", "data"),
 ))
 
 
@@ -204,7 +204,7 @@ def _make_grounder(dataset_name: str, depth: int = 2, max_facts: Optional[int] =
         device=DEVICE,
         predicate_no=predicate_no,
         resolution='sld',
-        filter='none',
+        filter='prune',
         max_goals=G,
         depth=depth,
         max_total_groundings=max_total_groundings,

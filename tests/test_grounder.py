@@ -6,6 +6,13 @@ from grounder import BCGrounder
 
 DEVICE = torch.device("cpu")
 
+# Padding facts to ensure K_f >= K_f_min_budget (10) in init_mgu.
+# All share (pred=1, arg0=10) so they cluster under one key,
+# raising max_fact_pairs to 12. Entities 10-22 don't match test queries.
+_PAD_FACTS = torch.tensor(
+    [[1, 10, i] for i in range(11, 23)], dtype=torch.long
+)
+
 
 class TestGrandparentChain:
     """Grandparent rule: gp(X,Z) :- parent(X,Y), parent(Y,Z).
@@ -19,21 +26,24 @@ class TestGrandparentChain:
 
     @pytest.fixture
     def grounder(self):
-        facts = torch.tensor([[1, 1, 2], [1, 2, 3]], dtype=torch.long)
-        heads = torch.tensor([[2, 4, 5]], dtype=torch.long)  # gp(V0, V1)
-        bodies = torch.tensor([[[1, 4, 6], [1, 6, 5]]], dtype=torch.long)  # parent(V0,V2), parent(V2,V1)
+        facts = torch.cat([
+            torch.tensor([[1, 1, 2], [1, 2, 3]], dtype=torch.long),
+            _PAD_FACTS,
+        ])
+        heads = torch.tensor([[2, 24, 25]], dtype=torch.long)  # gp(V0, V1)
+        bodies = torch.tensor([[[1, 24, 26], [1, 26, 25]]], dtype=torch.long)  # parent(V0,V2), parent(V2,V1)
         rule_lens = torch.tensor([2], dtype=torch.long)
         return BCGrounder(
             facts_idx=facts,
             rules_heads_idx=heads,
             rules_bodies_idx=bodies,
             rule_lens=rule_lens,
-            constant_no=3,
+            constant_no=23,
             padding_idx=99,
             device=DEVICE,
             predicate_no=3,
             resolution='sld',
-            filter='none',
+            filter='prune',
             max_goals=5,
             depth=3,
             max_total_groundings=8,
@@ -41,13 +51,13 @@ class TestGrandparentChain:
         )
 
     def test_finds_grounding(self, grounder):
-        queries = torch.tensor([[2, 1, 4]], dtype=torch.long)  # gp(alice, V0)
+        queries = torch.tensor([[2, 1, 24]], dtype=torch.long)  # gp(alice, V0)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         assert result.count[0].item() >= 1, "Should find at least one grounding"
 
     def test_grounding_body_is_correct(self, grounder):
-        queries = torch.tensor([[2, 1, 4]], dtype=torch.long)
+        queries = torch.tensor([[2, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         valid_idx = result.mask[0].nonzero(as_tuple=True)[0]
@@ -59,13 +69,13 @@ class TestGrandparentChain:
         assert [1, 2, 3] in body_list, f"Expected parent(bob,charlie) in body, got {body_list}"
 
     def test_no_grounding_for_invalid_query(self, grounder):
-        queries = torch.tensor([[2, 3, 4]], dtype=torch.long)  # gp(charlie, V0) - no matching chain
+        queries = torch.tensor([[2, 3, 24]], dtype=torch.long)  # gp(charlie, V0) - no matching chain
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         assert result.count[0].item() == 0
 
     def test_masked_query_not_processed(self, grounder):
-        queries = torch.tensor([[2, 1, 4]], dtype=torch.long)
+        queries = torch.tensor([[2, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([False])  # masked out
         result = grounder(queries, query_mask)
         assert result.count[0].item() == 0
@@ -79,39 +89,42 @@ class TestSingleBodyRule:
 
     @pytest.fixture
     def grounder(self):
-        facts = torch.tensor([
-            [1, 1, 2],  # base(a, b)
-            [1, 2, 3],  # base(b, c)
-            [1, 3, 1],  # base(c, a)
-        ], dtype=torch.long)
-        heads = torch.tensor([[2, 4, 5]], dtype=torch.long)  # derived(V0, V1)
-        bodies = torch.tensor([[[1, 4, 5]]], dtype=torch.long)  # base(V0, V1)
+        facts = torch.cat([
+            torch.tensor([
+                [1, 1, 2],  # base(a, b)
+                [1, 2, 3],  # base(b, c)
+                [1, 3, 1],  # base(c, a)
+            ], dtype=torch.long),
+            _PAD_FACTS,
+        ])
+        heads = torch.tensor([[2, 24, 25]], dtype=torch.long)  # derived(V0, V1)
+        bodies = torch.tensor([[[1, 24, 25]]], dtype=torch.long)  # base(V0, V1)
         rule_lens = torch.tensor([1], dtype=torch.long)
         return BCGrounder(
             facts_idx=facts,
             rules_heads_idx=heads,
             rules_bodies_idx=bodies,
             rule_lens=rule_lens,
-            constant_no=3,
+            constant_no=23,
             padding_idx=99,
             device=DEVICE,
             predicate_no=3,
             resolution='sld',
-            filter='none',
+            filter='prune',
             max_goals=4,
             depth=2,
-            max_total_groundings=8,
+            max_total_groundings=16,
             fact_index_type='arg_key',
         )
 
     def test_finds_grounding_depth2(self, grounder):
-        queries = torch.tensor([[2, 1, 4]], dtype=torch.long)  # derived(a, V0)
+        queries = torch.tensor([[2, 1, 24]], dtype=torch.long)  # derived(a, V0)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         assert result.count[0].item() >= 1
 
     def test_body_matches_fact(self, grounder):
-        queries = torch.tensor([[2, 1, 4]], dtype=torch.long)
+        queries = torch.tensor([[2, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         valid_idx = result.mask[0].nonzero(as_tuple=True)[0]
@@ -123,31 +136,31 @@ class TestBatchQueries:
     """Test that batched queries work correctly."""
 
     def test_batch_of_two(self):
-        facts = torch.tensor([
-            [1, 1, 2],
-            [1, 2, 3],
-        ], dtype=torch.long)
-        heads = torch.tensor([[2, 4, 5]], dtype=torch.long)
-        bodies = torch.tensor([[[1, 4, 5]]], dtype=torch.long)
+        facts = torch.cat([
+            torch.tensor([[1, 1, 2], [1, 2, 3]], dtype=torch.long),
+            _PAD_FACTS,
+        ])
+        heads = torch.tensor([[2, 24, 25]], dtype=torch.long)
+        bodies = torch.tensor([[[1, 24, 25]]], dtype=torch.long)
         rule_lens = torch.tensor([1], dtype=torch.long)
         grounder = BCGrounder(
             facts_idx=facts,
             rules_heads_idx=heads,
             rules_bodies_idx=bodies,
             rule_lens=rule_lens,
-            constant_no=3,
+            constant_no=23,
             padding_idx=99,
             device=DEVICE,
             predicate_no=3,
             resolution='sld',
-            filter='none',
+            filter='prune',
             max_goals=4,
             depth=2,
-            max_total_groundings=8,
+            max_total_groundings=16,
             fact_index_type='arg_key',
         )
         # Two queries: derived(a, V0) and derived(b, V0)
-        queries = torch.tensor([[2, 1, 4], [2, 2, 4]], dtype=torch.long)
+        queries = torch.tensor([[2, 1, 24], [2, 2, 24]], dtype=torch.long)
         query_mask = torch.tensor([True, True])
         result = grounder(queries, query_mask)
         # Both should find groundings
@@ -159,15 +172,18 @@ class TestMultipleRules:
     """KB with multiple rules sharing a predicate."""
 
     def test_two_rules_same_head(self):
-        facts = torch.tensor([
-            [1, 1, 2],  # r1(a, b)
-            [2, 1, 3],  # r2(a, c)
-        ], dtype=torch.long)
+        facts = torch.cat([
+            torch.tensor([
+                [1, 1, 2],  # r1(a, b)
+                [2, 1, 3],  # r2(a, c)
+            ], dtype=torch.long),
+            _PAD_FACTS,
+        ])
         # Two rules: h(X,Y) :- r1(X,Y) and h(X,Y) :- r2(X,Y)
-        heads = torch.tensor([[3, 4, 5], [3, 4, 5]], dtype=torch.long)
+        heads = torch.tensor([[3, 24, 25], [3, 24, 25]], dtype=torch.long)
         bodies = torch.tensor([
-            [[1, 4, 5]],  # r1(V0, V1)
-            [[2, 4, 5]],  # r2(V0, V1)
+            [[1, 24, 25]],  # r1(V0, V1)
+            [[2, 24, 25]],  # r2(V0, V1)
         ], dtype=torch.long)
         rule_lens = torch.tensor([1, 1], dtype=torch.long)
         grounder = BCGrounder(
@@ -175,18 +191,18 @@ class TestMultipleRules:
             rules_heads_idx=heads,
             rules_bodies_idx=bodies,
             rule_lens=rule_lens,
-            constant_no=3,
+            constant_no=23,
             padding_idx=99,
             device=DEVICE,
             predicate_no=4,
             resolution='sld',
-            filter='none',
+            filter='prune',
             max_goals=4,
             depth=2,
-            max_total_groundings=8,
+            max_total_groundings=16,
             fact_index_type='arg_key',
         )
-        queries = torch.tensor([[3, 1, 4]], dtype=torch.long)  # h(a, V0)
+        queries = torch.tensor([[3, 1, 24]], dtype=torch.long)  # h(a, V0)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         # Should find 2 groundings: via r1 and via r2
@@ -198,7 +214,10 @@ class TestNoRules:
     """Edge case: no rules in KB."""
 
     def test_no_rules(self):
-        facts = torch.tensor([[1, 1, 2]], dtype=torch.long)
+        facts = torch.cat([
+            torch.tensor([[1, 1, 2]], dtype=torch.long),
+            _PAD_FACTS,
+        ])
         heads = torch.empty(0, 3, dtype=torch.long)
         bodies = torch.empty(0, 1, 3, dtype=torch.long)
         rule_lens = torch.empty(0, dtype=torch.long)
@@ -207,18 +226,18 @@ class TestNoRules:
             rules_heads_idx=heads,
             rules_bodies_idx=bodies,
             rule_lens=rule_lens,
-            constant_no=3,
+            constant_no=23,
             padding_idx=99,
             device=DEVICE,
             predicate_no=2,
             resolution='sld',
-            filter='none',
+            filter='prune',
             max_goals=4,
             depth=2,
-            max_total_groundings=8,
+            max_total_groundings=16,
             fact_index_type='arg_key',
         )
-        queries = torch.tensor([[1, 1, 4]], dtype=torch.long)
+        queries = torch.tensor([[1, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         # No rules → no groundings
