@@ -4,6 +4,7 @@ Configuration replaces classes:
   resolution: 'sld' | 'rtf' | 'enum'
   filter:     'prune' | 'provset' | 'none'
   depth, width, hooks
+  standardization_mode: None | 'offset' | 'canonical'
 
 Canonical loop (same code path for all resolutions):
   states = init_states(queries, query_mask)
@@ -16,7 +17,7 @@ Resolution is the only pluggable phase — _select, _pack, _postprocess are shar
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple  # Callable used by _standardize_fn
 
 import torch
 import torch.nn as nn
@@ -68,6 +69,11 @@ class BCGrounder(Grounder):
         max_groundings_per_query: int = 32,
         fc_method: str = "join",
         fc_depth: int = 10,
+        # Output variable standardization (for consumers of ungrounded states)
+        standardization_mode: Optional[str] = None,
+        runtime_var_end_index: Optional[int] = None,
+        standardizer_compile_mode: str = "reduce-overhead",
+        enforce_runtime_var_range: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -79,6 +85,7 @@ class BCGrounder(Grounder):
         self.compile_mode = compile_mode
         self.hooks = hooks or []
         self.track_grounding_body = track_grounding_body
+        self.standardization_mode = standardization_mode
 
         # Max goals: shared for all resolutions.
         # Must accommodate M body atoms for enum resolution.
@@ -95,6 +102,24 @@ class BCGrounder(Grounder):
             max_groundings_per_query=max_groundings_per_query,
             fc_method=fc_method, fc_depth=fc_depth,
         )
+
+        # Output variable standardization
+        self._standardize_fn: Optional[Callable] = None
+        if standardization_mode is not None:
+            from grounder.resolution.standardization import build_standardize_fn
+            if runtime_var_end_index is None:
+                raise ValueError(
+                    "runtime_var_end_index is required when standardization_mode is set")
+            self._standardize_fn = build_standardize_fn(
+                standardization_mode,
+                self.constant_no,
+                int(runtime_var_end_index),
+                self.padding_idx,
+                self.M,
+                self._device,
+                standardizer_compile_mode,
+                enforce_runtime_var_range,
+            )
 
     # ==================================================================
     # Resolution init
@@ -194,24 +219,20 @@ class BCGrounder(Grounder):
     # Canonical loop
     # ==================================================================
 
+    @torch.no_grad()
     def forward(
         self, queries: Tensor, query_mask: Tensor,
     ) -> GroundingResult:
-        result = self.ground(queries, query_mask)
+        states = self.init_states(queries, query_mask)
+        for d in range(self.depth):
+            states = self.step(states, d)
+        result = self.filter_terminal(states)
         for hook in self.hooks:
             body, mask, ridx = hook.apply(result.body, result.mask, result.rule_idx)
             result = GroundingResult(
                 body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx)
         return result
 
-    @torch.no_grad()
-    def ground(
-        self, queries: Tensor, query_mask: Tensor,
-    ) -> GroundingResult:
-        states = self.init_states(queries, query_mask)
-        for d in range(self.depth):
-            states = self.step(states, d)
-        return self.filter_terminal(states)
 
     def init_states(
         self, queries: Tensor, query_mask: Tensor,
@@ -466,6 +487,40 @@ class BCGrounder(Grounder):
         states["collected_ridx"] = cr
         states["state_valid"] = sv
         return states
+
+    # ==================================================================
+    # Output variable standardization (optional)
+    # ==================================================================
+
+    def standardize_output(
+        self,
+        states: Tensor,
+        counts: Tensor,
+        next_var_indices: Tensor,
+        input_states: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Standardize runtime variables in output states.
+
+        Renumbers variables in ``states`` using the configured mode
+        (``standardization_mode='offset'`` or ``'canonical'``).
+
+        Does nothing if ``standardization_mode=None`` (default).
+
+        Args:
+            states: [B, K, M, 3] derived states to standardize.
+            counts: [B] valid state count per batch element.
+            next_var_indices: [B] current free variable index.
+            input_states: [B, ?, 3] parent states (needed for offset mode).
+
+        Returns:
+            std_states: [B, K, M, 3] standardized states.
+            new_next_var: [B] updated free variable indices.
+        """
+        if self._standardize_fn is None:
+            return states, next_var_indices
+        return self._standardize_fn(states, counts, next_var_indices,
+                                    input_states if input_states is not None
+                                    else states.new_zeros(0))
 
     # ==================================================================
     # Compiled step (optimization — same semantics as clean path)

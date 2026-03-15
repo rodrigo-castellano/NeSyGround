@@ -67,6 +67,7 @@ from grounder.bc.common import (
 
 # --- Standardization ---
 from grounder.resolution.standardization import (
+    build_standardize_fn,
     standardize_vars_canonical,
     standardize_vars_offset,
 )

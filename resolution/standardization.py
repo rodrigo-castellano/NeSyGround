@@ -1,15 +1,16 @@
 """Variable standardization for derived proof states.
 
-Two strategies:
+Three public APIs:
 - standardize_vars_offset: fast offset-based renaming (no fullgraph guarantee)
 - standardize_vars_canonical: graph-safe canonical renaming (torch.compile compatible)
+- build_standardize_fn: factory that returns a compiled standardizer callable
 
 These are pure functions with no internal package dependencies (only torch).
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -231,3 +232,58 @@ def standardize_vars_canonical(
     torch._assert_async(next_ok, "Canonical standardization advanced next-var beyond runtime range")
 
     return std_derived, new_next_var
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+def build_standardize_fn(
+    mode: str,
+    constant_no: int,
+    runtime_var_end_index: int,
+    padding_idx: int,
+    body_width: int,
+    device: torch.device,
+    compile_mode: str = "reduce-overhead",
+    enforce_runtime_range: bool = False,
+) -> Callable:
+    """Build a (optionally compiled) output-standardization callable.
+
+    Args:
+        mode: ``'offset'`` or ``'canonical'``.
+        constant_no: highest constant index.
+        runtime_var_end_index: upper bound for variable IDs.
+        padding_idx: padding value.
+        body_width: max body atoms per rule (for offset extra headroom).
+        device: target device (compile only on CUDA).
+        compile_mode: torch.compile mode (default ``'reduce-overhead'``).
+        enforce_runtime_range: assert output vars are in range.
+
+    Returns:
+        Callable ``(states [B,K,M,3], counts [B], nv [B], inp [B,?,3])``
+        ``→ (std_states [B,K,M,3], new_nv [B])``.
+    """
+    rve = int(runtime_var_end_index)
+
+    if mode == "canonical":
+        def _fn(states: Tensor, counts: Tensor, nv: Tensor, inp: Tensor):
+            s, n = standardize_vars_canonical(
+                states, counts, nv, constant_no, rve, padding_idx)
+            return s.clone(), n.clone()
+    elif mode == "offset":
+        extra = body_width + 2
+        def _fn(states: Tensor, counts: Tensor, nv: Tensor, inp: Tensor):
+            s, n = standardize_vars_offset(
+                states, counts, nv, constant_no, rve, padding_idx,
+                input_states=inp, extra_new_vars=extra,
+                enforce_runtime_range=enforce_runtime_range,
+                out_of_place=True)
+            return s.clone(), n.clone()
+    else:
+        raise ValueError(
+            f"Unknown standardization mode '{mode}'. Expected 'offset' or 'canonical'.")
+
+    if device.type == "cuda":
+        _fn = torch.compile(_fn, mode=compile_mode, fullgraph=True)
+    return _fn
