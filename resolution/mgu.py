@@ -419,6 +419,7 @@ def init_mgu(
     max_total_groundings: int,
     *,
     K_MAX: int = 550,
+    K_f_min_budget: int = 10,
     max_derived_per_state: Optional[int] = None,
     max_states: Optional[int] = None,
     max_groundings_per_rule: Optional[int] = None,
@@ -432,7 +433,21 @@ def init_mgu(
     K = min(K_uncapped, K_MAX)
     if max_derived_per_state is not None:
         K = int(max_derived_per_state)
-    if K_f > K:
+
+    # For SLD, reserve K_r slots for rule children; cap K_f to remainder.
+    if resolution == "sld":
+        K_f_budget = max(K - K_r, K_f_min_budget)
+        if K_r > K - K_f_min_budget:
+            raise ValueError(
+                f"K_r={K_r} leaves fewer than {K_f_min_budget} fact slots "
+                f"in K={K}. Reduce the number of rules.")
+        if K_f > K_f_budget:
+            import warnings
+            warnings.warn(
+                f"[init_mgu] K_f capped {K_f}→{K_f_budget} "
+                f"(K_r={K_r}, K={K}).", stacklevel=2)
+            K_f = K_f_budget
+    elif K_f > K:
         K_f = K
 
     S = max_states if max_states is not None else K

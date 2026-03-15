@@ -221,9 +221,9 @@ class BCGrounder(Grounder):
 
     @torch.no_grad()
     def forward(
-        self, queries: Tensor, query_mask: Tensor,
+        self, queries: Tensor, query_mask: Tensor, **init_kwargs,
     ) -> GroundingResult:
-        states = self.init_states(queries, query_mask)
+        states = self.init_states(queries, query_mask, **init_kwargs)
         for d in range(self.depth):
             states = self.step(states, d)
         result = self.filter_terminal(states)
@@ -236,37 +236,65 @@ class BCGrounder(Grounder):
 
     def init_states(
         self, queries: Tensor, query_mask: Tensor,
+        *,
+        initial_goals: Optional[Tensor] = None,
+        next_var_indices: Optional[Tensor] = None,
+        excluded_queries: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
-        """One state per query, query as sole goal."""
+        """Build initial states dict for the proof loop.
+
+        Args:
+            queries: [B, 3] query atoms.
+            query_mask: [B] validity mask.
+            initial_goals: [B, M_in, 3] multi-atom goal list to use instead
+                of the single query atom (for RL mid-proof entry).
+            next_var_indices: [B] pre-allocated variable counters. Defaults
+                to ``constant_no + 1`` (fresh).
+            excluded_queries: optional tensor for cycle prevention.
+        """
         B = queries.size(0)
         dev = queries.device
         pad = self.padding_idx
         G = self.max_goals
         M = self.M
         tG = self.effective_total_G
+        M_body = 1 if not self.track_grounding_body else M
 
         proof_goals = torch.full(
             (B, 1, G, 3), pad, dtype=torch.long, device=dev)
-        proof_goals[:, 0, 0, :] = queries
+        if initial_goals is not None:
+            M_in = initial_goals.shape[1]
+            proof_goals[:, 0, :M_in, :] = initial_goals
+        else:
+            proof_goals[:, 0, 0, :] = queries
         grounding_body = torch.full(
-            (B, 1, M, 3), pad, dtype=torch.long, device=dev)
+            (B, 1, M_body, 3), pad, dtype=torch.long, device=dev)
         top_ridx = torch.full((B, 1), -1, dtype=torch.long, device=dev)
         state_valid = query_mask.unsqueeze(1)
 
-        E = self.constant_no + 1
-        return {
+        if next_var_indices is None:
+            E = self.constant_no + 1
+            next_var_indices = torch.full(
+                (B,), E, dtype=torch.long, device=dev)
+
+        states = {
             "queries": queries,
             "query_mask": query_mask,
             "proof_goals": proof_goals,
             "grounding_body": grounding_body,
             "top_ridx": top_ridx,
             "state_valid": state_valid,
-            "next_var_indices": torch.full(
-                (B,), E, dtype=torch.long, device=dev),
+            "next_var_indices": next_var_indices,
+            "initial_next_var": next_var_indices,
             "collected_body": queries.new_zeros(B, tG, M, 3),
             "collected_mask": torch.zeros(B, tG, dtype=torch.bool, device=dev),
             "collected_ridx": queries.new_zeros(B, tG),
         }
+        if initial_goals is not None:
+            states["initial_goals"] = initial_goals
+        if excluded_queries is not None:
+            states["excluded_queries"] = excluded_queries
+        return states
 
     def step(self, states: Dict, d: int) -> Dict:
         """One proof step: SELECT → RESOLVE → PACK → POSTPROCESS."""
@@ -304,8 +332,14 @@ class BCGrounder(Grounder):
 
         return states
 
-    def filter_terminal(self, states: Dict) -> GroundingResult:
-        """Apply soundness filter on collected groundings → GroundingResult."""
+    def filter_terminal(self, states: Dict):
+        """Apply soundness filter on collected groundings → GroundingResult.
+
+        When ``filter='none'``, returns the raw states dict (no collection).
+        """
+        if self.filter_mode == "none":
+            return states
+
         B = states["collected_body"].size(0)
         tG = self.effective_total_G
         M = self.M
