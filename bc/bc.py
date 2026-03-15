@@ -4,7 +4,7 @@ Configuration replaces classes:
   resolution: 'sld' | 'rtf' | 'enum'
   filter:     'prune' | 'provset' | 'none'
   depth, width, hooks
-  standardization_mode: None | 'offset' | 'canonical'
+  standardization: None | StandardizationConfig
 
 Canonical loop (same code path for all resolutions):
   states = init_states(queries, query_mask)
@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from grounder.base import Grounder
+from grounder.resolution.standardization import StandardizationConfig
 from grounder.bc.common import (
     compact_atoms,
     collect_groundings,
@@ -70,10 +71,7 @@ class BCGrounder(Grounder):
         fc_method: str = "join",
         fc_depth: int = 10,
         # Output variable standardization (for consumers of ungrounded states)
-        standardization_mode: Optional[str] = None,
-        runtime_var_end_index: Optional[int] = None,
-        standardizer_compile_mode: str = "reduce-overhead",
-        enforce_runtime_var_range: bool = False,
+        standardization: Optional[StandardizationConfig] = None,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -85,7 +83,7 @@ class BCGrounder(Grounder):
         self.compile_mode = compile_mode
         self.hooks = hooks or []
         self.track_grounding_body = track_grounding_body
-        self.standardization_mode = standardization_mode
+        self.standardization_mode = standardization.mode if standardization else None
 
         # Max goals: shared for all resolutions.
         # Must accommodate M body atoms for enum resolution.
@@ -105,21 +103,9 @@ class BCGrounder(Grounder):
 
         # Output variable standardization
         self._standardize_fn: Optional[Callable] = None
-        if standardization_mode is not None:
+        if standardization is not None:
             from grounder.resolution.standardization import build_standardize_fn
-            if runtime_var_end_index is None:
-                raise ValueError(
-                    "runtime_var_end_index is required when standardization_mode is set")
-            self._standardize_fn = build_standardize_fn(
-                standardization_mode,
-                self.constant_no,
-                int(runtime_var_end_index),
-                self.padding_idx,
-                self.M,
-                self._device,
-                standardizer_compile_mode,
-                enforce_runtime_var_range,
-            )
+            self._standardize_fn = build_standardize_fn(standardization, self._device)
 
     # ==================================================================
     # Resolution init
