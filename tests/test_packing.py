@@ -1,8 +1,8 @@
-"""Tests for grounder.packing: compact_atoms, pack_combined, pack_fact_rule."""
+"""Tests for grounder.bc.common: compact_atoms, pack_states."""
 
 import torch
 import pytest
-from grounder.packing import compact_atoms, pack_combined, pack_fact_rule
+from grounder.bc.common import compact_atoms, pack_states
 
 PAD = 99
 
@@ -47,50 +47,128 @@ class TestCompactAtoms:
         assert result[1, 1, 0].tolist() == [4, 5, 6]
 
 
-class TestPackCombined:
-    def test_compact_valid(self):
-        B, K_total, M = 1, 4, 2
-        states = torch.full((B, K_total, M, 3), PAD, dtype=torch.long)
-        states[0, 1] = torch.tensor([[1, 2, 3], [4, 5, 6]])
-        states[0, 3] = torch.tensor([[7, 8, 9], [10, 11, 12]])
-        success = torch.tensor([[False, True, False, True]])
-        derived, counts = pack_combined(states, success, K=3, M=M, padding_idx=PAD)
-        assert counts[0].item() == 2
-        assert derived.shape == (1, 3, 2, 3)
-        # Valid entries should be in positions 0 and 1
-        assert derived[0, 0, 0].tolist() == [1, 2, 3]
-        assert derived[0, 1, 0].tolist() == [7, 8, 9]
+class TestPackStates:
+    """Tests for pack_states: flatten fact/rule resolution children into S_out states."""
 
-    def test_cap_at_K(self):
-        B, K_total, M = 1, 5, 1
-        states = torch.ones(B, K_total, M, 3, dtype=torch.long)
-        success = torch.ones(B, K_total, dtype=torch.bool)
-        derived, counts = pack_combined(states, success, K=3, M=M, padding_idx=PAD)
-        assert counts[0].item() == 3
-        assert derived.shape == (1, 3, 1, 3)
+    def test_single_fact_child(self):
+        """One valid fact child should appear in output."""
+        B, S_in, K_f, K_r, G, M = 1, 1, 2, 1, 3, 2
+        S_out = 4
 
+        # Fact resolution: 1 valid fact child out of K_f=2
+        fact_goals = torch.full((B, S_in, K_f, G, 3), PAD, dtype=torch.long)
+        fact_gbody = torch.full((B, S_in, K_f, M, 3), PAD, dtype=torch.long)
+        fact_gbody[0, 0, 0] = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        fact_success = torch.tensor([[[True, False]]])
 
-class TestPackFactRule:
-    def test_fact_and_rule(self):
-        B, M, G = 1, 2, 3
-        fact_gbody = torch.ones(B, 2, M, 3, dtype=torch.long)
-        fact_goals = torch.full((B, 2, G, 3), PAD, dtype=torch.long)
-        fact_valid = torch.tensor([[True, False]])
-        fact_ridx = torch.tensor([[0, 0]])
+        # Rule resolution: no valid children
+        rule_goals = torch.full((B, S_in, K_r, G, 3), PAD, dtype=torch.long)
+        rule_gbody = torch.full((B, S_in, K_r, M, 3), PAD, dtype=torch.long)
+        rule_success = torch.zeros(B, S_in, K_r, dtype=torch.bool)
+        sub_rule_idx = torch.zeros(B, S_in, K_r, dtype=torch.long)
 
-        rule_gbody = torch.ones(B, 2, M, 3, dtype=torch.long) * 2
-        rule_goals = torch.full((B, 2, G, 3), PAD, dtype=torch.long)
-        rule_valid = torch.tensor([[True, False]])
-        rule_ridx = torch.tensor([[1, 0]])
+        # Parent state: already has a rule index (not first resolution)
+        top_ridx = torch.tensor([[0]], dtype=torch.long)
+        grounding_body = torch.ones(B, S_in, M, 3, dtype=torch.long)
 
-        gbody, goals, ridx, valid = pack_fact_rule(
-            fact_gbody, fact_goals, fact_valid, fact_ridx,
-            rule_gbody, rule_goals, rule_valid, rule_ridx,
-            S=4, pad_idx=PAD)
+        gbody, goals, ridx, valid = pack_states(
+            fact_goals, fact_gbody, fact_success,
+            rule_goals, rule_gbody, rule_success, sub_rule_idx,
+            top_ridx, grounding_body,
+            S_out, PAD,
+        )
 
-        assert valid.shape == (1, 4)
-        assert valid[0, 0].item() is True  # fact
-        assert valid[0, 1].item() is True  # rule
-        assert valid[0, 2].item() is False
-        assert ridx[0, 0].item() == 0  # fact ridx
-        assert ridx[0, 1].item() == 1  # rule ridx
+        assert valid.shape == (B, S_out)
+        assert valid[0, 0].item() is True
+        assert valid[0, 1].item() is False
+
+    def test_fact_and_rule_children(self):
+        """Both fact and rule children should be packed together."""
+        B, S_in, K_f, K_r, G, M = 1, 1, 1, 1, 3, 2
+        S_out = 4
+
+        # 1 valid fact
+        fact_goals = torch.full((B, S_in, K_f, G, 3), PAD, dtype=torch.long)
+        fact_gbody = torch.ones(B, S_in, K_f, M, 3, dtype=torch.long)
+        fact_success = torch.tensor([[[True]]])
+
+        # 1 valid rule
+        rule_goals = torch.full((B, S_in, K_r, G, 3), PAD, dtype=torch.long)
+        rule_goals[0, 0, 0, 0] = torch.tensor([1, 2, 3])  # remaining goal
+        rule_gbody = torch.ones(B, S_in, K_r, M, 3, dtype=torch.long) * 2
+        rule_success = torch.tensor([[[True]]])
+        sub_rule_idx = torch.tensor([[[1]]])
+
+        # First resolution (top_ridx == -1)
+        top_ridx = torch.tensor([[-1]], dtype=torch.long)
+        grounding_body = torch.full((B, S_in, M, 3), PAD, dtype=torch.long)
+
+        gbody, goals, ridx, valid = pack_states(
+            fact_goals, fact_gbody, fact_success,
+            rule_goals, rule_gbody, rule_success, sub_rule_idx,
+            top_ridx, grounding_body,
+            S_out, PAD,
+        )
+
+        assert valid.shape == (B, S_out)
+        # Fact child skipped at first resolution (uninit grounding_body),
+        # rule child should be valid
+        n_valid = valid[0].sum().item()
+        assert n_valid >= 1, f"Expected at least 1 valid child, got {n_valid}"
+
+    def test_output_capped_at_S_out(self):
+        """More valid children than S_out should be capped."""
+        B, S_in, K_f, K_r, G, M = 1, 2, 2, 2, 3, 1
+        S_out = 3  # cap at 3
+
+        # All children valid
+        fact_goals = torch.full((B, S_in, K_f, G, 3), PAD, dtype=torch.long)
+        fact_gbody = torch.ones(B, S_in, K_f, M, 3, dtype=torch.long)
+        fact_success = torch.ones(B, S_in, K_f, dtype=torch.bool)
+
+        rule_goals = torch.full((B, S_in, K_r, G, 3), PAD, dtype=torch.long)
+        rule_gbody = torch.ones(B, S_in, K_r, M, 3, dtype=torch.long)
+        rule_success = torch.ones(B, S_in, K_r, dtype=torch.bool)
+        sub_rule_idx = torch.ones(B, S_in, K_r, dtype=torch.long)
+
+        # Not first resolution
+        top_ridx = torch.tensor([[0, 1]], dtype=torch.long)
+        grounding_body = torch.ones(B, S_in, M, 3, dtype=torch.long)
+
+        gbody, goals, ridx, valid = pack_states(
+            fact_goals, fact_gbody, fact_success,
+            rule_goals, rule_gbody, rule_success, sub_rule_idx,
+            top_ridx, grounding_body,
+            S_out, PAD,
+        )
+
+        assert gbody.shape == (B, S_out, M, 3)
+        assert goals.shape == (B, S_out, G, 3)
+        assert valid.shape == (B, S_out)
+        assert valid[0].sum().item() <= S_out
+
+    def test_no_valid_children(self):
+        """No valid children should produce all-False validity."""
+        B, S_in, K_f, K_r, G, M = 1, 1, 1, 1, 2, 1
+        S_out = 4
+
+        fact_goals = torch.full((B, S_in, K_f, G, 3), PAD, dtype=torch.long)
+        fact_gbody = torch.full((B, S_in, K_f, M, 3), PAD, dtype=torch.long)
+        fact_success = torch.zeros(B, S_in, K_f, dtype=torch.bool)
+
+        rule_goals = torch.full((B, S_in, K_r, G, 3), PAD, dtype=torch.long)
+        rule_gbody = torch.full((B, S_in, K_r, M, 3), PAD, dtype=torch.long)
+        rule_success = torch.zeros(B, S_in, K_r, dtype=torch.bool)
+        sub_rule_idx = torch.zeros(B, S_in, K_r, dtype=torch.long)
+
+        top_ridx = torch.tensor([[0]], dtype=torch.long)
+        grounding_body = torch.ones(B, S_in, M, 3, dtype=torch.long)
+
+        gbody, goals, ridx, valid = pack_states(
+            fact_goals, fact_gbody, fact_success,
+            rule_goals, rule_gbody, rule_success, sub_rule_idx,
+            top_ridx, grounding_body,
+            S_out, PAD,
+        )
+
+        assert valid.sum().item() == 0

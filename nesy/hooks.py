@@ -1,26 +1,34 @@
-"""NeSy hook protocols — applied during/after resolution or as provability replacement.
+"""NeSy hook protocols — injection points in the grounding pipeline.
 
-Hook protocols define the interface for plugging neural components into the
-grounding pipeline. They are orthogonal to FOL grounding logic.
+Three injection points:
 
-Three protocol types:
-    ResolutionHook:     scores/filters entity candidates during resolution.
-    PostResolutionHook: scores/ranks final groundings after resolution.
-    ProvabilityHook:    replaces hard provability with soft scores.
+ResolutionHook
+    During RESOLVE — scores/filters entity candidates or rules.
+    Injected inside resolve_sld/rtf/enum.
+
+StepHook
+    After each STEP — filters/reranks proof states between iterations.
+    Injected between step() calls in the canonical loop.
+
+GroundingHook
+    After grounding — scores/ranks/filters the final output.
+    Injected in forward() after ground().
 """
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol, Tuple, runtime_checkable
 
 from torch import Tensor
 
 
 @runtime_checkable
 class ResolutionHook(Protocol):
-    """Applied during resolution — scores/filters entity candidates."""
+    """During RESOLVE — scores entity candidates or filters rules."""
 
-    def score_candidates(self, candidates: Tensor, context: Tensor) -> Tensor:
+    def score_candidates(
+        self, candidates: Tensor, context: Tensor,
+    ) -> Tensor:
         """Score entity candidates.
 
         Args:
@@ -34,39 +42,35 @@ class ResolutionHook(Protocol):
 
 
 @runtime_checkable
-class PostResolutionHook(Protocol):
-    """Applied after resolution — scores/ranks final groundings."""
+class StepHook(Protocol):
+    """After each STEP — filters/reranks proof states."""
 
-    def score_groundings(
+    def on_step(
         self,
-        body: Tensor,      # [B, tG, M, 3]
+        body: Tensor,       # [B, tG, M, 3]
         mask: Tensor,       # [B, tG]
-        ridx: Tensor,       # [B, tG]
-    ) -> Tensor:
-        """Score groundings for ranking.
+        rule_idx: Tensor,   # [B, tG]
+        d: int,             # current depth
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Process states after one proof step.
 
-        Args:
-            body: [B, tG, M, 3] grounded body atoms.
-            mask: [B, tG] validity mask.
-            ridx: [B, tG] rule indices.
-
-        Returns:
-            scores: [B, tG] grounding scores.
+        Returns: (body, mask, rule_idx) — possibly filtered/reranked.
         """
         ...
 
 
 @runtime_checkable
-class ProvabilityHook(Protocol):
-    """Replaces hard provability with soft scores."""
+class GroundingHook(Protocol):
+    """After grounding — scores/ranks/filters final output."""
 
-    def provability_score(self, atoms: Tensor) -> Tensor:
-        """Compute soft provability scores.
+    def apply(
+        self,
+        body: Tensor,       # [B, tG, M, 3]
+        mask: Tensor,       # [B, tG]
+        rule_idx: Tensor,   # [B, tG]
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Process final groundings.
 
-        Args:
-            atoms: [..., 3] atom triples.
-
-        Returns:
-            scores: [...] soft provability in [0, 1].
+        Returns: (body, mask, rule_idx) — possibly resized/reordered.
         """
         ...

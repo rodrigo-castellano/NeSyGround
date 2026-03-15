@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.compilation import CompiledRule
+from grounder.rule_index import RulePattern
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -216,7 +216,7 @@ def _compute_join_order(bps, m: int) -> List[int]:
     return order
 
 
-def _compute_frontiers(cr: CompiledRule, ordered_bps=None) -> List[set]:
+def _compute_frontiers(cr: RulePattern, ordered_bps=None) -> List[set]:
     """F_k = head_vars ∪ (seen_vars_0..k ∩ future_vars_{k+1..m-1})."""
     m = cr.num_body
     head_vars = {cr.head_var0, cr.head_var1}
@@ -247,7 +247,7 @@ class FCDynamic(nn.Module):
     Handles all connected rule types including non-chain (fork) rules.
 
     Args:
-        compiled_rules: List of CompiledRule from grounder/compilation.py.
+        compiled_rules: List of RulePattern from grounder/compilation.py.
         facts_idx: [F, 3] raw fact triples (pred, subj, obj).
         num_entities: Total number of entities.
         num_predicates: Total number of predicates.
@@ -256,7 +256,7 @@ class FCDynamic(nn.Module):
 
     def __init__(
         self,
-        compiled_rules: List[CompiledRule],
+        compiled_rules: List[RulePattern],
         facts_idx: Tensor,
         num_entities: int,
         num_predicates: int,
@@ -338,7 +338,7 @@ class FCDynamic(nn.Module):
     # ── Full join (step 0) ────────────────────────────────────────────
 
     def _apply_rule(
-        self, cr: CompiledRule, ordered_bps: list,
+        self, cr: RulePattern, ordered_bps: list,
         prov_ps_off: Tensor, prov_ps_vals: Tensor,
         prov_po_off: Tensor, prov_po_vals: Tensor,
         provable_hashes: Tensor,
@@ -384,7 +384,7 @@ class FCDynamic(nn.Module):
     # ── Semi-naive anchored term (step t > 0) ─────────────────────────
 
     def _apply_rule_anchored(
-        self, cr: CompiledRule,
+        self, cr: RulePattern,
         anchor_k: int, join_order: List[int], ordered_bps: list,
         delta_ps_off: Tensor, delta_ps_vals: Tensor,
         delta_po_off: Tensor, delta_po_vals: Tensor, delta_hashes: Tensor,
@@ -645,7 +645,7 @@ class FCDynamic(nn.Module):
 # ══════════════════════════════════════════════════════════════════════
 
 def run_forward_chaining(
-    compiled_rules: List[CompiledRule],
+    compiled_rules: List[RulePattern],
     facts_idx: Tensor,
     num_entities: int,
     num_predicates: int,
@@ -655,7 +655,7 @@ def run_forward_chaining(
     """Run forward chaining and return (sorted_hashes, n_provable).
 
     Args:
-        compiled_rules: List of CompiledRule from grounder/compilation.py.
+        compiled_rules: List of RulePattern from grounder/compilation.py.
         facts_idx: [F, 3] raw fact triples.
         num_entities: Total entity count.
         num_predicates: Total predicate count.

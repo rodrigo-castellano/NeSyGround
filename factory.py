@@ -1,69 +1,49 @@
-"""Grounder factory — parse grounder_type string and instantiate the right class.
+"""Grounder factory — parse grounder_type string and instantiate BCGrounder.
 
-Uses raw tensor interface (no ns_lib domain objects).
+All grounder types map to BCGrounder (or LazyGrounder wrapping BCGrounder)
+with appropriate resolution, filter, width, and depth settings.
 
 Naming convention:
   BC grounders:       '{name}_{depth}'        (e.g., bcprune_2, bcprovset_3)
   Parametrized:       '{name}_{width}_{depth}' (e.g., lazy_0_1, soft_1_2)
-  backward_W_D is also accepted (maps to ParametrizedBCGrounder).
+  backward_W_D is also accepted (maps to BCGrounder with enum resolution).
 """
 
 from __future__ import annotations
 
-from typing import Optional, Set, Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.base import Grounder
-from grounder.bc.bc import PrologGrounder, RTFGrounder
-from grounder.types import ForwardResult
+from grounder.bc.bc import BCGrounder
+from grounder.bc.lazy import LazyGrounder
 
 
-def _lazy_imports():
-    """Lazy import all grounder classes to avoid circular imports."""
-    from grounder.grounders.parametrized import ParametrizedBCGrounder
-    from grounder.grounders.full import FullBCGrounder
-    from grounder.grounders.prune import BCPruneGrounder
-    from grounder.grounders.provset import BCProvsetGrounder
-    from grounder.nesy.sampler import SamplerGrounder
-    from grounder.nesy.kge import KGEGrounder, NeuralGrounder
-    from grounder.nesy.soft import SoftGrounder
-    from grounder.grounders.lazy import LazyGrounder
-    return {
-        "ParametrizedBCGrounder": ParametrizedBCGrounder,
-        "FullBCGrounder": FullBCGrounder,
-        "BCPruneGrounder": BCPruneGrounder,
-        "BCProvsetGrounder": BCProvsetGrounder,
-        "SamplerGrounder": SamplerGrounder,
-        "KGEGrounder": KGEGrounder,
-        "NeuralGrounder": NeuralGrounder,
-        "SoftGrounder": SoftGrounder,
-        "LazyGrounder": LazyGrounder,
-    }
-
-
-# (prefix, class_name, extra_kwargs)
+# (prefix, resolution, filter, uses_width)
 # Order matters: longer prefixes first to avoid prefix collisions.
 _REGISTRY = [
-    # Parametrized grounders (use width+depth: prefix_W_D)
-    ("lazy_", "LazyGrounder", {}),
-    ("sampler_", "SamplerGrounder", {"_sample": True}),
-    ("kge_", "KGEGrounder", {}),
-    ("neural_", "NeuralGrounder", {}),
-    ("softneural_", "SoftGrounder", {"mode": "neural"}),
-    ("soft_", "SoftGrounder", {"mode": "kge"}),
-    # BC grounders (use depth only: prefix_D)
-    ("bcprovset_", "BCProvsetGrounder", {}),
-    ("bcprune_", "BCPruneGrounder", {}),
-    # SLD grounders (existing prolog/rtf)
-    ("prolog_", "PrologGrounder", {"_prolog": True}),
-    ("rtf_", "RTFGrounder", {"_rtf": True}),
-    # Full BC (no width/depth suffix)
-    ("full", "FullBCGrounder", {}),
-    # Parametrized BC fallback (backward_W_D → ParametrizedBCGrounder)
-    ("backward_", "ParametrizedBCGrounder", {}),
+    # NeSy grounders (enum resolution, hooks TBD) — width+depth: prefix_W_D
+    ("softneural_", "enum", "prune", True),
+    ("soft_",       "enum", "prune", True),
+    ("sampler_",    "enum", "prune", True),
+    ("kge_",        "enum", "prune", True),
+    ("neural_",     "enum", "prune", True),
+    # Lazy grounder — width+depth: lazy_W_D
+    ("lazy_",       "enum", "prune", True),
+    # SLD-based grounders — depth only: prefix_D
+    ("bcprovset_",  "sld",  "provset", False),
+    ("bcprune_",    "sld",  "prune",   False),
+    ("bcsld_",      "sld",  "none",    False),
+    ("bcprolog_",   "sld",  "none",    False),
+    ("prolog_",     "sld",  "none",    False),
+    # RTF grounder — depth only: rtf_D
+    ("rtf_",        "rtf",  "none",    False),
+    # Full BC — no suffix
+    ("full",        "enum", "prune",   False),
+    # Parametrized BC fallback — width+depth: backward_W_D
+    ("backward_",   "enum", "prune",   True),
 ]
 
 
@@ -81,7 +61,7 @@ def parse_grounder_type(grounder_type: str) -> Tuple[int, int]:
         'full'         → (1, 1)
     """
     suffix = None
-    for prefix, _, _ in _REGISTRY:
+    for prefix, _, _, _ in _REGISTRY:
         if grounder_type.startswith(prefix):
             suffix = grounder_type[len(prefix):]
             break
@@ -126,6 +106,20 @@ def create_grounder(
 ) -> nn.Module:
     """Create a grounder from a type string.
 
+    All type strings now map to BCGrounder (unified backward chaining) or
+    LazyGrounder (predicate-filtered wrapper over BCGrounder).
+
+    Mapping:
+        'prolog_D' / 'bcprolog_D' → BCGrounder(resolution='sld', depth=D)
+        'rtf_D'                   → BCGrounder(resolution='rtf', depth=D)
+        'bcprune_D'               → BCGrounder(resolution='sld', filter='prune', depth=D)
+        'bcprovset_D'             → BCGrounder(resolution='sld', filter='provset', depth=D)
+        'bcsld_D'                 → BCGrounder(resolution='sld', filter='none', depth=D)
+        'backward_W_D'            → BCGrounder(resolution='enum', width=W, depth=D, filter='prune')
+        'lazy_W_D'                → LazyGrounder wrapping BCGrounder
+        'full'                    → BCGrounder(resolution='enum', width=None, depth=1)
+        'sampler_W_D' etc.        → BCGrounder(resolution='enum', width=W, depth=D)
+
     Args:
         grounder_type: String like 'bcprune_2', 'backward_1_2', 'full', etc.
         facts_idx: [F, 3] fact triples.
@@ -138,7 +132,7 @@ def create_grounder(
         max_groundings: Max groundings per query per rule.
         max_total_groundings: Max total groundings per query.
         fc_method: FC method for provable set ('join').
-        kge_model: KGE model (for kge/neural/soft grounders).
+        kge_model: KGE model (for future hook integration).
         predicate_no: Number of predicates.
         num_entities: Number of entities.
         max_facts_per_query: K_f for fact index.
@@ -146,12 +140,27 @@ def create_grounder(
         max_goals: Max goals for BFS-based grounders.
 
     Returns:
-        Grounder module instance.
+        Grounder module instance (BCGrounder or LazyGrounder).
     """
-    classes = _lazy_imports()
     width, depth = parse_grounder_type(grounder_type)
 
-    # Base kwargs shared by all grounders that inherit from Grounder
+    # Look up resolution and filter from registry
+    resolution = "enum"
+    filter_mode = "prune"
+    uses_width = True
+    is_lazy = False
+    is_full = False
+
+    for prefix, res, filt, uw in _REGISTRY:
+        if grounder_type.startswith(prefix):
+            resolution = res
+            filter_mode = filt
+            uses_width = uw
+            is_lazy = prefix == "lazy_"
+            is_full = prefix == "full"
+            break
+
+    # Base kwargs shared by all grounders (positional args for Grounder base)
     base_kwargs = dict(
         facts_idx=facts_idx,
         rules_heads_idx=rule_heads,
@@ -166,78 +175,29 @@ def create_grounder(
         fact_index_type=fact_index_type,
     )
 
-    for prefix, class_name, extra in _REGISTRY:
-        if not grounder_type.startswith(prefix):
-            continue
-
-        cls = classes.get(class_name)
-        if cls is None:
-            # Fall through for PrologGrounder/RTFGrounder which are already
-            # imported at module level
-            if class_name == "PrologGrounder":
-                cls = PrologGrounder
-            elif class_name == "RTFGrounder":
-                cls = RTFGrounder
-            else:
-                raise ValueError(f"Unknown grounder class: {class_name}")
-
-        gkw = {**base_kwargs, **extra}
-
-        # Remove internal markers
-        is_sample = gkw.pop("_sample", False)
-        is_prolog = gkw.pop("_prolog", False)
-        is_rtf = gkw.pop("_rtf", False)
-
-        # Prolog/RTF grounders use max_goals, depth from BCGrounder
-        if is_prolog or is_rtf:
-            gkw["max_goals"] = max_goals
-            gkw["depth"] = depth
-            gkw["max_total_groundings"] = max_total_groundings
-            return cls(**gkw)
-
-        # ParametrizedBCGrounder and derivatives
-        if class_name in ("ParametrizedBCGrounder", "FullBCGrounder",
-                          "LazyGrounder", "SamplerGrounder",
-                          "KGEGrounder", "NeuralGrounder",
-                          "SoftGrounder"):
-            gkw["depth"] = depth
-            gkw["width"] = width
-            gkw["max_groundings_per_query"] = max_groundings
-            gkw["max_total_groundings"] = max_total_groundings
-
-            if class_name == "FullBCGrounder":
-                # Full grounder doesn't take width/depth/max_groundings_per_query
-                gkw.pop("width", None)
-                gkw.pop("depth", None)
-                gkw.pop("max_groundings_per_query", None)
-
-            if is_sample:
-                gkw["max_sample"] = max_total_groundings
-
-            if "mode" in extra:
-                gkw["kge_model"] = kge_model
-
-            if class_name in ("KGEGrounder", "NeuralGrounder"):
-                gkw["kge_model"] = kge_model
-
-            return cls(**gkw)
-
-        # BC grounders (BCPruneGrounder, BCProvsetGrounder)
-        if class_name in ("BCPruneGrounder", "BCProvsetGrounder"):
-            gkw["depth"] = depth
-            gkw["max_groundings_per_query"] = max_groundings
-            gkw["max_total_groundings"] = max_total_groundings
-            gkw["max_goals"] = max_goals
-            return cls(**gkw)
-
-        return cls(**gkw)
-
-    # Fallback: ParametrizedBCGrounder
-    cls = classes["ParametrizedBCGrounder"]
-    return cls(
-        **base_kwargs,
+    # BCGrounder-specific kwargs
+    bc_kwargs = dict(
+        resolution=resolution,
+        filter=filter_mode,
         depth=depth,
-        width=width,
-        max_groundings_per_query=max_groundings,
         max_total_groundings=max_total_groundings,
+        max_goals=max_goals,
     )
+
+    # Enum resolution: set width + enum-specific params
+    if resolution == "enum":
+        if is_full:
+            bc_kwargs["width"] = None
+            bc_kwargs["depth"] = 1
+        else:
+            bc_kwargs["width"] = width
+        bc_kwargs["max_groundings_per_query"] = max_groundings
+        bc_kwargs["fc_method"] = fc_method
+
+    # Merge all kwargs
+    gkw = {**base_kwargs, **bc_kwargs}
+
+    if is_lazy:
+        return LazyGrounder(**gkw)
+
+    return BCGrounder(**gkw)

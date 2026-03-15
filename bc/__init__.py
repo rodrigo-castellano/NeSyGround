@@ -1,4 +1,5 @@
 # bc/ — backward chaining grounders
-from grounder.bc.bc import BCGrounder, PrologGrounder, RTFGrounder
+from grounder.bc.bc import BCGrounder
+from grounder.bc.lazy import LazyGrounder
 
-__all__ = ["BCGrounder", "PrologGrounder", "RTFGrounder"]
+__all__ = ["BCGrounder", "LazyGrounder"]

@@ -1,6 +1,6 @@
 """Integration tests using real KG datasets (family, wn18rr, fb15k237).
 
-Tests that PrologGrounder can load real KBs and find groundings for
+Tests that BCGrounder (SLD resolution) can load real KBs and find groundings for
 test queries. Datasets are loaded from kge_experiments/data/.
 """
 
@@ -11,12 +11,12 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 import pytest
-from grounder import PrologGrounder
+from grounder import BCGrounder
 
 DEVICE = torch.device("cpu")
 DATA_ROOT = Path(os.environ.get(
     "GROUNDER_DATA_ROOT",
-    os.path.expanduser("~/Batched_env-swarm/main/kge_experiments/data"),
+    os.path.join(os.path.dirname(__file__), "..", "..", "data"),
 ))
 
 
@@ -185,8 +185,8 @@ def _build_kb(
 
 
 def _make_grounder(dataset_name: str, depth: int = 2, max_facts: Optional[int] = None,
-                   max_total_groundings: int = 16) -> Tuple[PrologGrounder, Dict, Dict]:
-    """Build a PrologGrounder from a dataset."""
+                   max_total_groundings: int = 16) -> Tuple[BCGrounder, Dict, Dict]:
+    """Build a BCGrounder (SLD, no filter) from a dataset."""
     (facts_idx, heads_idx, bodies_idx, rule_lens,
      constant_no, padding_idx, predicate_no,
      entity2idx, pred2idx) = _build_kb(dataset_name, max_facts=max_facts)
@@ -194,7 +194,7 @@ def _make_grounder(dataset_name: str, depth: int = 2, max_facts: Optional[int] =
     M = int(rule_lens.max().item()) if rule_lens.numel() > 0 else 1
     G = M + (M - 1) * depth + 1  # enough goals for depth
 
-    grounder = PrologGrounder(
+    grounder = BCGrounder(
         facts_idx=facts_idx,
         rules_heads_idx=heads_idx,
         rules_bodies_idx=bodies_idx,
@@ -203,10 +203,13 @@ def _make_grounder(dataset_name: str, depth: int = 2, max_facts: Optional[int] =
         padding_idx=padding_idx,
         device=DEVICE,
         predicate_no=predicate_no,
+        resolution='sld',
+        filter='none',
         max_goals=G,
         depth=depth,
         max_total_groundings=max_total_groundings,
         K_MAX=50,  # keep small for CPU tests
+        fact_index_type='arg_key',
     )
     return grounder, entity2idx, pred2idx
 
@@ -240,7 +243,7 @@ class TestFamily:
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         print(f"Family query pred={head_pred}, entity={entity}: "
-              f"found {result.collected_count[0].item()} groundings")
+              f"found {result.count[0].item()} groundings")
         # We don't assert >0 since not every (pred, entity) combo has groundings
 
     def test_batch_queries(self):
@@ -256,7 +259,7 @@ class TestFamily:
         ], dtype=torch.long)
         query_mask = torch.ones(B, dtype=torch.bool)
         result = grounder(queries, query_mask)
-        total = result.collected_count.sum().item()
+        total = result.count.sum().item()
         print(f"Family batch of {B}: total groundings = {total}")
 
     def test_depth_increases_groundings(self):
@@ -279,8 +282,8 @@ class TestFamily:
 
         r1 = grounder_d1(queries_t, mask)
         r2 = grounder_d2(queries_t, mask)
-        c1 = r1.collected_count.sum().item()
-        c2 = r2.collected_count.sum().item()
+        c1 = r1.count.sum().item()
+        c2 = r2.count.sum().item()
         print(f"Family depth comparison: depth=2 → {c1}, depth=3 → {c2}")
         assert c2 >= c1, f"Depth 3 should find >= depth 2 groundings ({c2} < {c1})"
 
@@ -315,7 +318,7 @@ class TestWN18RR:
         queries_t = torch.tensor(queries, dtype=torch.long)
         mask = torch.ones(len(queries), dtype=torch.bool)
         result = grounder(queries_t, mask)
-        total = result.collected_count.sum().item()
+        total = result.count.sum().item()
         print(f"WN18RR batch of {len(queries)}: total groundings = {total}")
 
 
@@ -349,5 +352,5 @@ class TestFB15K237:
         queries_t = torch.tensor(queries, dtype=torch.long)
         mask = torch.ones(len(queries), dtype=torch.bool)
         result = grounder(queries_t, mask)
-        total = result.collected_count.sum().item()
+        total = result.count.sum().item()
         print(f"FB15K-237 batch of {len(queries)}: total groundings = {total}")

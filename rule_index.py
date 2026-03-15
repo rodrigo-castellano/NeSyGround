@@ -1,41 +1,55 @@
-"""Rule index: segment-based and table-based predicate-to-rule lookup.
+"""Rule indexing — sorted storage, lookup, and binding analysis.
 
-Sorts rules by head predicate and provides two lookup strategies:
-- Segment-based (BE style): fixed-width offset lookup via pairs_via_predicate_ranges
-- Table-based (TS style): direct [P, R_eff] index table with mask
+RuleIndex(nn.Module)
+    Sorted rule tensors + segment-based predicate→rule lookup.
+    Used directly by MGU resolution (SLD, RTF).
 
-All tensors are registered as buffers for device transfer and state_dict support.
+RuleIndexEnum(RuleIndex)
+    Adds per-rule binding analysis + tensorized enum metadata.
+    Used by enum resolution and forward chaining.
 
-Part of the grounder package.
+RulePattern
+    Per-rule variable binding pattern (internal to RuleIndexEnum).
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+# Binding constants
+BINDING_HEAD_VAR0 = 0
+BINDING_HEAD_VAR1 = 1
+BINDING_FREE_VAR_OFFSET = 2
+
+
+# ======================================================================
+# RuleIndex — base: sorted storage + segment lookup
+# ======================================================================
 
 class RuleIndex(nn.Module):
-    """Predicate-to-rule lookup index with segment and table strategies.
+    """Sorted rules with predicate→rule segment lookup.
+
+    Sufficient for MGU resolution (SLD, RTF). For enum resolution,
+    use RuleIndexEnum which adds binding analysis.
 
     Args:
-        rules_heads_idx: [R, 3] rule head atoms (pred, arg0, arg1)
-        rules_bodies_idx: [R, Bmax, 3] rule body atoms
-        rule_lens: [R] number of body atoms per rule
-        device: target device
-        predicate_no: total number of predicates (exclusive upper bound);
-            if None, inferred from rules_heads_idx
-        padding_idx: index used for padding
+        rules_heads_idx:  [R, 3] rule head atoms.
+        rules_bodies_idx: [R, Bmax, 3] rule body atoms.
+        rule_lens:        [R] body lengths.
+        device:           target device.
+        predicate_no:     total predicates (exclusive upper bound).
+        padding_idx:      padding value.
     """
 
     def __init__(
         self,
-        rules_heads_idx: Tensor,  # [R, 3]
-        rules_bodies_idx: Tensor,  # [R, Bmax, 3]
-        rule_lens: Tensor,  # [R]
+        rules_heads_idx: Tensor,
+        rules_bodies_idx: Tensor,
+        rule_lens: Tensor,
         device: torch.device,
         predicate_no: Optional[int] = None,
         padding_idx: int = 0,
@@ -45,78 +59,51 @@ class RuleIndex(nn.Module):
         R = rules_heads_idx.shape[0]
 
         if R > 0:
-            # Sort rules by head predicate
             order = torch.argsort(rules_heads_idx[:, 0], stable=True)
-            heads_sorted = rules_heads_idx.index_select(0, order).to(device)
-            bodies_sorted = rules_bodies_idx.index_select(0, order).to(device)
-            idx_sorted = order.to(device)
-            lens_sorted = rule_lens.index_select(0, order).to(device)
+            heads = rules_heads_idx.index_select(0, order).to(device)
+            bodies = rules_bodies_idx.index_select(0, order).to(device)
+            idx = order.to(device)
+            lens = rule_lens.index_select(0, order).to(device)
 
-            # --- Segment-based index (BE style) ---
-            preds = heads_sorted[:, 0]
+            preds = heads[:, 0]
             uniq, cnts = torch.unique_consecutive(preds, return_counts=True)
-            seg_input = torch.zeros(cnts.shape[0], dtype=torch.long, device=device)
-            seg_input[1:] = cnts[:-1]
-            seg_starts = torch.cumsum(seg_input, dim=0)
+            offsets = torch.zeros_like(cnts)
+            offsets[1:] = cnts[:-1]
+            seg_starts = offsets.cumsum(0)
 
-            num_pred = (predicate_no + 1) if predicate_no is not None else int(preds.max().item()) + 2
-            rule_seg_starts = torch.zeros(num_pred, dtype=torch.long, device=device)
-            rule_seg_lens = torch.zeros(num_pred, dtype=torch.long, device=device)
+            num_pred = (predicate_no + 1 if predicate_no is not None
+                        else int(preds.max().item()) + 2)
+            starts = torch.zeros(num_pred, dtype=torch.long, device=device)
+            seg_lens = torch.zeros(num_pred, dtype=torch.long, device=device)
             mask = uniq < num_pred
-            rule_seg_starts[uniq[mask]] = seg_starts[mask]
-            rule_seg_lens[uniq[mask]] = cnts[mask]
+            starts[uniq[mask]] = seg_starts[mask]
+            seg_lens[uniq[mask]] = cnts[mask]
 
-            _max_rule_pairs = int(cnts.max().item())
-
-            # --- Table-based index (TS style) ---
-            r_eff = _max_rule_pairs
-            pred_rule_indices = torch.zeros(num_pred, r_eff, dtype=torch.long, device=device)
-            pred_rule_mask = torch.zeros(num_pred, r_eff, dtype=torch.bool, device=device)
-            for p_idx in range(num_pred):
-                start = int(rule_seg_starts[p_idx].item())
-                length = int(rule_seg_lens[p_idx].item())
-                if length > 0:
-                    pred_rule_indices[p_idx, :length] = idx_sorted[start:start + length]
-                    pred_rule_mask[p_idx, :length] = True
+            self._max_rule_pairs = int(cnts.max().item())
         else:
-            heads_sorted = rules_heads_idx.to(device)
-            bodies_sorted = rules_bodies_idx.to(device)
-            idx_sorted = torch.zeros(0, dtype=torch.long, device=device)
-            lens_sorted = rule_lens.to(device)
-            rule_seg_starts = torch.zeros(1, dtype=torch.long, device=device)
-            rule_seg_lens = torch.zeros(1, dtype=torch.long, device=device)
-            _max_rule_pairs = 0
-            r_eff = 0
-            num_pred = 1
-            pred_rule_indices = torch.zeros(1, 0, dtype=torch.long, device=device)
-            pred_rule_mask = torch.zeros(1, 0, dtype=torch.bool, device=device)
+            heads = rules_heads_idx.to(device)
+            bodies = rules_bodies_idx.to(device)
+            idx = torch.zeros(0, dtype=torch.long, device=device)
+            lens = rule_lens.to(device)
+            starts = torch.zeros(1, dtype=torch.long, device=device)
+            seg_lens = torch.zeros(1, dtype=torch.long, device=device)
+            self._max_rule_pairs = 0
 
-        # Register all tensors as buffers
-        self.register_buffer("rules_heads_sorted", heads_sorted)
-        self.register_buffer("rules_bodies_sorted", bodies_sorted)
-        self.register_buffer("rules_idx_sorted", idx_sorted)
-        self.register_buffer("rule_lens_sorted", lens_sorted)
-        self.register_buffer("rule_seg_starts", rule_seg_starts)
-        self.register_buffer("rule_seg_lens", rule_seg_lens)
-        self.register_buffer("pred_rule_indices", pred_rule_indices)
-        self.register_buffer("pred_rule_mask", pred_rule_mask)
-
-        self._max_rule_pairs = _max_rule_pairs
-        self._R_eff = r_eff
-
-    # --- Properties ---
+        self.register_buffer("rules_heads_sorted", heads)
+        self.register_buffer("rules_bodies_sorted", bodies)
+        self.register_buffer("rules_idx_sorted", idx)
+        self.register_buffer("rule_lens_sorted", lens)
+        self.register_buffer("_seg_starts", starts)
+        self.register_buffer("_seg_lens", seg_lens)
 
     @property
     def max_rule_pairs(self) -> int:
-        """Maximum number of rules sharing a single head predicate."""
         return self._max_rule_pairs
 
     @property
     def R_eff(self) -> int:
-        """Width of the table-based index (= max_rule_pairs)."""
-        return self._R_eff
+        return self._max_rule_pairs
 
-    # Convenience aliases used by operations.py
     @property
     def rules_heads(self) -> Tensor:
         return self.rules_heads_sorted
@@ -129,62 +116,241 @@ class RuleIndex(nn.Module):
     def rule_lens(self) -> Tensor:
         return self.rule_lens_sorted
 
-    # --- Segment-based lookup (BE style) ---
-
     @torch.no_grad()
-    def lookup_by_segments(
-        self,
-        query_preds: Tensor,  # [B]
-        max_pairs: int,
+    def lookup(
+        self, query_preds: Tensor, max_pairs: int,
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        """Segment-based predicate lookup with fixed output shape.
+        """Predicate→rule segment lookup.
 
-        Args:
-            query_preds: [B] predicate ID per query
-            max_pairs: max pairs per query (output width)
-
-        Returns:
-            item_idx:   [B, max_pairs] indices into sorted rule arrays
-            valid_mask: [B, max_pairs] which pairs are valid
-            query_idx:  [B, max_pairs] repeated query indices
+        Returns: (item_idx [B, K], valid_mask [B, K], query_idx [B, K]).
         """
         B = query_preds.shape[0]
-        device = query_preds.device
-
+        dev = query_preds.device
         if B == 0:
-            return (
-                torch.zeros((0, max_pairs), dtype=torch.long, device=device),
-                torch.zeros((0, max_pairs), dtype=torch.bool, device=device),
-                torch.zeros((0, max_pairs), dtype=torch.long, device=device),
-            )
+            z = torch.zeros((0, max_pairs), dtype=torch.long, device=dev)
+            return z, z.bool(), z
 
-        lens = self.rule_seg_lens[query_preds.long()]      # [B]
-        starts = self.rule_seg_starts[query_preds.long()]   # [B]
+        lens = self._seg_lens[query_preds.long()]
+        starts = self._seg_starts[query_preds.long()]
+        offsets = torch.arange(max_pairs, device=dev).unsqueeze(0)
+        return (
+            starts.unsqueeze(1) + offsets,
+            offsets < lens.unsqueeze(1),
+            torch.arange(B, device=dev).unsqueeze(1).expand(-1, max_pairs),
+        )
 
-        offsets = torch.arange(max_pairs, device=device, dtype=torch.long).unsqueeze(0)  # [1, max_pairs]
+    # Backward compat alias
+    lookup_by_segments = lookup
 
-        item_idx = starts.unsqueeze(1) + offsets     # [B, max_pairs]
-        valid_mask = offsets < lens.unsqueeze(1)      # [B, max_pairs]
-        query_idx = torch.arange(B, device=device, dtype=torch.long).unsqueeze(1).expand(-1, max_pairs)
 
-        return item_idx, valid_mask, query_idx
+# ======================================================================
+# RulePattern — per-rule binding analysis (internal)
+# ======================================================================
 
-    # --- Table-based lookup (TS style) ---
+class RulePattern:
+    """Per-rule variable binding pattern with enumeration ordering.
 
-    @torch.no_grad()
-    def lookup_by_table(
+    Identifies head/free variables, computes binding sources for each
+    body atom argument, and reorders body atoms so each has ≥1 known arg.
+    """
+
+    def __init__(
+        self, rule_idx: int, head: Tensor, body: Tensor,
+        body_len: int, constant_no: int,
+    ) -> None:
+        self.rule_idx = rule_idx
+        self.constant_no = constant_no
+        self.head_pred_idx: int = head[0].item()
+        self.head_var0: int = head[1].item()
+        self.head_var1: int = head[2].item()
+        self.num_body: int = body_len
+        self.body_pred_indices: List[int] = [
+            body[j, 0].item() for j in range(body_len)]
+
+        # Free variables = body vars not in head
+        head_vars = {v for v in (self.head_var0, self.head_var1)
+                     if v > constant_no}
+        body_vars = {body[j, k].item()
+                     for j in range(body_len) for k in (1, 2)
+                     if body[j, k].item() > constant_no}
+        self.free_vars_list = sorted(body_vars - head_vars)
+        self.num_free = len(self.free_vars_list)
+        self._fv_idx = {v: i for i, v in enumerate(self.free_vars_list)}
+
+        self.body_patterns = [
+            {"pred_idx": body[j, 0].item(),
+             "arg0_binding": self._binding(body[j, 1].item()),
+             "arg1_binding": self._binding(body[j, 2].item())}
+            for j in range(body_len)]
+
+        self._reorder_body()
+
+    def _binding(self, val: int) -> int:
+        if val == self.head_var0:
+            return BINDING_HEAD_VAR0
+        if val == self.head_var1:
+            return BINDING_HEAD_VAR1
+        if val in self._fv_idx:
+            return BINDING_FREE_VAR_OFFSET + self._fv_idx[val]
+        return BINDING_HEAD_VAR0
+
+    def _reorder_body(self) -> None:
+        known = {BINDING_HEAD_VAR0, BINDING_HEAD_VAR1}
+        remaining = list(range(self.num_body))
+        order, meta = [], []
+
+        while remaining:
+            found = False
+            for idx in remaining:
+                bp = self.body_patterns[idx]
+                b0, b1 = bp["arg0_binding"], bp["arg1_binding"]
+                if b0 in known or b1 in known:
+                    if b0 in known and b1 in known:
+                        m = {"introduces_fv": -1, "enum_bound_src": 0,
+                             "enum_direction": 0, "enum_pred": bp["pred_idx"]}
+                    elif b0 in known:
+                        m = {"introduces_fv": b1 - BINDING_FREE_VAR_OFFSET,
+                             "enum_bound_src": b0, "enum_direction": 0,
+                             "enum_pred": bp["pred_idx"]}
+                        known.add(b1)
+                    else:
+                        m = {"introduces_fv": b0 - BINDING_FREE_VAR_OFFSET,
+                             "enum_bound_src": b1, "enum_direction": 1,
+                             "enum_pred": bp["pred_idx"]}
+                        known.add(b0)
+                    order.append(idx)
+                    meta.append(m)
+                    remaining.remove(idx)
+                    found = True
+                    break
+            if not found:
+                for idx in remaining:
+                    order.append(idx)
+                    meta.append({"introduces_fv": -1, "enum_bound_src": 0,
+                                 "enum_direction": 0,
+                                 "enum_pred": self.body_patterns[idx]["pred_idx"]})
+                break
+
+        self.enum_meta = meta
+        self.body_patterns = [self.body_patterns[i] for i in order]
+        self.body_pred_indices = [self.body_pred_indices[i] for i in order]
+
+
+
+
+# ======================================================================
+# RuleIndexEnum — adds binding analysis + enum metadata tensors
+# ======================================================================
+
+class RuleIndexEnum(RuleIndex):
+    """Rule index with binding analysis and enum metadata.
+
+    Extends RuleIndex with per-rule binding patterns and tensorized
+    metadata for compiled enumeration resolution.
+
+    Additional args (vs RuleIndex):
+        constant_no:     highest constant index (for binding analysis).
+        num_predicates:  total predicates (for pred→rule clustering).
+    """
+
+    def __init__(
         self,
-        query_preds: Tensor,  # [N]
-    ) -> Tuple[Tensor, Tensor]:
-        """Table-based predicate lookup returning original rule indices + mask.
+        rules_heads_idx: Tensor,
+        rules_bodies_idx: Tensor,
+        rule_lens: Tensor,
+        constant_no: int,
+        device: torch.device,
+        *,
+        num_predicates: int,
+        predicate_no: Optional[int] = None,
+        padding_idx: int = 0,
+    ) -> None:
+        super().__init__(
+            rules_heads_idx, rules_bodies_idx, rule_lens, device,
+            predicate_no=predicate_no, padding_idx=padding_idx,
+        )
+        R = self.rules_heads_sorted.size(0)
 
-        Args:
-            query_preds: [N] predicate IDs
+        # Per-rule binding analysis
+        self.patterns: List[RulePattern] = [
+            RulePattern(i, self.rules_heads_sorted[i],
+                        self.rules_bodies_sorted[i],
+                        int(self.rule_lens_sorted[i].item()), constant_no)
+            for i in range(R)]
 
-        Returns:
-            rule_idx: [N, R_eff] original rule indices per query predicate
-            mask:     [N, R_eff] validity mask
-        """
-        rule_idx = self.pred_rule_indices[query_preds.long()]   # [N, R_eff]
-        mask = self.pred_rule_mask[query_preds.long()]           # [N, R_eff]
-        return rule_idx, mask
+        self.max_body: int = max(
+            (p.num_body for p in self.patterns), default=1)
+        M = self.max_body
+        Rt = max(R, 1)
+
+        # ── Tensorize rule metadata ──
+        head_preds = torch.zeros(Rt, dtype=torch.long, device=device)
+        body_preds = torch.zeros(Rt, M, dtype=torch.long, device=device)
+        num_body = torch.zeros(Rt, dtype=torch.long, device=device)
+        has_free = torch.zeros(Rt, dtype=torch.bool, device=device)
+        enum_pred = torch.zeros(Rt, dtype=torch.long, device=device)
+        enum_bound = torch.zeros(Rt, dtype=torch.long, device=device)
+        enum_dir = torch.zeros(Rt, dtype=torch.long, device=device)
+        arg_source = torch.zeros(Rt, M, 2, dtype=torch.long, device=device)
+
+        for i, p in enumerate(self.patterns):
+            head_preds[i] = p.head_pred_idx
+            num_body[i] = p.num_body
+            has_free[i] = p.num_free > 0
+            for j, bp in enumerate(p.body_patterns):
+                body_preds[i, j] = bp["pred_idx"]
+                arg_source[i, j, 0] = bp["arg0_binding"]
+                arg_source[i, j, 1] = bp["arg1_binding"]
+            for m in p.enum_meta:
+                if m["introduces_fv"] >= 0:
+                    enum_pred[i] = m["enum_pred"]
+                    enum_bound[i] = m["enum_bound_src"]
+                    enum_dir[i] = m["enum_direction"]
+                    break
+
+        self.register_buffer("head_preds", head_preds)
+        self.register_buffer("body_preds", body_preds)
+        self.register_buffer("num_body_atoms", num_body)
+        self.register_buffer("has_free", has_free)
+        self.register_buffer("enum_pred", enum_pred)
+        self.register_buffer("enum_bound", enum_bound)
+        self.register_buffer("enum_dir", enum_dir)
+        self.register_buffer("arg_source", arg_source)
+
+        # ── Predicate → rule clustering ──
+        P = num_predicates
+        pred_to_rules: Dict[int, List[int]] = {}
+        for i, p in enumerate(self.patterns):
+            pred_to_rules.setdefault(p.head_pred_idx, []).append(i)
+
+        R_eff = max((len(v) for v in pred_to_rules.values()), default=1)
+        pred_rule_indices = torch.zeros(
+            P, R_eff, dtype=torch.long, device=device)
+        pred_rule_mask = torch.zeros(
+            P, R_eff, dtype=torch.bool, device=device)
+        for p_idx, indices in pred_to_rules.items():
+            for j, ri in enumerate(indices[:R_eff]):
+                pred_rule_indices[p_idx, j] = ri
+                pred_rule_mask[p_idx, j] = True
+
+        self.register_buffer("pred_rule_indices", pred_rule_indices)
+        self.register_buffer("pred_rule_mask", pred_rule_mask)
+        self._R_eff_enum = R_eff
+
+    @property
+    def R_eff(self) -> int:
+        return self._R_eff_enum
+
+
+# ======================================================================
+# Standalone compile (for FC and legacy callers without a RuleIndexEnum)
+# ======================================================================
+
+def compile_rules(
+    rule_heads: Tensor, rule_bodies: Tensor,
+    rule_lens: Tensor, constant_no: int,
+) -> List[RulePattern]:
+    """Raw tensors → List[RulePattern]."""
+    return [RulePattern(i, rule_heads[i], rule_bodies[i],
+                        int(rule_lens[i].item()), constant_no)
+            for i in range(rule_heads.size(0))]

@@ -4,39 +4,41 @@ This package provides a fully compilable grounding engine with fixed-shape
 tensors throughout.  All dynamic operations are replaced with masked operations
 for torch.compile and CUDA graph compatibility.
 
-Usage:
-    from grounder import PrologGrounder, ParametrizedBCGrounder, create_grounder
+Architecture
+------------
+The grounding system is built around a single ``BCGrounder`` class that is
+configured at construction time via three orthogonal axes:
 
-    # Direct construction
-    grounder = PrologGrounder(
-        facts_idx=facts, rules_heads_idx=heads,
-        rules_bodies_idx=bodies, rule_lens=lens,
-        constant_no=C, padding_idx=P, device=dev,
-        max_goals=G, depth=2,
-    )
-    result = grounder(queries, query_mask)
+* **resolution** — how unification candidates are generated:
+    ``sld``   standard SLD resolution (fact + rule unification),
+    ``rtf``   Rule-Then-Fact (rule first, then match facts),
+    ``enum``  full entity enumeration.
 
-    # Factory construction
+* **filter** — how incomplete / unreachable proof branches are pruned:
+    ``prune``   BFS + PruneIncompleteProofs fixed-point,
+    ``provset`` BFS + forward-chaining provable-set check,
+    ``none``    no filtering (raw resolution output).
+
+* **hooks** — optional neuro-symbolic callbacks injected between steps:
+    ``ResolutionHook``       scores / reweights unification candidates,
+    ``GroundingHook``   post-processes step results,
+    ``ProvabilityHook``      injects soft provability signals.
+
+There is no class hierarchy of subclasses — just one ``BCGrounder`` that
+composes the desired behaviour from the options above.  ``LazyGrounder``
+wraps ``BCGrounder`` with predicate-level filtering for large KBs.
+
+Usage::
+
+    from grounder import BCGrounder, create_grounder
+
+    # Factory construction (recommended)
     grounder = create_grounder(
-        'backward_1_2', facts_idx=facts, rule_heads=heads,
+        'bcprune_2', facts_idx=facts, rule_heads=heads,
         rule_bodies=bodies, rule_lens=lens, constant_no=C,
         padding_idx=P, device=dev,
     )
-
-Class hierarchy:
-    Grounder(nn.Module)             — base: owns KB state
-    ├── BCGrounder                  — backward chaining: step() + multi-depth forward()
-    │   ├── PrologGrounder          — K = K_f + K_r, Prolog MGU resolution
-    │   ├── RTFGrounder             — K = K_f * K_r, Rule-Then-Fact
-    │   ├── BCPruneGrounder         — BFS + PruneIncompleteProofs fixed-point
-    │   └── BCProvsetGrounder       — BFS + FC provable set check
-    ├── ParametrizedBCGrounder      — vectorized enumeration with dual anchoring
-    │   ├── SamplerGrounder         — random subsampling wrapper
-    │   ├── KGEGrounder             — KGE min-conjunction scoring
-    │   ├── NeuralGrounder          — learned attention scoring
-    │   ├── SoftGrounder            — soft provability scoring
-    │   └── LazyGrounder            — predicate-filtered wrapper
-    └── FullBCGrounder              — full entity enumeration (BC_{∞,1})
+    result = grounder(queries, query_mask)
 """
 
 # --- Primitives ---
@@ -52,15 +54,14 @@ from grounder.fact_index import (
     pack_triples_64,
 )
 
-# --- Rule indexing ---
-from grounder.rule_index import RuleIndex
+# --- Rule indexing + compilation ---
+from grounder.rule_index import RuleIndex, RuleIndexEnum, RulePattern, compile_rules
 
 # --- Packing + post-processing ---
 from grounder.bc.common import (
     compact_atoms,
     collect_groundings,
-    pack_combined,
-    pack_fact_rule,
+    pack_states,
     prune_ground_facts,
 )
 
@@ -73,51 +74,31 @@ from grounder.resolution.standardization import (
 # --- Filters ---
 from grounder.filters import cap_ground_children, prune_dead_nonground_rules
 
-# --- Feature encoding ---
-from grounder.features import (
-    build_predicate_var_count_table,
-    build_rule_feature_encoding,
-    build_rule_var_count_table,
-    compute_shared_slot_indices,
-)
 
 # --- Types ---
-from grounder.types import ForwardResult, GroundingResult, PackResult, ResolveResult, StepResult
+from grounder.types import GroundingResult, PackResult, ResolveResult, StepResult
 
 # --- Data loading ---
 from grounder.data_loader import KGDataset
 
-# --- Compilation ---
-from grounder.compilation import CompiledRule, compile_rules
 
 # --- Forward chaining ---
 from grounder.fc.fc import run_forward_chaining
 
 # --- Factory ---
-from grounder.factory import create_grounder, parse_grounder_type
+from grounder.factory import create_grounder
 
 # --- Base + BC grounders ---
 from grounder.base import Grounder
-from grounder.bc.bc import BCGrounder, PrologGrounder, RTFGrounder
+from grounder.bc.bc import BCGrounder
+from grounder.bc.lazy import LazyGrounder
 
-# --- Other grounders (still in grounders/) ---
-from grounder.grounders.parametrized import ParametrizedBCGrounder
-from grounder.grounders.full import FullBCGrounder
-from grounder.grounders.prune import BCPruneGrounder
-from grounder.grounders.provset import BCProvsetGrounder
-from grounder.grounders.lazy import LazyGrounder
-
-# --- NeSy grounders ---
-from grounder.nesy.kge import GroundingAttention, KGEGrounder, NeuralGrounder
-from grounder.nesy.soft import ProvabilityMLP, SoftGrounder
-from grounder.nesy.sampler import SamplerGrounder
-
-# --- NeSy hook protocols ---
-from grounder.nesy.hooks import (
-    PostResolutionHook,
-    ProvabilityHook,
-    ResolutionHook,
-)
+# --- NeSy hooks ---
+from grounder.nesy.hooks import GroundingHook, ResolutionHook, StepHook
+from grounder.nesy.kge import KGEScorer
+from grounder.nesy.neural import NeuralScorer, GroundingAttention
+from grounder.nesy.soft import SoftScorer, ProvabilityMLP
+from grounder.nesy.sampler import RandomSampler
 
 __all__ = [
     # Primitives
@@ -132,12 +113,13 @@ __all__ = [
     "pack_triples_64",
     # Rule indexing
     "RuleIndex",
-    # Packing
+    "RuleIndexEnum",
+    "RulePattern",
+    "compile_rules",
+    # Packing + post-processing
     "compact_atoms",
-    "pack_combined",
-    "pack_fact_rule",
-    # Post-processing
     "collect_groundings",
+    "pack_states",
     "prune_ground_facts",
     # Standardization
     "standardize_vars_canonical",
@@ -145,44 +127,29 @@ __all__ = [
     # Filters
     "cap_ground_children",
     "prune_dead_nonground_rules",
-    # Feature encoding
-    "build_predicate_var_count_table",
-    "build_rule_feature_encoding",
-    "build_rule_var_count_table",
-    "compute_shared_slot_indices",
-    # Data loading
-    "KGDataset",
     # Types
-    "ForwardResult",
     "GroundingResult",
     "PackResult",
     "ResolveResult",
     "StepResult",
-    # Compilation
-    "CompiledRule",
-    "compile_rules",
+    # Data loading
+    "KGDataset",
     # Forward chaining
     "run_forward_chaining",
     # Factory
     "create_grounder",
-    "parse_grounder_type",
-    # Class hierarchy
+    # Grounders
     "BCGrounder",
-    "BCPruneGrounder",
-    "BCProvsetGrounder",
-    "FullBCGrounder",
-    "GroundingAttention",
     "Grounder",
-    "KGEGrounder",
     "LazyGrounder",
-    "NeuralGrounder",
-    "ParametrizedBCGrounder",
-    "PostResolutionHook",
-    "PrologGrounder",
-    "ProvabilityHook",
-    "ProvabilityMLP",
+    # NeSy hooks
+    "GroundingHook",
     "ResolutionHook",
-    "RTFGrounder",
-    "SamplerGrounder",
-    "SoftGrounder",
+    "StepHook",
+    "KGEScorer",
+    "NeuralScorer",
+    "GroundingAttention",
+    "SoftScorer",
+    "ProvabilityMLP",
+    "RandomSampler",
 ]

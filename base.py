@@ -18,6 +18,7 @@ from grounder.fact_index import (
     ArgKeyFactIndex,
     BlockSparseFactIndex,
     InvertedFactIndex,
+    shuffle_facts_per_predicate,
 )
 from grounder.rule_index import RuleIndex
 
@@ -129,34 +130,9 @@ class Grounder(nn.Module):
 
         # Optional: shuffle facts per predicate
         if shuffle_facts and self.facts_idx.numel() > 0:
-            self._shuffle_facts_per_predicate(predicate_no, seed=shuffle_seed)
+            self.facts_idx.copy_(
+                shuffle_facts_per_predicate(self.facts_idx, predicate_no, shuffle_seed))
 
     @property
     def num_facts(self) -> int:
         return self.facts_idx.shape[0]
-
-    def _shuffle_facts_per_predicate(
-        self, predicate_no: Optional[int], seed: int = 42,
-    ) -> None:
-        """Randomly shuffle facts within each predicate segment."""
-        device = self.facts_idx.device
-        gen = torch.Generator(device=device).manual_seed(seed)
-        preds = self.facts_idx[:, 0]
-        num_preds = max(
-            int(preds.max().item()) + 1,
-            (predicate_no + 1) if predicate_no else 1,
-        )
-        order = torch.argsort(preds, stable=True)
-        facts_sorted = self.facts_idx[order]
-        counts = torch.bincount(preds.long(), minlength=num_preds)
-        starts = torch.zeros(num_preds + 1, dtype=torch.long, device=device)
-        starts[1:] = counts.cumsum(0)
-
-        shuffled = facts_sorted.clone()
-        for p in range(num_preds):
-            s, e = starts[p].item(), starts[p + 1].item()
-            if e - s > 1:
-                shuffled[s:e] = facts_sorted[
-                    s + torch.randperm(e - s, device=device, generator=gen)
-                ]
-        self.facts_idx.copy_(shuffled)

@@ -24,8 +24,7 @@ from torch import Tensor
 torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None  # type: ignore[attr-defined]
 
 from grounder.data_loader import KGDataset
-from grounder.packing import compact_atoms
-from grounder.postprocessing import prune_ground_facts
+from grounder.bc.common import compact_atoms, prune_ground_facts
 from grounder.analysis._dedup import (
     dedup_within_depth,
     dedup_cross_depth,

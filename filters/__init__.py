@@ -1,12 +1,35 @@
-"""Derived-state filters: ground-child capping, dead-rule pruning.
+"""Soundness filters and derived-state filters.
 
-Pure tensor operations with no external dependencies beyond PyTorch.
-These filters are used by both the grounder and RL engines.
+Submodules:
+  prune.py   — PruneIncompleteProofs fixed-point filter
+  provset.py — FC provable set filter (uses fc/)
+
+Module-level functions:
+  check_in_provable        — binary search membership in sorted hash tensor
+  cap_ground_children      — cap fact-derived children per parent
+  prune_dead_nonground_rules — kill states with dead non-ground atoms
 """
 
 from typing import Optional
 import torch
 from torch import Tensor
+
+
+def check_in_provable(atom_hashes: Tensor, provable_hashes: Tensor) -> Tensor:
+    """Check which atoms are in the provable set via searchsorted.
+
+    Args:
+        atom_hashes: Arbitrary-shape long tensor of atom hashes.
+        provable_hashes: Sorted 1-D long tensor of provable atom hashes.
+
+    Returns:
+        Bool tensor of same shape as atom_hashes.
+    """
+    flat = atom_hashes.reshape(-1)
+    pos = torch.searchsorted(provable_hashes, flat)
+    pos = pos.clamp(max=provable_hashes.size(0) - 1)
+    found = provable_hashes[pos] == flat
+    return found.view(atom_hashes.shape)
 
 
 def cap_ground_children(fact_success: Tensor, max_ground: int) -> Tensor:

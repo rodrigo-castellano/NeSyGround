@@ -1,14 +1,8 @@
-"""LazyGrounder — predicate-filtered wrapper over ParametrizedBCGrounder.
+"""LazyGrounder — predicate-filtered wrapper over BCGrounder.
 
 Computes predicate reachability via BFS on the rule head-to-body predicate
 graph, filters rules to those with reachable head predicates, and passes
-the filtered rule set to a ParametrizedBCGrounder.
-
-This results in a smaller provable set and fewer rules to process, while
-producing identical groundings for reachable queries.
-
-Grounder naming: lazy_W_D — same width/depth semantics as backward_W_D,
-but with smaller provable set due to predicate filtering.
+the filtered rule set to a BCGrounder.
 
 Compatible with torch.compile(fullgraph=True, mode='reduce-overhead').
 """
@@ -22,29 +16,19 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.grounders.parametrized import ParametrizedBCGrounder
-from grounder.types import ForwardResult
-from grounder.compilation import compile_rules
+from grounder.bc.bc import BCGrounder
+from grounder.types import GroundingResult
 
 
 class LazyGrounder(nn.Module):
-    """Predicate-filtered grounder — wraps ParametrizedBCGrounder.
+    """Predicate-filtered grounder — wraps BCGrounder with fewer rules.
 
     Builds a predicate reachability graph from rules (head -> body predicates),
     performs BFS from query predicates, and filters rules to those with
     reachable head predicates before passing to the inner grounder.
 
-    This results in a smaller provable set and fewer rules to process,
-    while producing identical groundings for reachable queries.
-
-    Constructor takes the same raw tensor args as ParametrizedBCGrounder,
-    plus ``query_predicates`` controlling which predicates seed the BFS.
-
-    Note: ``query_predicates`` is ``Set[int]`` (predicate indices, not names).
-    The reachability BFS operates on predicate indices from the rule tensors.
-
     Args:
-        facts_idx:           [F, 3] fact triples (pred, arg0, arg1)
+        facts_idx:           [F, 3] fact triples
         rules_heads_idx:     [R, 3] rule head atoms
         rules_bodies_idx:    [R, Bmax, 3] rule body atoms (padded)
         rule_lens:           [R] number of body atoms per rule
@@ -52,9 +36,8 @@ class LazyGrounder(nn.Module):
         padding_idx:         padding value
         device:              target device
         query_predicates:    optional set of query predicate indices for
-                             aggressive filtering. Defaults to all rule-head
-                             predicates (conservative -- no filtering).
-        **kwargs:            forwarded to ParametrizedBCGrounder
+                             filtering (None = all rule-head predicates)
+        **kwargs:            forwarded to BCGrounder
     """
 
     def __init__(
@@ -72,13 +55,12 @@ class LazyGrounder(nn.Module):
     ) -> None:
         super().__init__()
 
-        # Compute reachable predicates and filter rules
         reachable = self._compute_reachable_predicates(
             rules_heads_idx, rules_bodies_idx, rule_lens,
             query_predicates,
         )
 
-        # Filter rule tensors to keep only rules whose head pred is reachable
+        # Filter rules to reachable head predicates
         R = rules_heads_idx.shape[0]
         keep_mask = torch.zeros(R, dtype=torch.bool)
         for i in range(R):
@@ -94,7 +76,6 @@ class LazyGrounder(nn.Module):
             filtered_bodies = rules_bodies_idx[keep_indices]
             filtered_lens = rule_lens[keep_indices]
         else:
-            # No rules pass the filter -- create empty tensors
             Bmax = rules_bodies_idx.shape[1] if rules_bodies_idx.dim() > 1 else 1
             filtered_heads = rules_heads_idx.new_zeros(0, 3)
             filtered_bodies = rules_bodies_idx.new_zeros(0, Bmax, 3)
@@ -106,19 +87,12 @@ class LazyGrounder(nn.Module):
             f"{len(reachable)} reachable predicates)"
         )
 
-        # Create inner grounder with filtered rules
-        self._inner = ParametrizedBCGrounder(
-            facts_idx,
-            filtered_heads,
-            filtered_bodies,
-            filtered_lens,
-            constant_no,
-            padding_idx,
-            device,
+        self._inner = BCGrounder(
+            facts_idx, filtered_heads, filtered_bodies, filtered_lens,
+            constant_no, padding_idx, device,
             **kwargs,
         )
 
-        # Expose inner grounder properties
         self.effective_total_G: int = self._inner.effective_total_G
 
     @property
@@ -127,38 +101,22 @@ class LazyGrounder(nn.Module):
 
     @staticmethod
     def _compute_reachable_predicates(
-        rules_heads_idx: Tensor,    # [R, 3]
-        rules_bodies_idx: Tensor,   # [R, Bmax, 3]
-        rule_lens: Tensor,          # [R]
+        rules_heads_idx: Tensor,
+        rules_bodies_idx: Tensor,
+        rule_lens: Tensor,
         query_predicates: Optional[Set[int]] = None,
     ) -> Set[int]:
-        """BFS on head->body predicate graph to find reachable predicates.
-
-        Operates on predicate indices from the rule tensors. Builds head->body
-        pred adjacency from ``rules_heads_idx`` and ``rules_bodies_idx``.
-
-        Args:
-            rules_heads_idx:  [R, 3] rule heads.
-            rules_bodies_idx: [R, Bmax, 3] rule bodies.
-            rule_lens:        [R] body lengths.
-            query_predicates: Starting predicate index set. If None, uses all
-                rule-head predicates (conservative -- no filtering).
-
-        Returns:
-            Set of reachable predicate indices.
-        """
+        """BFS on head->body predicate graph to find reachable predicates."""
         R = rules_heads_idx.shape[0]
         if R == 0:
             return set()
 
-        # Build adjacency: head_pred -> {body_preds}
         head_to_body: dict = {}
         all_head_preds: Set[int] = set()
 
         for i in range(R):
             head_pred = int(rules_heads_idx[i, 0].item())
             all_head_preds.add(head_pred)
-
             body_len = int(rule_lens[i].item())
             body_preds: Set[int] = set()
             for j in range(body_len):
@@ -166,17 +124,9 @@ class LazyGrounder(nn.Module):
                 body_preds.add(bp)
             head_to_body.setdefault(head_pred, set()).update(body_preds)
 
-        # Start from query predicates or all head predicates
-        if query_predicates is None:
-            seeds = all_head_preds
-        else:
-            seeds = query_predicates & all_head_preds
+        seeds = (query_predicates & all_head_preds
+                 if query_predicates is not None else all_head_preds)
 
-        # BFS: a predicate is reachable if it's a seed or appears in the
-        # body of a rule whose head is reachable (backward reachability).
-        # head->body means: to prove head, we need body.
-        # So we want predicates that are needed to prove seeds.
-        # BFS from seeds following head->body edges.
         reachable: Set[int] = set(seeds)
         frontier = deque(seeds)
         while frontier:
@@ -189,14 +139,8 @@ class LazyGrounder(nn.Module):
         return reachable
 
     def forward(
-        self,
-        queries: Tensor,       # [B, 3]
-        query_mask: Tensor,    # [B]
-    ) -> ForwardResult:
-        """Delegates to inner ParametrizedBCGrounder.
-
-        Returns identical output format (ForwardResult).
-        """
+        self, queries: Tensor, query_mask: Tensor,
+    ) -> GroundingResult:
         return self._inner(queries, query_mask)
 
     def __repr__(self) -> str:
