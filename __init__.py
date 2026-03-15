@@ -19,10 +19,10 @@ configured at construction time via three orthogonal axes:
     ``provset`` BFS + forward-chaining provable-set check,
     ``none``    no filtering (raw resolution output).
 
-* **hooks** — optional neuro-symbolic callbacks injected between steps:
-    ``ResolutionHook``       scores / reweights unification candidates,
-    ``GroundingHook``   post-processes step results,
-    ``ProvabilityHook``      injects soft provability signals.
+* **hooks** — optional neuro-symbolic callbacks injected at various points:
+    ``ResolutionFactHook``   scores / filters fact candidates during resolution,
+    ``ResolutionRuleHook``   scores / filters rule candidates during resolution,
+    ``GroundingHook``        post-processes final groundings.
 
 There is no class hierarchy of subclasses — just one ``BCGrounder`` that
 composes the desired behaviour from the options above.  ``LazyGrounder``
@@ -95,8 +95,11 @@ from grounder.bc.bc import BCGrounder
 from grounder.bc.lazy import LazyGrounder
 
 # --- NeSy hooks ---
-from grounder.nesy.hooks import GroundingHook, ResolutionHook, StepHook
-from grounder.nesy.kge import KGEScorer
+from grounder.nesy.hooks import (
+    GroundingHook, ResolutionFactHook, ResolutionRuleHook, StepHook,
+)
+from grounder.nesy.scoring import kge_score_triples, kge_score_all_tails, kge_score_all_heads
+from grounder.nesy.kge import KGEScorer, KGEFactFilter, KGERuleFilter
 from grounder.nesy.neural import NeuralScorer, GroundingAttention
 from grounder.nesy.soft import SoftScorer, ProvabilityMLP
 from grounder.nesy.sampler import RandomSampler
@@ -145,9 +148,17 @@ __all__ = [
     "LazyGrounder",
     # NeSy hooks
     "GroundingHook",
-    "ResolutionHook",
+    "ResolutionFactHook",
+    "ResolutionRuleHook",
     "StepHook",
+    # Scoring primitives
+    "kge_score_triples",
+    "kge_score_all_tails",
+    "kge_score_all_heads",
+    # Hook implementations
     "KGEScorer",
+    "KGEFactFilter",
+    "KGERuleFilter",
     "NeuralScorer",
     "GroundingAttention",
     "SoftScorer",

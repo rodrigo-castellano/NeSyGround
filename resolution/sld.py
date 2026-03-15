@@ -9,13 +9,16 @@ Public API:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple  # noqa: F401 — Optional used in excluded_queries
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
 from grounder.resolution.mgu import resolve_facts as mgu_resolve_facts
 from grounder.resolution.mgu import resolve_rules as mgu_resolve_rules
+
+if TYPE_CHECKING:
+    from grounder.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
 
 
 @torch.no_grad()
@@ -38,6 +41,8 @@ def resolve_sld(
     num_rules: int,
     track_grounding_body: bool = True,
     excluded_queries: Optional[Tensor] = None,
+    fact_hook: Optional[ResolutionFactHook] = None,
+    rule_hook: Optional[ResolutionRuleHook] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """SLD resolution: resolve facts and rules in parallel.
 
@@ -63,6 +68,9 @@ def resolve_sld(
         state_valid, active_mask,
         grounding_body if track_grounding_body else None,
         excluded_queries=excluded_queries)
+
+    if fact_hook is not None:
+        fact_success = fact_hook.filter_facts(fact_goals, fact_success, queries)
 
     # Rule resolution
     if num_rules == 0:
@@ -90,6 +98,9 @@ def resolve_sld(
     if n_rem > 0:
         rule_goals[:, :, :, Bmax:Bmax + n_rem, :] = \
             rule_remaining[:, :, :, :n_rem, :]
+
+    if rule_hook is not None:
+        rule_success = rule_hook.filter_rules(rule_goals, rule_success, queries)
 
     return (fact_goals, fact_gbody, fact_success,
             rule_goals, rule_gbody_out, rule_success, sub_rule_idx)

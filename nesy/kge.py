@@ -1,6 +1,13 @@
-"""KGE min-conjunction scorer — PostResolutionHook.
+"""KGE-based hooks for resolution filtering and grounding scoring.
 
-Scores groundings by min(KGE body atom scores), selects top-k.
+KGEScorer
+    GroundingHook — min-conjunction of body atom KGE scores + top-k.
+
+KGEFactFilter
+    ResolutionFactHook — scores matched fact triples with KGE, keeps top-k.
+
+KGERuleFilter
+    ResolutionRuleHook — scores first body atom of rule children, keeps top-k.
 """
 
 from __future__ import annotations
@@ -9,9 +16,13 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from grounder.nesy.scoring import kge_score_triples
+
 
 class KGEScorer(nn.Module):
     """Score groundings by KGE min-conjunction, select top-k.
+
+    GroundingHook: applied after grounding in BCGrounder.forward().
 
     kge_model interface:
         kge_model.score_atoms(preds, subjs, objs) -> Tensor of scalar scores.
@@ -46,14 +57,15 @@ class KGEScorer(nn.Module):
         # Body-active mask
         body_active = body[..., 0] != self._padding_idx  # [B, tG, M]
 
-        # KGE atom scores
-        atom_scores = kge.score_atoms(
-            body[..., 0].reshape(-1),
-            body[..., 1].reshape(-1),
-            body[..., 2].reshape(-1),
+        # KGE atom scores via unified scoring primitive
+        atom_scores = kge_score_triples(
+            kge,
+            body[..., 1].reshape(-1),  # h (subj)
+            body[..., 0].reshape(-1),  # r (pred)
+            body[..., 2].reshape(-1),  # t (obj)
         ).view(B, tG_in, M)
 
-        # Mask inactive → large value so min ignores them
+        # Mask inactive -> large value so min ignores them
         atom_scores = torch.where(body_active, atom_scores,
                                   torch.tensor(1e9, device=dev))
 
@@ -67,3 +79,163 @@ class KGEScorer(nn.Module):
 
     def __repr__(self) -> str:
         return f"KGEScorer(output_budget={self._output_tG})"
+
+
+class KGEFactFilter(nn.Module):
+    """Score matched fact triples with KGE, keep top-k.
+
+    ResolutionFactHook: applied inside resolve_sld/rtf after mgu_resolve_facts.
+
+    Re-looks up fact candidates via fact_index to obtain ground triples,
+    scores them with kge_score_triples, and zeros out low-scoring entries
+    in fact_success.
+
+    Args:
+        kge_model:    nn.Module with score_atoms().
+        fact_index:   ArgKeyFactIndex (or compatible) with targeted_lookup().
+        facts_idx:    [F, 3] tensor of all facts.
+        top_k:        max fact candidates to keep per (batch, state).
+        padding_idx:  padding value.
+    """
+
+    def __init__(
+        self,
+        kge_model: nn.Module,
+        fact_index,
+        facts_idx: Tensor,
+        top_k: int,
+        padding_idx: int,
+    ) -> None:
+        super().__init__()
+        self._kge_ref: list = [kge_model]
+        self._fact_index = fact_index
+        self.register_buffer("_facts_idx", facts_idx)
+        self._top_k = top_k
+        self._padding_idx = padding_idx
+
+    def filter_facts(
+        self,
+        fact_goals: Tensor,      # [B, S, K_f, G, 3]
+        fact_success: Tensor,    # [B, S, K_f]
+        queries: Tensor,         # [B, S, 3]
+    ) -> Tensor:
+        B, S, K_f = fact_success.shape
+        if K_f == 0 or self._top_k >= K_f:
+            return fact_success
+
+        dev = fact_success.device
+        kge = self._kge_ref[0]
+        N = B * S
+
+        # Re-lookup matched fact triples
+        flat_q = queries.reshape(N, 3)
+        fact_item_idx, _ = self._fact_index.targeted_lookup(flat_q, K_f)
+        F = self._facts_idx.shape[0]
+        safe_idx = fact_item_idx.clamp(0, max(F - 1, 0))
+        fact_triples = self._facts_idx[safe_idx.view(-1)].view(N, K_f, 3)
+
+        # Score: triples are [pred, subj, obj]
+        scores = kge_score_triples(
+            kge,
+            fact_triples[..., 1].reshape(-1),  # h (subj)
+            fact_triples[..., 0].reshape(-1),  # r (pred)
+            fact_triples[..., 2].reshape(-1),  # t (obj)
+        ).view(B, S, K_f)
+
+        # Mask invalid candidates to -inf
+        scores = torch.where(
+            fact_success, scores,
+            torch.tensor(-1e9, device=dev, dtype=scores.dtype))
+
+        # Top-k selection: zero out entries below top-k
+        _, top_idx = scores.view(N, K_f).topk(
+            min(self._top_k, K_f), dim=1, largest=True, sorted=False)
+        keep = torch.zeros(N, K_f, dtype=torch.bool, device=dev)
+        keep.scatter_(1, top_idx, True)
+        return fact_success & keep.view(B, S, K_f)
+
+    def __repr__(self) -> str:
+        return f"KGEFactFilter(top_k={self._top_k})"
+
+
+class KGERuleFilter(nn.Module):
+    """Score rule children's first body atom with KGE, keep top-k.
+
+    ResolutionRuleHook: applied inside resolve_sld/rtf after mgu_resolve_rules.
+
+    For each rule child, scores the first body atom (rule_goals[:,:,:,0,:]).
+    Only ground atoms (all args <= constant_no) are scored; non-ground atoms
+    get a neutral score of 0.
+
+    Args:
+        kge_model:    nn.Module with score_atoms().
+        top_k:        max rule candidates to keep per (batch, state).
+        constant_no:  highest constant index (for ground detection).
+        padding_idx:  padding value.
+    """
+
+    def __init__(
+        self,
+        kge_model: nn.Module,
+        top_k: int,
+        constant_no: int,
+        padding_idx: int,
+    ) -> None:
+        super().__init__()
+        self._kge_ref: list = [kge_model]
+        self._top_k = top_k
+        self._constant_no = constant_no
+        self._padding_idx = padding_idx
+
+    def filter_rules(
+        self,
+        rule_goals: Tensor,      # [B, S, K_r, G, 3]
+        rule_success: Tensor,    # [B, S, K_r]
+        queries: Tensor,         # [B, S, 3]
+    ) -> Tensor:
+        B, S, K_r = rule_success.shape
+        if K_r == 0 or self._top_k >= K_r:
+            return rule_success
+
+        dev = rule_success.device
+        kge = self._kge_ref[0]
+        c_no = self._constant_no
+
+        # First body atom of each rule child
+        first_atoms = rule_goals[:, :, :, 0, :]  # [B, S, K_r, 3]
+        p = first_atoms[..., 0]   # pred
+        a1 = first_atoms[..., 1]  # subj
+        a2 = first_atoms[..., 2]  # obj
+
+        # Ground detection: both args are constants and pred is not padding
+        is_ground = (a1 <= c_no) & (a2 <= c_no) & (p != self._padding_idx)
+
+        # Safe indices for embedding lookup (clamp variables to 0)
+        safe_p = torch.where(is_ground, p, torch.zeros_like(p))
+        safe_a1 = torch.where(is_ground, a1, torch.zeros_like(a1))
+        safe_a2 = torch.where(is_ground, a2, torch.zeros_like(a2))
+
+        scores = kge_score_triples(
+            kge,
+            safe_a1.reshape(-1),  # h
+            safe_p.reshape(-1),   # r
+            safe_a2.reshape(-1),  # t
+        ).view(B, S, K_r)
+
+        # Non-ground -> 0 (neutral), invalid -> -inf
+        scores = torch.where(is_ground, scores, torch.zeros_like(scores))
+        scores = torch.where(
+            rule_success, scores,
+            torch.tensor(-1e9, device=dev, dtype=scores.dtype))
+
+        # Top-k selection
+        N = B * S
+        _, top_idx = scores.view(N, K_r).topk(
+            min(self._top_k, K_r), dim=1, largest=True, sorted=False)
+        keep = torch.zeros(N, K_r, dtype=torch.bool, device=dev)
+        keep.scatter_(1, top_idx, True)
+        return rule_success & keep.view(B, S, K_r)
+
+    def __repr__(self) -> str:
+        return (f"KGERuleFilter(top_k={self._top_k}, "
+                f"constant_no={self._constant_no})")

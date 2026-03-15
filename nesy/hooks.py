@@ -1,10 +1,14 @@
 """NeSy hook protocols — injection points in the grounding pipeline.
 
-Three injection points:
+Four injection points:
 
-ResolutionHook
-    During RESOLVE — scores/filters entity candidates or rules.
-    Injected inside resolve_sld/rtf/enum.
+ResolutionFactHook
+    After fact resolution — scores/filters ground fact candidates.
+    Injected inside resolve_sld/rtf after mgu_resolve_facts.
+
+ResolutionRuleHook
+    After rule resolution — scores/filters rule candidates.
+    Injected inside resolve_sld/rtf after mgu_resolve_rules.
 
 StepHook
     After each STEP — filters/reranks proof states between iterations.
@@ -23,21 +27,30 @@ from torch import Tensor
 
 
 @runtime_checkable
-class ResolutionHook(Protocol):
-    """During RESOLVE — scores entity candidates or filters rules."""
+class ResolutionFactHook(Protocol):
+    """Applied after mgu_resolve_facts — scores/filters ground fact candidates."""
 
-    def score_candidates(
-        self, candidates: Tensor, context: Tensor,
-    ) -> Tensor:
-        """Score entity candidates.
+    def filter_facts(
+        self,
+        fact_goals: Tensor,      # [B, S, K_f, G, 3]
+        fact_success: Tensor,    # [B, S, K_f]
+        queries: Tensor,         # [B, S, 3] the query atoms that produced these facts
+    ) -> Tensor:                 # [B, S, K_f] modified success mask
+        """Score/filter fact candidates, return modified success mask."""
+        ...
 
-        Args:
-            candidates: [N, K] candidate entity indices.
-            context:    [N, 3] query atoms providing context.
 
-        Returns:
-            scores: [N, K] candidate scores.
-        """
+@runtime_checkable
+class ResolutionRuleHook(Protocol):
+    """Applied after mgu_resolve_rules — scores/filters rule candidates."""
+
+    def filter_rules(
+        self,
+        rule_goals: Tensor,      # [B, S, K_r, G, 3]
+        rule_success: Tensor,    # [B, S, K_r]
+        queries: Tensor,         # [B, S, 3] the query atoms
+    ) -> Tensor:                 # [B, S, K_r] modified success mask
+        """Score/filter rule candidates, return modified success mask."""
         ...
 
 

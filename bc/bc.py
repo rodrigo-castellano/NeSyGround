@@ -46,7 +46,9 @@ class BCGrounder(Grounder):
       width (w):    max unknown body atoms per grounding (enum only; None=∞)
       resolution:   'sld' | 'rtf' | 'enum'
       filter:       'prune' | 'provset' | 'none'
-      hooks:        NeSy hooks (ResolutionHook, PostResolutionHook, ProvabilityHook)
+      hooks:        GroundingHook list (post-grounding scoring/filtering)
+      fact_hook:    ResolutionFactHook (filters fact candidates during resolution)
+      rule_hook:    ResolutionRuleHook (filters rule candidates during resolution)
     """
 
     def __init__(
@@ -59,6 +61,8 @@ class BCGrounder(Grounder):
         max_total_groundings: int = 64,
         compile_mode: Optional[str] = None,
         hooks: Optional[List] = None,
+        fact_hook=None,
+        rule_hook=None,
         # MGU params
         max_goals: Optional[int] = None,
         max_states: Optional[int] = None,
@@ -82,6 +86,8 @@ class BCGrounder(Grounder):
         self.filter_mode = filter
         self.compile_mode = compile_mode
         self.hooks = hooks or []
+        self.fact_hook = fact_hook
+        self.rule_hook = rule_hook
         self.track_grounding_body = track_grounding_body
         self.standardization_mode = standardization.mode if standardization else None
 
@@ -386,8 +392,12 @@ class BCGrounder(Grounder):
         active_mask: Tensor,       # [B, S]
         states: Dict,
         d: int,
+        use_hooks: bool = True,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Dispatch to resolution strategy. Returns common 7-tensor format."""
+        fh = self.fact_hook if use_hooks else None
+        rh = self.rule_hook if use_hooks else None
+
         if self.resolution == "sld":
             return resolve_sld(
                 queries, remaining, grounding_body, state_valid, active_mask,
@@ -400,6 +410,7 @@ class BCGrounder(Grounder):
                 num_rules=self.num_rules,
                 track_grounding_body=self.track_grounding_body,
                 excluded_queries=states.get("excluded_queries"),
+                fact_hook=fh, rule_hook=rh,
             )
         elif self.resolution == "rtf":
             return resolve_rtf(
@@ -413,6 +424,7 @@ class BCGrounder(Grounder):
                 num_rules=self.num_rules,
                 max_fact_pairs_body=self._max_fact_pairs_body,
                 track_grounding_body=self.track_grounding_body,
+                fact_hook=fh, rule_hook=rh,
             )
         else:
             return resolve_enum_step(
@@ -598,7 +610,7 @@ class BCGrounder(Grounder):
         queries, remaining, active_mask = self._select(states)
         resolved = self._resolve(
             queries, remaining, grounding_body, state_valid,
-            active_mask, states, d=1,
+            active_mask, states, d=1, use_hooks=False,
         )
         resolved = self._apply_hooks(resolved, states)
         states = self._pack(resolved, states)

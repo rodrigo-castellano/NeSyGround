@@ -8,13 +8,16 @@ atom of each rule child against facts.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
 from grounder.resolution.mgu import resolve_facts as mgu_resolve_facts
 from grounder.resolution.mgu import resolve_rules as mgu_resolve_rules
+
+if TYPE_CHECKING:
+    from grounder.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
 
 
 @torch.no_grad()
@@ -38,6 +41,8 @@ def resolve_rtf(
     num_rules: int,
     max_fact_pairs_body: int,
     track_grounding_body: bool = True,
+    fact_hook: Optional[ResolutionFactHook] = None,
+    rule_hook: Optional[ResolutionRuleHook] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """RTF resolution: rules first, then facts on first body atom.
 
@@ -115,6 +120,10 @@ def resolve_rtf(
         B, S, K_r, K_f_actual, M_g, 3).reshape(B, S, K_rtf, M_g, 3)
     sub_ridx_out = sub_rule_idx_l1.unsqueeze(3).expand(
         B, S, K_r, K_f_actual).reshape(B, S, K_rtf)
+
+    if rule_hook is not None:
+        rule_success_out = rule_hook.filter_rules(
+            rule_goals, rule_success_out, queries)
 
     return (fact_goals, fact_gbody, fact_success,
             rule_goals, rule_gbody_out, rule_success_out, sub_ridx_out)

@@ -1,7 +1,8 @@
 # nesy/ — neural-symbolic hooks and scoring
 #
-# hooks.py   — GroundingHook protocol
-# kge.py     — KGEScorer: min(KGE atom scores) + topk
+# hooks.py   — ResolutionFactHook, ResolutionRuleHook, GroundingHook
+# scoring.py — kge_score_triples, kge_score_all_tails, kge_score_all_heads
+# kge.py     — KGEScorer, KGEFactFilter, KGERuleFilter
 # neural.py  — NeuralScorer: learned attention + topk
 # soft.py    — SoftScorer: soft provability + topk
 # sampler.py — RandomSampler: random subsampling
@@ -9,8 +10,18 @@
 import torch
 from torch import Tensor
 
-from grounder.nesy.hooks import GroundingHook
-from grounder.nesy.kge import KGEScorer
+from grounder.nesy.hooks import (
+    GroundingHook,
+    ResolutionFactHook,
+    ResolutionRuleHook,
+    StepHook,
+)
+from grounder.nesy.scoring import (
+    kge_score_triples,
+    kge_score_all_tails,
+    kge_score_all_heads,
+)
+from grounder.nesy.kge import KGEScorer, KGEFactFilter, KGERuleFilter
 from grounder.nesy.neural import GroundingAttention, NeuralScorer
 from grounder.nesy.soft import ProvabilityMLP, SoftScorer
 from grounder.nesy.sampler import RandomSampler
@@ -35,8 +46,19 @@ def _topk_select(
 
 
 __all__ = [
+    # Hook protocols
     "GroundingHook",
+    "ResolutionFactHook",
+    "ResolutionRuleHook",
+    "StepHook",
+    # Scoring primitives
+    "kge_score_triples",
+    "kge_score_all_tails",
+    "kge_score_all_heads",
+    # Hook implementations
     "KGEScorer",
+    "KGEFactFilter",
+    "KGERuleFilter",
     "NeuralScorer",
     "GroundingAttention",
     "SoftScorer",
