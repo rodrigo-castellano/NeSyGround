@@ -165,9 +165,11 @@ class KGDataset:
             facts_path = self.data_dir / "train.txt"
         self._facts_file = facts_path.name
 
-        # Parse raw data
+        # Parse raw data (kept for analysis tools)
         facts_raw = _parse_triples(facts_path)
         rules_raw = _parse_rules(self.data_dir / "rules.txt")
+        self._facts_raw: List[Tuple[str, str, str]] = facts_raw
+        self._rules_raw: List[Tuple[Tuple[str, str, str], List[Tuple[str, str, str]]]] = rules_raw
 
         # Parse all splits
         self._splits_raw: Dict[str, List[Tuple[str, str, str]]] = {}
