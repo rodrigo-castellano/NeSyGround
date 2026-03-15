@@ -272,6 +272,9 @@ class BCGrounder(Grounder):
             active_mask, states, d,
         )
 
+        # ── HOOKS (between RESOLVE and PACK) ──
+        resolved = self._apply_hooks(resolved, states)
+
         # ── PACK ──
         states = self._pack(resolved, states)
 
@@ -355,6 +358,7 @@ class BCGrounder(Grounder):
                 max_vars_per_rule=self.max_vars_per_rule,
                 num_rules=self.num_rules,
                 track_grounding_body=self.track_grounding_body,
+                excluded_queries=states.get("excluded_queries"),
             )
         elif self.resolution == "rtf":
             return resolve_rtf(
@@ -396,6 +400,18 @@ class BCGrounder(Grounder):
             )
 
     # ==================================================================
+    # Hooks (between RESOLVE and PACK)
+    # ==================================================================
+
+    def _apply_hooks(
+        self,
+        resolved: Tuple[Tensor, ...],
+        states: Dict,
+    ) -> Tuple[Tensor, ...]:
+        """Apply resolution hooks. Subclasses override for RL filtering."""
+        return resolved
+
+    # ==================================================================
     # Phase 3: PACK (shared)
     # ==================================================================
 
@@ -432,6 +448,7 @@ class BCGrounder(Grounder):
             states["proof_goals"], states["state_valid"],
             self.fact_hashes, self.pack_base,
             self.constant_no, self.padding_idx,
+            excluded_queries=states.get("excluded_queries"),
         )
         proof_goals = compact_atoms(proof_goals, self.padding_idx)
 
@@ -502,12 +519,13 @@ class BCGrounder(Grounder):
             "collected_ridx": collected_ridx,
         }
 
-        # SELECT → RESOLVE → PACK → POSTPROCESS (same code as clean path)
+        # SELECT → RESOLVE → HOOKS → PACK → POSTPROCESS (same code as clean path)
         queries, remaining, active_mask = self._select(states)
         resolved = self._resolve(
             queries, remaining, grounding_body, state_valid,
             active_mask, states, d=1,
         )
+        resolved = self._apply_hooks(resolved, states)
         states = self._pack(resolved, states)
         states = self._postprocess(states)
 

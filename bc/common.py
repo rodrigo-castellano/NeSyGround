@@ -98,12 +98,13 @@ def pack_states(
     K_f = fact_goals.shape[2]
     K_r = rule_goals.shape[2]
     M = grounding_body.shape[2]
-    G = rule_goals.shape[3]
     pad = padding_idx
     dev = top_ridx.device
 
     n_f = S_in * K_f
     n_r = S_in * K_r
+
+    G = rule_goals.shape[3]
 
     # ── Fact children: flatten, inherit parent ridx ──
     if K_f > 0:

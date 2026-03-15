@@ -9,7 +9,7 @@ Public API:
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple  # noqa: F401 — Optional used in excluded_queries
 
 import torch
 from torch import Tensor
@@ -37,6 +37,7 @@ def resolve_sld(
     max_vars_per_rule: int,
     num_rules: int,
     track_grounding_body: bool = True,
+    excluded_queries: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """SLD resolution: resolve facts and rules in parallel.
 
@@ -60,7 +61,8 @@ def resolve_sld(
         queries, remaining, fact_index, facts_idx,
         constant_no, padding_idx, K_f,
         state_valid, active_mask,
-        grounding_body if track_grounding_body else None)
+        grounding_body if track_grounding_body else None,
+        excluded_queries=excluded_queries)
 
     # Rule resolution
     if num_rules == 0:
