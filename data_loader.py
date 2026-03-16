@@ -286,6 +286,21 @@ class KGDataset:
             return []
         return [f"{p}({a0},{a1})" for p, a0, a1 in self._splits_raw[split]]
 
+    def make_kb(self, **kwargs) -> "KB":
+        """Create a KB from this dataset's tensors."""
+        from grounder.kb import KB
+        return KB(
+            self.facts_idx,
+            self.rules_heads_idx,
+            self.rules_bodies_idx,
+            self.rule_lens,
+            constant_no=self.constant_no,
+            predicate_no=self.predicate_no,
+            padding_idx=self.padding_idx,
+            device=self.device,
+            **kwargs,
+        )
+
     def make_grounder(
         self,
         grounder_cls: Type,
@@ -296,26 +311,10 @@ class KGDataset:
         track_grounding_body: bool = True,
         **kwargs,
     ):
-        """Create a BCGrounder from this dataset's tensors.
-
-        Args:
-            grounder_cls: PrologGrounder or RTFGrounder class
-            max_goals: G dimension
-            depth: number of proof steps
-            max_states: S cap (None = K)
-            compile_mode: torch.compile mode (None, 'reduce-overhead', etc.)
-            track_grounding_body: whether to track grounding body atoms
-            **kwargs: additional args to grounder constructor
-        """
+        """Create a KB + BCGrounder from this dataset's tensors."""
+        kb = self.make_kb()
         return grounder_cls(
-            facts_idx=self.facts_idx,
-            rules_heads_idx=self.rules_heads_idx,
-            rules_bodies_idx=self.rules_bodies_idx,
-            rule_lens=self.rule_lens,
-            constant_no=self.constant_no,
-            padding_idx=self.padding_idx,
-            device=self.device,
-            predicate_no=self.predicate_no,
+            kb,
             max_goals=max_goals,
             depth=depth,
             max_states=max_states,

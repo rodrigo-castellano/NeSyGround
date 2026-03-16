@@ -89,7 +89,8 @@ from grounder.fc.fc import run_forward_chaining
 # --- Factory ---
 from grounder.factory import create_grounder
 
-# --- Base + BC grounders ---
+# --- KB + Grounders ---
+from grounder.kb import KB
 from grounder.base import Grounder
 from grounder.bc.bc import BCGrounder
 from grounder.bc.lazy import LazyGrounder
@@ -144,6 +145,7 @@ __all__ = [
     "create_grounder",
     # Grounders
     "BCGrounder",
+    "KB",
     "Grounder",
     "LazyGrounder",
     # NeSy hooks

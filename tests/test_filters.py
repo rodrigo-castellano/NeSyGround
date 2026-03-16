@@ -2,7 +2,7 @@
 
 import torch
 import pytest
-from grounder import BCGrounder
+from grounder import KB, BCGrounder
 
 DEVICE = torch.device("cpu")
 
@@ -15,43 +15,30 @@ class TestPruneFilter:
             [1, 1, 2],  # base(a, b)
             [1, 2, 3],  # base(b, c)
         ], dtype=torch.long)
-        heads = torch.tensor([[2, 4, 5]], dtype=torch.long)  # derived(V0, V1)
-        bodies = torch.tensor([[[1, 4, 5]]], dtype=torch.long)  # base(V0, V1)
+        heads = torch.tensor([[2, 4, 5]], dtype=torch.long)
+        bodies = torch.tensor([[[1, 4, 5]]], dtype=torch.long)
         rule_lens = torch.tensor([1], dtype=torch.long)
+        kb = KB(facts, heads, bodies, rule_lens,
+                constant_no=3, predicate_no=3,
+                padding_idx=99, device=DEVICE)
         return BCGrounder(
-            facts_idx=facts,
-            rules_heads_idx=heads,
-            rules_bodies_idx=bodies,
-            rule_lens=rule_lens,
-            constant_no=3,
-            padding_idx=99,
-            device=DEVICE,
-            predicate_no=3,
-            resolution='sld',
-            filter=filter_mode,
-            max_goals=4,
-            depth=2,
-            max_total_groundings=64,
+            kb, resolution='sld', filter=filter_mode,
+            max_goals=4, depth=2, max_total_groundings=64,
             max_derived_per_state=20,
-            fact_index_type='arg_key',
         )
 
     def test_prune_keeps_provable(self):
         grounder = self._make_grounder('prune')
-        queries = torch.tensor([[2, 1, 4]], dtype=torch.long)  # derived(a, V0)
+        queries = torch.tensor([[2, 1, 4]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
-        # All surviving groundings should have fact-backed bodies
         assert result.count[0].item() >= 1
 
     def test_prune_filters_unprovable(self):
         grounder = self._make_grounder('prune')
-        # Query for something that doesn't match any fact chain
-        queries = torch.tensor([[2, 3, 4]], dtype=torch.long)  # derived(c, V0) — no base(c, ?) exists
+        queries = torch.tensor([[2, 3, 4]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
-        # c has no outgoing base() fact, so no provable groundings
-        # (unless base(c, a) is added — not in our KB)
         assert result.count[0].item() == 0
 
     def test_no_filter_returns_more(self):
@@ -62,7 +49,6 @@ class TestPruneFilter:
         query_mask = torch.tensor([True])
         result_none = grounder_none(queries, query_mask)
         result_prune = grounder_prune(queries, query_mask)
-        # filter='none' returns a GroundingResult; count collected groundings
         none_count = result_none.count[0].item()
         assert none_count >= result_prune.count[0].item()
 
@@ -77,4 +63,4 @@ class TestHashAtoms:
         base = 100
         h1 = hash_atoms(atoms, base)
         h2 = pack_triples_64(atoms, base)
-        assert (h1 == h2).all(), "hash_atoms and pack_triples_64 should agree"
+        assert (h1 == h2).all()

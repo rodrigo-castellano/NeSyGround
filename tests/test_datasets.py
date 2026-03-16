@@ -194,22 +194,15 @@ def _make_grounder(dataset_name: str, depth: int = 2, max_facts: Optional[int] =
     M = int(rule_lens.max().item()) if rule_lens.numel() > 0 else 1
     G = M + (M - 1) * depth + 1  # enough goals for depth
 
+    from grounder import KB
+    kb = KB(facts_idx, heads_idx, bodies_idx, rule_lens,
+            constant_no=constant_no, predicate_no=predicate_no,
+            padding_idx=padding_idx, device=DEVICE)
     grounder = BCGrounder(
-        facts_idx=facts_idx,
-        rules_heads_idx=heads_idx,
-        rules_bodies_idx=bodies_idx,
-        rule_lens=rule_lens,
-        constant_no=constant_no,
-        padding_idx=padding_idx,
-        device=DEVICE,
-        predicate_no=predicate_no,
-        resolution='sld',
-        filter='prune',
-        max_goals=G,
-        depth=depth,
+        kb, resolution='sld', filter='prune',
+        max_goals=G, depth=depth,
         max_total_groundings=max_total_groundings,
-        K_MAX=50,  # keep small for CPU tests
-        fact_index_type='arg_key',
+        K_MAX=50,
     )
     return grounder, entity2idx, pred2idx
 
@@ -227,17 +220,17 @@ class TestFamily:
 
     def test_loads_and_constructs(self):
         grounder, e2i, p2i = _make_grounder("family", depth=2)
-        assert grounder.num_facts > 0
-        assert grounder.num_rules > 0
-        print(f"Family: {grounder.num_facts} facts, {grounder.num_rules} rules, "
-              f"K_f={grounder.K_f}, K_r={grounder.K_r}, K={grounder.K}")
+        assert grounder.kb.num_facts > 0
+        assert grounder.kb.num_rules > 0
+        print(f"Family: {grounder.kb.num_facts} facts, {grounder.kb.num_rules} rules, "
+              f"K_f={grounder.kb.K_f}, K_r={grounder.kb.K_r}, K={grounder.K}")
 
     def test_finds_groundings(self):
         grounder, e2i, p2i = _make_grounder("family", depth=2)
         # Pick a rule head predicate and a known entity
         head_pred = list(p2i.values())[0]
         entity = list(e2i.values())[0]
-        var = grounder.constant_no + 1
+        var = grounder.kb.constant_no + 1
 
         queries = torch.tensor([[head_pred, entity, var]], dtype=torch.long)
         query_mask = torch.tensor([True])
@@ -251,7 +244,7 @@ class TestFamily:
         B = min(8, len(e2i))
         entities = list(e2i.values())[:B]
         head_preds = list(p2i.values())
-        var = grounder.constant_no + 1
+        var = grounder.kb.constant_no + 1
 
         queries = torch.tensor([
             [head_preds[i % len(head_preds)], entities[i], var]
@@ -270,7 +263,7 @@ class TestFamily:
         # Build queries from test triples
         test_facts = _parse_facts(DATA_ROOT / "family" / "test.txt")
         B = min(16, len(test_facts))
-        var = grounder_d1.constant_no + 1
+        var = grounder_d1.kb.constant_no + 1
         queries = []
         for pred, arg0, arg1 in test_facts[:B]:
             if pred in p2i and arg0 in e2i:
@@ -297,16 +290,16 @@ class TestWN18RR:
 
     def test_loads_and_constructs(self):
         grounder, e2i, p2i = _make_grounder("wn18rr", depth=2, max_facts=10000)
-        assert grounder.num_facts > 0
-        assert grounder.num_rules > 0
-        print(f"WN18RR: {grounder.num_facts} facts, {grounder.num_rules} rules, "
-              f"K_f={grounder.K_f}, K_r={grounder.K_r}")
+        assert grounder.kb.num_facts > 0
+        assert grounder.kb.num_rules > 0
+        print(f"WN18RR: {grounder.kb.num_facts} facts, {grounder.kb.num_rules} rules, "
+              f"K_f={grounder.kb.K_f}, K_r={grounder.kb.K_r}")
 
     def test_finds_groundings(self):
         grounder, e2i, p2i = _make_grounder("wn18rr", depth=2, max_facts=10000)
         test_facts = _parse_facts(DATA_ROOT / "wn18rr" / "test.txt")
         B = min(8, len(test_facts))
-        var = grounder.constant_no + 1
+        var = grounder.kb.constant_no + 1
         queries = []
         for pred, arg0, arg1 in test_facts[:B * 4]:
             if pred in p2i and arg0 in e2i:
@@ -331,16 +324,16 @@ class TestFB15K237:
 
     def test_loads_and_constructs(self):
         grounder, e2i, p2i = _make_grounder("fb15k237", depth=2, max_facts=10000)
-        assert grounder.num_facts > 0
-        assert grounder.num_rules > 0
-        print(f"FB15K-237: {grounder.num_facts} facts, {grounder.num_rules} rules, "
-              f"K_f={grounder.K_f}, K_r={grounder.K_r}")
+        assert grounder.kb.num_facts > 0
+        assert grounder.kb.num_rules > 0
+        print(f"FB15K-237: {grounder.kb.num_facts} facts, {grounder.kb.num_rules} rules, "
+              f"K_f={grounder.kb.K_f}, K_r={grounder.kb.K_r}")
 
     def test_finds_groundings(self):
         grounder, e2i, p2i = _make_grounder("fb15k237", depth=2, max_facts=10000)
         test_facts = _parse_facts(DATA_ROOT / "fb15k237" / "test.txt")
         B = min(8, len(test_facts))
-        var = grounder.constant_no + 1
+        var = grounder.kb.constant_no + 1
         queries = []
         for pred, arg0, arg1 in test_facts[:B * 4]:
             if pred in p2i and arg0 in e2i:

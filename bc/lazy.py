@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from grounder.kb import KB
 from grounder.bc.bc import BCGrounder
 from grounder.types import GroundingResult
 
@@ -28,13 +29,7 @@ class LazyGrounder(nn.Module):
     reachable head predicates before passing to the inner grounder.
 
     Args:
-        facts_idx:           [F, 3] fact triples
-        rules_heads_idx:     [R, 3] rule head atoms
-        rules_bodies_idx:    [R, Bmax, 3] rule body atoms (padded)
-        rule_lens:           [R] number of body atoms per rule
-        constant_no:         highest constant index
-        padding_idx:         padding value
-        device:              target device
+        kb:                  knowledge base
         query_predicates:    optional set of query predicate indices for
                              filtering (None = all rule-head predicates)
         **kwargs:            forwarded to BCGrounder
@@ -42,62 +37,63 @@ class LazyGrounder(nn.Module):
 
     def __init__(
         self,
-        facts_idx: Tensor,
-        rules_heads_idx: Tensor,
-        rules_bodies_idx: Tensor,
-        rule_lens: Tensor,
+        kb: KB,
         *,
-        constant_no: int,
-        padding_idx: int,
-        device: torch.device,
         query_predicates: Optional[Set[int]] = None,
         **kwargs,
     ) -> None:
         super().__init__()
 
+        heads = kb.rule_index.rules_heads_sorted
+        bodies = kb.rule_index.rules_bodies_sorted
+        lens = kb.rule_index.rule_lens_sorted
+
         reachable = self._compute_reachable_predicates(
-            rules_heads_idx, rules_bodies_idx, rule_lens,
-            query_predicates,
+            heads, bodies, lens, query_predicates,
         )
 
         # Filter rules to reachable head predicates
-        R = rules_heads_idx.shape[0]
+        R = heads.shape[0]
         keep_mask = torch.zeros(R, dtype=torch.bool)
         for i in range(R):
-            if int(rules_heads_idx[i, 0].item()) in reachable:
+            if int(heads[i, 0].item()) in reachable:
                 keep_mask[i] = True
 
         keep_indices = keep_mask.nonzero(as_tuple=True)[0]
-        n_orig = R
         n_filt = keep_indices.shape[0]
 
         if n_filt > 0:
-            filtered_heads = rules_heads_idx[keep_indices]
-            filtered_bodies = rules_bodies_idx[keep_indices]
-            filtered_lens = rule_lens[keep_indices]
+            filtered_heads = heads[keep_indices]
+            filtered_bodies = bodies[keep_indices]
+            filtered_lens = lens[keep_indices]
         else:
-            Bmax = rules_bodies_idx.shape[1] if rules_bodies_idx.dim() > 1 else 1
-            filtered_heads = rules_heads_idx.new_zeros(0, 3)
-            filtered_bodies = rules_bodies_idx.new_zeros(0, Bmax, 3)
-            filtered_lens = rule_lens.new_zeros(0)
+            Bmax = bodies.shape[1] if bodies.dim() > 1 else 1
+            filtered_heads = heads.new_zeros(1, 3)
+            filtered_bodies = bodies.new_zeros(1, Bmax, 3)
+            filtered_lens = lens.new_zeros(1)
 
         print(
-            f"  LazyGrounder: {n_orig} rules -> {n_filt} rules "
-            f"({n_orig - n_filt} filtered, "
+            f"  LazyGrounder: {R} rules -> {n_filt} rules "
+            f"({R - n_filt} filtered, "
             f"{len(reachable)} reachable predicates)"
         )
 
-        self._inner = BCGrounder(
-            facts_idx, filtered_heads, filtered_bodies, filtered_lens,
-            constant_no=constant_no, padding_idx=padding_idx, device=device,
-            **kwargs,
+        # Build a filtered KB with the subset of rules
+        filtered_kb = KB(
+            kb.fact_index.facts_idx,
+            filtered_heads, filtered_bodies, filtered_lens,
+            constant_no=kb.constant_no,
+            predicate_no=kb.predicate_no,
+            padding_idx=kb.padding_idx,
+            device=kb.device_,
         )
 
+        self._inner = BCGrounder(filtered_kb, **kwargs)
         self.effective_total_G: int = self._inner.effective_total_G
 
     @property
     def max_body_atoms(self) -> int:
-        return self._inner.M
+        return self._inner.kb.M
 
     @staticmethod
     def _compute_reachable_predicates(

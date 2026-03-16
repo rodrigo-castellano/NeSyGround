@@ -24,6 +24,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from grounder.base import Grounder
+from grounder.kb import KB
 from grounder.resolution.standardization import StandardizationConfig
 from grounder.bc.common import (
     compact_atoms,
@@ -53,7 +54,8 @@ class BCGrounder(Grounder):
 
     def __init__(
         self,
-        *args,
+        kb: KB,
+        *,
         depth: int = 2,
         width: Optional[int] = 1,
         resolution: str = "enum",
@@ -76,9 +78,8 @@ class BCGrounder(Grounder):
         fc_depth: int = 10,
         # Output variable standardization (for consumers of ungrounded states)
         standardization: Optional[StandardizationConfig] = None,
-        **kwargs,
     ) -> None:
-        super().__init__(*args, **kwargs)
+        super().__init__(kb)
 
         self.depth = depth
         self.width = width
@@ -94,8 +95,8 @@ class BCGrounder(Grounder):
         # Max goals: shared for all resolutions.
         # Must accommodate M body atoms for enum resolution.
         if max_goals is None:
-            max_goals = 1 + depth * max(self.M - 1, 1)
-        self.max_goals = max(max_goals, self.M)
+            max_goals = 1 + depth * max(self.kb.M - 1, 1)
+        self.max_goals = max(max_goals, self.kb.M)
 
         # Init resolution + compilation
         self._init_resolution(
@@ -111,7 +112,7 @@ class BCGrounder(Grounder):
         self._standardize_fn: Optional[Callable] = None
         if standardization is not None:
             from grounder.resolution.standardization import build_standardize_fn
-            self._standardize_fn = build_standardize_fn(standardization, self._device)
+            self._standardize_fn = build_standardize_fn(standardization, self.kb.device_)
 
     # ==================================================================
     # Resolution init
@@ -123,8 +124,8 @@ class BCGrounder(Grounder):
             from grounder.resolution.mgu import init_mgu
             cfg = init_mgu(
                 resolution=self.resolution,
-                K_f=self.K_f, K_r=self.K_r,
-                rule_index=self.rule_index,
+                K_f=self.kb.K_f, K_r=self.kb.K_r,
+                rule_index=self.kb.rule_index,
                 max_total_groundings=kwargs["max_total_groundings"],
                 K_MAX=kwargs["K_MAX"],
                 max_derived_per_state=kwargs["max_derived_per_state"],
@@ -133,7 +134,7 @@ class BCGrounder(Grounder):
             )
             self.K = cfg["K"]
             self.S = cfg["S"]
-            self.K_f = cfg["K_f"]
+            self.kb.K_f = cfg["K_f"]
             self.max_vars_per_rule = cfg["max_vars_per_rule"]
             self.effective_total_G = cfg["effective_total_G"]
             self._max_fact_pairs_body = cfg["max_fact_pairs_body"]
@@ -141,16 +142,16 @@ class BCGrounder(Grounder):
         elif self.resolution == "enum":
             from grounder.resolution.enum import init_enum
             meta = init_enum(
-                rule_index=self.rule_index,
-                fact_index=self.fact_index,
-                facts_idx=self.fact_index.facts_idx,
-                constant_no=self.constant_no,
-                num_rules=self.num_rules, M=self.M,
+                rule_index=self.kb.rule_index,
+                fact_index=self.kb.fact_index,
+                facts_idx=self.kb.fact_index.facts_idx,
+                constant_no=self.kb.constant_no,
+                num_rules=self.kb.num_rules, M=self.kb.M,
                 width=self.width,
                 max_groundings_per_query=kwargs["max_groundings_per_query"],
                 max_total_groundings=kwargs["max_total_groundings"],
                 max_states=kwargs["max_states"],
-                device=self._device,
+                device=self.kb.device_,
             )
             for name, tensor in meta["buffers"].items():
                 self.register_buffer(name, tensor)
@@ -175,7 +176,7 @@ class BCGrounder(Grounder):
         self._clone_between_steps = False
         if (self.compile_mode
                 and self.depth > 1
-                and self._device.type == "cuda"):
+                and self.kb.device_.type == "cuda"):
             self._fn_step = torch.compile(
                 self._step_impl, fullgraph=True,
                 mode=self.compile_mode)
@@ -187,7 +188,7 @@ class BCGrounder(Grounder):
         # Provable set (for provset filter)
         self._has_provable_set = False
         if self.filter_mode == "provset" and self.resolution == "enum":
-            self._build_provable_set(self._device)
+            self._build_provable_set(self.kb.device_)
 
     def _build_provable_set(self, device: torch.device) -> None:
         from grounder.fc.fc import run_forward_chaining
@@ -196,7 +197,7 @@ class BCGrounder(Grounder):
             method = "dynamic"
         provable_tensor, n_provable = run_forward_chaining(
             compiled_rules=self._enum_ri.patterns,
-            facts_idx=self.fact_index.facts_idx,
+            facts_idx=self.kb.fact_index.facts_idx,
             num_entities=self._E,
             num_predicates=self._P,
             depth=self.fc_depth,
@@ -256,9 +257,9 @@ class BCGrounder(Grounder):
         """
         B = queries.size(0)
         dev = queries.device
-        pad = self.padding_idx
+        pad = self.kb.padding_idx
         G = self.max_goals
-        M = self.M
+        M = self.kb.M
         tG = self.effective_total_G
         M_body = 1 if not self.track_grounding_body else M
 
@@ -275,7 +276,7 @@ class BCGrounder(Grounder):
         state_valid = query_mask.unsqueeze(1)
 
         if next_var_indices is None:
-            E = self.constant_no + 1
+            E = self.kb.constant_no + 1
             next_var_indices = torch.full(
                 (B,), E, dtype=torch.long, device=dev)
 
@@ -300,7 +301,7 @@ class BCGrounder(Grounder):
 
     def step(self, states: Dict, d: int) -> Dict:
         """One proof step: SELECT → RESOLVE → PACK → POSTPROCESS."""
-        if self.num_rules == 0:
+        if self.kb.num_rules == 0:
             return states
 
         # Compiled fast path (all depths; skip last enum step which needs width=0)
@@ -344,27 +345,27 @@ class BCGrounder(Grounder):
 
         B = states["collected_body"].size(0)
         tG = self.effective_total_G
-        M = self.M
+        M = self.kb.M
         dev = states["collected_body"].device
 
         body = states["collected_body"]
         mask = states["collected_mask"]
         ridx = states["collected_ridx"]
 
-        if self.num_rules == 0:
+        if self.kb.num_rules == 0:
             return self._empty_result(B, tG, M, dev)
 
         if self.filter_mode == "prune":
             from grounder.filters.prune import apply_prune
             mask = apply_prune(
-                body, mask, states["queries"], self.fact_index,
-                self.fact_index.pack_base, self.padding_idx, self.depth)
+                body, mask, states["queries"], self.kb.fact_index,
+                self.kb.fact_index.pack_base, self.kb.padding_idx, self.depth)
 
         elif self.filter_mode == "provset":
             from grounder.filters.provset import apply_provset
             mask = apply_provset(
-                body, mask, self.fact_index,
-                self.fact_index.pack_base, self.padding_idx,
+                body, mask, self.kb.fact_index,
+                self.kb.fact_index.pack_base, self.kb.padding_idx,
                 self.provable_hashes)
 
         count = mask.sum(dim=1)
@@ -382,11 +383,11 @@ class BCGrounder(Grounder):
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Extract first goal from each proof state."""
         proof_goals = states["proof_goals"]
-        active_mask = proof_goals[:, :, 0, 0] != self.padding_idx
+        active_mask = proof_goals[:, :, 0, 0] != self.kb.padding_idx
         queries = proof_goals[:, :, 0, :]
         queries = queries * active_mask.unsqueeze(-1).to(queries.dtype)
         remaining = proof_goals.clone()
-        remaining[:, :, 0, :] = self.padding_idx
+        remaining[:, :, 0, :] = self.kb.padding_idx
         return queries, remaining, active_mask
 
     # ==================================================================
@@ -412,12 +413,12 @@ class BCGrounder(Grounder):
             return resolve_sld(
                 queries, remaining, grounding_body, state_valid, active_mask,
                 next_var_indices=states["next_var_indices"],
-                fact_index=self.fact_index, facts_idx=self.fact_index.facts_idx,
-                rule_index=self.rule_index,
-                constant_no=self.constant_no, padding_idx=self.padding_idx,
-                K_f=self.K_f, K_r=self.K_r,
+                fact_index=self.kb.fact_index, facts_idx=self.kb.fact_index.facts_idx,
+                rule_index=self.kb.rule_index,
+                constant_no=self.kb.constant_no, padding_idx=self.kb.padding_idx,
+                K_f=self.kb.K_f, K_r=self.kb.K_r,
                 max_vars_per_rule=self.max_vars_per_rule,
-                num_rules=self.num_rules,
+                num_rules=self.kb.num_rules,
                 track_grounding_body=self.track_grounding_body,
                 excluded_queries=states.get("excluded_queries"),
                 fact_hook=fh, rule_hook=rh,
@@ -426,12 +427,12 @@ class BCGrounder(Grounder):
             return resolve_rtf(
                 queries, remaining, grounding_body, state_valid, active_mask,
                 next_var_indices=states["next_var_indices"],
-                fact_index=self.fact_index, facts_idx=self.fact_index.facts_idx,
-                rule_index=self.rule_index,
-                constant_no=self.constant_no, padding_idx=self.padding_idx,
-                K_f=self.K_f, K_r=self.K_r, K=self.K,
+                fact_index=self.kb.fact_index, facts_idx=self.kb.fact_index.facts_idx,
+                rule_index=self.kb.rule_index,
+                constant_no=self.kb.constant_no, padding_idx=self.kb.padding_idx,
+                K_f=self.kb.K_f, K_r=self.kb.K_r, K=self.K,
                 max_vars_per_rule=self.max_vars_per_rule,
-                num_rules=self.num_rules,
+                num_rules=self.kb.num_rules,
                 max_fact_pairs_body=self._max_fact_pairs_body,
                 track_grounding_body=self.track_grounding_body,
                 fact_hook=fh, rule_hook=rh,
@@ -439,9 +440,9 @@ class BCGrounder(Grounder):
         else:
             return resolve_enum_step(
                 queries, remaining, grounding_body, state_valid, active_mask,
-                fact_index=self.fact_index,
+                fact_index=self.kb.fact_index,
                 d=d, depth=self.depth, width=self.width,
-                M=self.M, padding_idx=self.padding_idx,
+                M=self.kb.M, padding_idx=self.kb.padding_idx,
                 enum_G=self._enum_G, K_enum=self._K_enum,
                 any_dual=self.any_dual,
                 pred_rule_indices=self.pred_rule_indices,
@@ -489,7 +490,7 @@ class BCGrounder(Grounder):
         new_gbody, new_goals, new_ridx, new_valid = pack_states(
             *resolved,
             states["top_ridx"], states["grounding_body"],
-            self.S, self.padding_idx,
+            self.S, self.kb.padding_idx,
             track_grounding_body=self.track_grounding_body,
         )
 
@@ -509,18 +510,18 @@ class BCGrounder(Grounder):
         """Prune ground facts, compact atoms, collect completed groundings."""
         proof_goals, _, _ = prune_ground_facts(
             states["proof_goals"], states["state_valid"],
-            self.fact_index.fact_hashes, self.fact_index.pack_base,
-            self.constant_no, self.padding_idx,
+            self.kb.fact_index.fact_hashes, self.kb.fact_index.pack_base,
+            self.kb.constant_no, self.kb.padding_idx,
             excluded_queries=states.get("excluded_queries"),
         )
-        proof_goals = compact_atoms(proof_goals, self.padding_idx)
+        proof_goals = compact_atoms(proof_goals, self.kb.padding_idx)
 
         cb, cm, cr, sv = collect_groundings(
             states["grounding_body"], proof_goals,
             states["state_valid"], states["top_ridx"],
             states["collected_body"], states["collected_mask"],
             states["collected_ridx"],
-            self.constant_no, self.padding_idx, self.effective_total_G,
+            self.kb.constant_no, self.kb.padding_idx, self.effective_total_G,
         )
 
         states["proof_goals"] = proof_goals
@@ -633,7 +634,7 @@ class BCGrounder(Grounder):
 
     def check_known(self, atoms: Tensor) -> Tensor:
         """Check if atoms are known facts or in provable set."""
-        is_fact = self.fact_index.exists(atoms)
+        is_fact = self.kb.fact_index.exists(atoms)
         if hasattr(self, "_has_provable_set") and self._has_provable_set:
             E = self._E
             h = atoms[..., 0] * (E * E) + atoms[..., 1] * E + atoms[..., 2]
@@ -667,5 +668,5 @@ class BCGrounder(Grounder):
             f"BCGrounder(resolution={self.resolution!r}, "
             f"filter={self.filter_mode!r}, "
             f"depth={self.depth}, width={self.width}, "
-            f"num_rules={self.num_rules}, "
+            f"num_rules={self.kb.num_rules}, "
             f"S={self.S}, tG={self.effective_total_G})")

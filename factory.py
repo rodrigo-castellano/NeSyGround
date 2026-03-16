@@ -17,6 +17,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from grounder.kb import KB
 from grounder.bc.bc import BCGrounder
 from grounder.bc.lazy import LazyGrounder
 
@@ -50,10 +51,6 @@ _REGISTRY = [
 def parse_grounder_type(grounder_type: str) -> Tuple[int, int]:
     """Parse grounder name into (width, depth).
 
-    Supports two naming conventions:
-      - '{prefix}_{depth}'        → (1, depth)
-      - '{prefix}_{width}_{depth}' → (width, depth)
-
     Examples:
         'bcprune_2'    → (1, 2)
         'backward_1_2' → (1, 2)
@@ -86,6 +83,7 @@ def parse_grounder_type(grounder_type: str) -> Tuple[int, int]:
 def create_grounder(
     grounder_type: str,
     *,
+    # KB params
     facts_idx: Tensor,
     rule_heads: Tensor,
     rule_bodies: Tensor,
@@ -93,49 +91,20 @@ def create_grounder(
     constant_no: int,
     padding_idx: int,
     device: torch.device,
+    predicate_no: Optional[int] = None,
+    max_facts_per_query: int = 64,
+    fact_index_type: str = "block_sparse",
+    # Algorithm params
     max_groundings: int = 32,
     max_total_groundings: int = 64,
     fc_method: str = "join",
     kge_model: Optional[nn.Module] = None,
-    predicate_no: Optional[int] = None,
-    max_facts_per_query: int = 64,
-    fact_index_type: str = "block_sparse",
     max_goals: int = 256,
     **kwargs,
 ) -> nn.Module:
     """Create a grounder from a type string.
 
-    All type strings now map to BCGrounder (unified backward chaining) or
-    LazyGrounder (predicate-filtered wrapper over BCGrounder).
-
-    Mapping:
-        'prolog_D' / 'bcprolog_D' → BCGrounder(resolution='sld', depth=D)
-        'rtf_D'                   → BCGrounder(resolution='rtf', depth=D)
-        'bcprune_D'               → BCGrounder(resolution='sld', filter='prune', depth=D)
-        'bcprovset_D'             → BCGrounder(resolution='sld', filter='provset', depth=D)
-        'bcsld_D'                 → BCGrounder(resolution='sld', filter='none', depth=D)
-        'backward_W_D'            → BCGrounder(resolution='enum', width=W, depth=D, filter='prune')
-        'lazy_W_D'                → LazyGrounder wrapping BCGrounder
-        'full'                    → BCGrounder(resolution='enum', width=None, depth=1)
-        'sampler_W_D' etc.        → BCGrounder(resolution='enum', width=W, depth=D)
-
-    Args:
-        grounder_type: String like 'bcprune_2', 'backward_1_2', 'full', etc.
-        facts_idx: [F, 3] fact triples.
-        rule_heads: [R, 3] rule head atoms.
-        rule_bodies: [R, M, 3] rule body atoms (padded).
-        rule_lens: [R] body lengths.
-        constant_no: Highest constant index.
-        padding_idx: Padding value.
-        device: Target device.
-        max_groundings: Max groundings per query per rule.
-        max_total_groundings: Max total groundings per query.
-        fc_method: FC method for provable set ('join').
-        kge_model: KGE model (for future hook integration).
-        predicate_no: Number of predicates.
-        max_facts_per_query: K_f for fact index.
-        fact_index_type: Fact index type.
-        max_goals: Max goals for BFS-based grounders.
+    Builds a KB from the data params, then instantiates the right grounder.
 
     Returns:
         Grounder module instance (BCGrounder or LazyGrounder).
@@ -158,16 +127,11 @@ def create_grounder(
             is_full = prefix == "full"
             break
 
-    # Base kwargs shared by all grounders (positional args for Grounder base)
-    base_kwargs = dict(
-        facts_idx=facts_idx,
-        rules_heads_idx=rule_heads,
-        rules_bodies_idx=rule_bodies,
-        rule_lens=rule_lens,
-        constant_no=constant_no,
-        padding_idx=padding_idx,
-        device=device,
-        predicate_no=predicate_no,
+    # Build KB from data params
+    kb = KB(
+        facts_idx, rule_heads, rule_bodies, rule_lens,
+        constant_no=constant_no, predicate_no=predicate_no,
+        padding_idx=padding_idx, device=device,
         max_facts_per_query=max_facts_per_query,
         fact_index_type=fact_index_type,
     )
@@ -191,10 +155,10 @@ def create_grounder(
         bc_kwargs["max_groundings_per_query"] = max_groundings
         bc_kwargs["fc_method"] = fc_method
 
-    # Merge all kwargs (extra kwargs like compile_mode pass through)
-    gkw = {**base_kwargs, **bc_kwargs, **kwargs}
+    # Merge extra kwargs (compile_mode, hooks, etc.)
+    bc_kwargs.update(kwargs)
 
     if is_lazy:
-        return LazyGrounder(**gkw)
+        return LazyGrounder(kb, **bc_kwargs)
 
-    return BCGrounder(**gkw)
+    return BCGrounder(kb, **bc_kwargs)
