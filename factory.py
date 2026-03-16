@@ -194,8 +194,8 @@ def create_grounder(
         bc_kwargs["max_groundings_per_query"] = max_groundings
         bc_kwargs["fc_method"] = fc_method
 
-    # Merge all kwargs
-    gkw = {**base_kwargs, **bc_kwargs}
+    # Merge all kwargs (extra kwargs like compile_mode pass through)
+    gkw = {**base_kwargs, **bc_kwargs, **kwargs}
 
     if is_lazy:
         return LazyGrounder(**gkw)

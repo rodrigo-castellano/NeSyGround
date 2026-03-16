@@ -21,7 +21,6 @@ if TYPE_CHECKING:
     from grounder.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
 
 
-@torch.no_grad()
 def resolve_sld(
     queries: Tensor,           # [B, S, 3]
     remaining: Tensor,         # [B, S, G, 3]

@@ -182,6 +182,7 @@ class BCGrounder(Grounder):
             self._clone_between_steps = (
                 self.compile_mode == "reduce-overhead")
             self._compiled = True
+            self._multi_step = True
 
         # Provable set (for provset filter)
         self._has_provable_set = False
@@ -219,6 +220,15 @@ class BCGrounder(Grounder):
         for d in range(self.depth):
             states = self.step(states, d)
         result = self.filter_terminal(states)
+        # filter='none' returns raw states dict — wrap in GroundingResult
+        # outside the compiled region (dataclass init breaks fullgraph).
+        if isinstance(result, dict):
+            result = GroundingResult(
+                body=result["collected_body"],
+                mask=result["collected_mask"],
+                count=result["collected_mask"].sum(dim=1),
+                rule_idx=result["collected_ridx"],
+            )
         for hook in self.hooks:
             body, mask, ridx = hook.apply(result.body, result.mask, result.rule_idx)
             result = GroundingResult(
@@ -293,8 +303,8 @@ class BCGrounder(Grounder):
         if self.num_rules == 0:
             return states
 
-        # Compiled fast path (d > 0, but not last enum step which needs width=0)
-        if self._compiled and d > 0:
+        # Compiled fast path (all depths; skip last enum step which needs width=0)
+        if self._compiled:
             last_enum_step = (
                 self.resolution == "enum"
                 and d == self.depth - 1
@@ -589,12 +599,7 @@ class BCGrounder(Grounder):
         collected_ridx: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
                Tensor]:
-        """Raw tensor step for torch.compile — calls the same 4 phases.
-
-        Uses d=1 internally (safe: compiled path is never called at d=0
-        or at the last enum step where width differs).
-        """
-        # Build temporary states dict (torch.compile handles static-key dicts)
+        """Raw tensor step for torch.compile — same 4 phases as clean path."""
         states = {
             "grounding_body": grounding_body,
             "proof_goals": proof_goals,
@@ -606,7 +611,7 @@ class BCGrounder(Grounder):
             "collected_ridx": collected_ridx,
         }
 
-        # SELECT → RESOLVE → HOOKS → PACK → POSTPROCESS (same code as clean path)
+        # SELECT → RESOLVE → HOOKS → PACK → POSTPROCESS
         queries, remaining, active_mask = self._select(states)
         resolved = self._resolve(
             queries, remaining, grounding_body, state_valid,
