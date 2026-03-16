@@ -15,9 +15,9 @@ configured at construction time via three orthogonal axes:
     ``enum``  full entity enumeration.
 
 * **filter** — how incomplete / unreachable proof branches are pruned:
-    ``prune``   BFS + PruneIncompleteProofs fixed-point,
-    ``provset`` BFS + forward-chaining provable-set check,
-    ``none``    no filtering (raw resolution output).
+    ``fp_batch``  cross-query Kleene T_P fixed-point,
+    ``fp_global`` forward-chaining provable-set check (precomputed),
+    ``none``      no filtering (raw resolution output).
 
 * **hooks** — optional neuro-symbolic callbacks injected at various points:
     ``ResolutionFactHook``   scores / filters fact candidates during resolution,
@@ -34,7 +34,7 @@ Usage::
 
     # Factory construction (recommended)
     grounder = create_grounder(
-        'sld.prune.d2', facts_idx=facts, rule_heads=heads,
+        'sld.fp_batch.d2', facts_idx=facts, rule_heads=heads,
         rule_bodies=bodies, rule_lens=lens, constant_no=C,
         padding_idx=P, device=dev,
     )
@@ -73,7 +73,7 @@ from grounder.resolution.standardization import (
 )
 
 # --- Filters ---
-from grounder.filters import cap_ground_children, prune_dead_nonground_rules
+from grounder.filters import filter_prune_dead, filter_width
 
 
 # --- Types ---
@@ -133,8 +133,8 @@ __all__ = [
     "standardize_vars_canonical",
     "standardize_vars_offset",
     # Filters
-    "cap_ground_children",
-    "prune_dead_nonground_rules",
+    "filter_prune_dead",
+    "filter_width",
     # Types
     "GroundingResult",
     "PackResult",

@@ -17,7 +17,7 @@ BCGrounder is configured via three orthogonal axes (no subclasses):
 | Axis | Options | Description |
 |------|---------|-------------|
 | **resolution** | `'sld'`, `'rtf'`, `'enum'` | How unification candidates are generated |
-| **filter** | `'prune'`, `'provset'`, `'none'` | How incomplete proof branches are pruned |
+| **filter** | `'fp_batch'`, `'fp_global'`, `'none'` | How incomplete proof branches are pruned |
 | **hooks** | `ResolutionFactHook`, `ResolutionRuleHook`, `GroundingHook` | Optional neuro-symbolic callbacks |
 
 Resolution strategies:
@@ -40,7 +40,7 @@ SLD resolution with MGU-based unification, up to depth `D`. Each step:
 1. **SELECT** the first unresolved goal atom
 2. **RESOLVE** — dispatch to the configured resolution strategy (`sld`, `rtf`, or `enum`)
 3. **PACK** children into fixed-size state tensor, deduplicate, truncate
-4. **POSTPROCESS** — apply configured filter (`prune`, `provset`, or `none`), collect completed groundings
+4. **POSTPROCESS** — apply configured filter (`fp_batch`, `fp_global`, or `none`), collect completed groundings
 
 ### Formal definition
 
@@ -57,7 +57,7 @@ BCGrounder(
     depth: int = 2,                         # D — max resolution steps
     width: Optional[int] = 1,              # W — max unproven body atoms (enum only; None=∞)
     resolution: str = "enum",              # 'sld' | 'rtf' | 'enum'
-    filter: str = "prune",                 # 'prune' | 'provset' | 'none'
+    filter: str = "fp_batch",               # 'fp_batch' | 'fp_global' | 'none'
     max_total_groundings: int = 64,         # tG — output budget
     compile_mode: Optional[str] = None,     # torch.compile mode
     hooks: Optional[List] = None,           # GroundingHook list
@@ -90,14 +90,14 @@ from grounder import KB, BCGrounder
 kb = KB(facts, heads, bodies, lens,
         constant_no=C, predicate_no=P, padding_idx=pad, device=dev)
 
-# SLD resolution with pruning (formerly PrologGrounder + BCPruneGrounder)
-g = BCGrounder(kb, resolution='sld', filter='prune', depth=2)
+# SLD resolution with fp_batch (formerly PrologGrounder + BCPruneGrounder)
+g = BCGrounder(kb, resolution='sld', filter='fp_batch', depth=2)
 
 # RTF resolution, no filter (formerly RTFGrounder)
 g = BCGrounder(kb, resolution='rtf', filter='none', depth=2)
 
-# Entity enumeration with provable-set filter (formerly ParametrizedBCGrounder + BCProvsetGrounder)
-g = BCGrounder(kb, resolution='enum', filter='provset', depth=1, width=1)
+# Entity enumeration with fp_global filter (formerly ParametrizedBCGrounder + BCProvsetGrounder)
+g = BCGrounder(kb, resolution='enum', filter='fp_global', depth=1, width=1)
 ```
 
 ---
@@ -746,7 +746,7 @@ This is the standard SLD resolution algorithm with full MGU-based unification (i
 ### Usage
 
 ```python
-grounder = BCGrounder(kb, resolution='sld', filter='prune', depth=2)
+grounder = BCGrounder(kb, resolution='sld', filter='fp_batch', depth=2)
 ```
 
 ### Soundness
@@ -757,7 +757,7 @@ grounder = BCGrounder(kb, resolution='sld', filter='prune', depth=2)
 
 ### When to use
 
-The default resolution for standard backward chaining. Use with `filter='prune'` for the most common setup.
+The default resolution for standard backward chaining. Use with `filter='fp_batch'` for the most common setup.
 
 ---
 
@@ -775,7 +775,7 @@ Fact resolution at the SELECT stage is empty — all work is done inside the rul
 ### Usage
 
 ```python
-grounder = BCGrounder(kb, resolution='rtf', filter='prune', depth=2)
+grounder = BCGrounder(kb, resolution='rtf', filter='fp_batch', depth=2)
 ```
 
 ### Soundness
@@ -823,12 +823,12 @@ Format: `{resolution}[.{filter}].d{depth}[.w{width}]`
 | Pattern | Config | Example |
 |---------|--------|---------|
 | `sld.d2` | resolution=sld, filter=none, depth=2 | `BCGrounder(kb, resolution='sld', depth=2)` |
-| `sld.prune.d2` | resolution=sld, filter=prune, depth=2 | `BCGrounder(kb, resolution='sld', filter='prune', depth=2)` |
-| `sld.provset.d3` | resolution=sld, filter=provset, depth=3 | `BCGrounder(kb, resolution='sld', filter='provset', depth=3)` |
+| `sld.fp_batch.d2` | resolution=sld, filter=fp_batch, depth=2 | `BCGrounder(kb, resolution='sld', filter='fp_batch', depth=2)` |
+| `sld.fp_global.d3` | resolution=sld, filter=fp_global, depth=3 | `BCGrounder(kb, resolution='sld', filter='fp_global', depth=3)` |
 | `rtf.d2` | resolution=rtf, depth=2 | `BCGrounder(kb, resolution='rtf', depth=2)` |
-| `enum.prune.w1.d2` | resolution=enum, filter=prune, width=1, depth=2 | `BCGrounder(kb, resolution='enum', filter='prune', width=1, depth=2)` |
+| `enum.fp_batch.w1.d2` | resolution=enum, filter=fp_batch, width=1, depth=2 | `BCGrounder(kb, resolution='enum', filter='fp_batch', width=1, depth=2)` |
 | `enum.full` | resolution=enum, all entities, depth=1 | `BCGrounder(kb, resolution='enum', width=None, depth=1)` |
-| `lazy.enum.prune.w0.d1` | LazyGrounder wrapping enum | `LazyGrounder(kb, resolution='enum', ...)` |
+| `lazy.enum.fp_batch.w0.d1` | LazyGrounder wrapping enum | `LazyGrounder(kb, resolution='enum', ...)` |
 
 ### parse_grounder_type
 
@@ -836,9 +836,9 @@ Format: `{resolution}[.{filter}].d{depth}[.w{width}]`
 def parse_grounder_type(grounder_type: str) -> dict:
     """Parse grounder type string into config dict.
 
-    'sld.prune.d2'         → {resolution:'sld', filter:'prune', depth:2, ...}
-    'enum.prune.w1.d2'     → {resolution:'enum', filter:'prune', depth:2, width:1}
-    'enum.full'            → {resolution:'enum', filter:'prune', depth:1, is_full:True}
-    'lazy.enum.prune.w0.d1'→ {resolution:'enum', filter:'prune', depth:1, width:0, is_lazy:True}
+    'sld.fp_batch.d2'         → {resolution:'sld', filter:'fp_batch', depth:2, ...}
+    'enum.fp_batch.w1.d2'     → {resolution:'enum', filter:'fp_batch', depth:2, width:1}
+    'enum.full'               → {resolution:'enum', filter:'fp_batch', depth:1, is_full:True}
+    'lazy.enum.fp_batch.w0.d1'→ {resolution:'enum', filter:'fp_batch', depth:1, width:0, is_lazy:True}
     """
 ```

@@ -71,7 +71,7 @@ def generate_depths_static(
     grounder = BCGrounder(
         kb,
         resolution=resolution,
-        filter="prune",
+        filter="fp_batch",
         depth=max_depth,
         max_goals=max_goals,
         max_states=max_states if max_states is not None else hard_cap,

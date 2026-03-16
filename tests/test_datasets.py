@@ -199,7 +199,7 @@ def _make_grounder(dataset_name: str, depth: int = 2, max_facts: Optional[int] =
             constant_no=constant_no, predicate_no=predicate_no,
             padding_idx=padding_idx, device=DEVICE)
     grounder = BCGrounder(
-        kb, resolution='sld', filter='prune',
+        kb, resolution='sld', filter='fp_batch',
         max_goals=G, depth=depth,
         max_total_groundings=max_total_groundings,
         K_MAX=50,

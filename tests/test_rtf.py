@@ -22,7 +22,7 @@ class TestRTFSmoke:
                 constant_no=5, predicate_no=3,
                 padding_idx=99, device=DEVICE)
         return BCGrounder(
-            kb, resolution='rtf', filter='prune',
+            kb, resolution='rtf', filter='fp_batch',
             max_goals=4, depth=2, max_total_groundings=64,
             max_derived_per_state=20,
         )

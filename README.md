@@ -11,7 +11,7 @@ from grounder import KB, BCGrounder
 
 kb = KB(facts, heads, bodies, lens,
         constant_no=C, predicate_no=P, padding_idx=P, device=dev)
-grounder = BCGrounder(kb, resolution='sld', filter='prune', depth=2)
+grounder = BCGrounder(kb, resolution='sld', filter='fp_batch', depth=2)
 result = grounder(queries, query_mask)
 # result.collected_body:  [B, tG, M, 3]
 # result.collected_mask:  [B, tG]

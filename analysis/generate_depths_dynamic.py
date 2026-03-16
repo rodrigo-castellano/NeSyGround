@@ -171,7 +171,7 @@ def generate_depths_dynamic(
     grounder = BCGrounder(
         kb,
         resolution=resolution,
-        filter="prune",
+        filter="fp_batch",
         depth=1,
         max_goals=max_goals,
         compile_mode=None,  # we compile externally

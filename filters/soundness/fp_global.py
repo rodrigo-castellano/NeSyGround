@@ -8,10 +8,10 @@ from __future__ import annotations
 
 from torch import Tensor
 
-from grounder.filters import check_in_provable
+from grounder.filters.soundness import check_in_provable
 
 
-def apply_provset(
+def apply_fp_global(
     body: Tensor,               # [B, N, M, 3]
     mask: Tensor,               # [B, N] bool
     fact_index,                 # FactIndex with .exists()

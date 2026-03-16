@@ -253,19 +253,17 @@ ancestor(1,3) query) depends on.
 - Cost: O(num_steps × N_proofs) per batch, where N_proofs is total proof
   entries across all queries.
 
-**Current torch-ns limitation:** The current `filters/prune.py` implementation
-assigns ALL groundings within a batch element the same head hash (the query).
-Since query exclusion prevents body atoms from equaling the query, the
-fixed-point iterations are effectively a no-op — it degenerates to "all body
-atoms must be base facts."  This needs to be fixed to match the keras-ns
-cross-query semantics described above.
+The torch-ns implementation (`filters/soundness/fp_batch.py`) pools proved head
+hashes across ALL batch elements into a global pool, enabling cross-query
+provability: if query B proves ancestor(2,3) and query A needs it as a body atom,
+the fixed-point iteration will discover it.
 
 ### `fp_global` — global fixed-point (forward-chaining provable set)
 
 Precomputes the provable set I_D by running **forward chaining over the entire
 KB** at init time.  At filter time, checks each body atom independently.
 
-**Algorithm** (`filters/provset.py` + `fc/fc.py`):
+**Algorithm** (`filters/soundness/fp_global.py` + `fc/fc.py`):
 
 **Phase 1 — Forward chaining at init** (one-time cost):
 ```

@@ -240,7 +240,9 @@ class RulePattern:
         self.body_patterns = [
             {"pred_idx": body[j, 0].item(),
              "arg0_binding": self._binding(body[j, 1].item()),
-             "arg1_binding": self._binding(body[j, 2].item())}
+             "arg1_binding": self._binding(body[j, 2].item()),
+             "arg0_var": body[j, 1].item(),
+             "arg1_var": body[j, 2].item()}
             for j in range(body_len)]
 
         self._reorder_body()

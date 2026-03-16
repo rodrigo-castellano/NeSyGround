@@ -4,13 +4,13 @@ Naming convention (dot-separated):
     {resolution}[.{filter}].d{depth}[.w{width}]
 
 Examples:
-    sld.d2           SLD resolution, no filter, depth 2
-    sld.prune.d2     SLD + PruneIncompleteProofs, depth 2
-    sld.provset.d3   SLD + provable-set filter, depth 3
-    rtf.d2           Rule-Then-Fact, depth 2
-    enum.prune.w1.d2 Enum resolution, prune, width 1, depth 2
-    enum.full        Enum, all entities, depth 1
-    lazy.enum.prune.w0.d1  Lazy-filtered enum
+    sld.d2              SLD resolution, no filter, depth 2
+    sld.fp_batch.d2     SLD + cross-query Kleene T_P, depth 2
+    sld.fp_global.d3    SLD + FC provable set filter, depth 3
+    rtf.d2              Rule-Then-Fact, depth 2
+    enum.fp_batch.w1.d2 Enum resolution, fp_batch, width 1, depth 2
+    enum.full           Enum, all entities, depth 1
+    lazy.enum.fp_batch.w0.d1  Lazy-filtered enum
 """
 
 from __future__ import annotations
@@ -34,7 +34,8 @@ from grounder.bc.lazy import LazyGrounder
 _PATTERN = re.compile(
     r"^(?P<lazy>lazy\.)?"
     r"(?P<resolution>sld|rtf|enum)"
-    r"(\.(?P<filter>prune|provset|none))?"
+    r"(\.(?P<filter>fp_batch|fp_global|prune|provset|none))?"
+    r"(?P<pd>\.pd)?"
     r"(\.full|\.w(?P<width>\d+))?"
     r"(\.d(?P<depth>\d+))?$"
 )
@@ -46,34 +47,40 @@ def parse_grounder_type(grounder_type: str) -> dict:
     Returns dict with keys: resolution, filter, depth, width, is_lazy, is_full.
 
     Examples:
-        'sld.prune.d2'         → {resolution:'sld', filter:'prune', depth:2, ...}
-        'enum.prune.w1.d2'     → {resolution:'enum', filter:'prune', depth:2, width:1}
-        'enum.full'            → {resolution:'enum', filter:'prune', depth:1, is_full:True}
-        'lazy.enum.prune.w0.d1'→ {resolution:'enum', filter:'prune', depth:1, width:0, is_lazy:True}
+        'sld.fp_batch.d2'         → {resolution:'sld', filter:'fp_batch', depth:2, ...}
+        'enum.fp_batch.w1.d2'     → {resolution:'enum', filter:'fp_batch', depth:2, width:1}
+        'enum.full'               → {resolution:'enum', filter:'fp_batch', depth:1, is_full:True}
+        'lazy.enum.fp_batch.w0.d1'→ {resolution:'enum', filter:'fp_batch', depth:1, width:0, is_lazy:True}
     """
     m = _PATTERN.match(grounder_type)
     if not m:
         raise ValueError(
             f"Unknown grounder type: {grounder_type!r}. "
             f"Expected format: {{resolution}}[.{{filter}}].d{{depth}}[.w{{width}}]  "
-            f"(e.g. 'sld.prune.d2', 'enum.prune.w1.d2', 'rtf.d4')"
+            f"(e.g. 'sld.fp_batch.d2', 'enum.fp_batch.w1.d2', 'rtf.d4')"
         )
 
     resolution = m.group("resolution")
     is_full = ".full" in grounder_type
 
     if resolution == "enum":
-        default_filter = "prune"
+        default_filter = "fp_batch"
     else:
         default_filter = "none"
 
+    filter_mode = m.group("filter") or default_filter
+    # Normalize legacy names
+    _FILTER_ALIASES = {"prune": "fp_batch", "provset": "fp_global"}
+    filter_mode = _FILTER_ALIASES.get(filter_mode, filter_mode)
+
     return {
         "resolution": resolution,
-        "filter": m.group("filter") or default_filter,
+        "filter": filter_mode,
         "depth": int(m.group("depth")) if m.group("depth") else 1,
         "width": int(m.group("width")) if m.group("width") else 1,
         "is_lazy": bool(m.group("lazy")),
         "is_full": is_full,
+        "step_prune_dead": bool(m.group("pd")),
     }
 
 
@@ -107,7 +114,7 @@ def create_grounder(
     Builds a KB from the data params, then instantiates the right grounder.
 
     Args:
-        grounder_type: e.g. 'sld.prune.d2', 'enum.prune.w1.d2', 'rtf.d4'.
+        grounder_type: e.g. 'sld.fp_batch.d2', 'enum.fp_batch.w1.d2', 'rtf.d4'.
 
     Returns:
         Grounder module instance (BCGrounder or LazyGrounder).
@@ -129,6 +136,7 @@ def create_grounder(
         max_total_groundings=max_total_groundings,
         max_goals=max_goals,
     )
+    bc_kwargs["step_prune_dead"] = cfg["step_prune_dead"]
 
     if cfg["resolution"] == "enum":
         if cfg["is_full"]:
@@ -140,6 +148,10 @@ def create_grounder(
         bc_kwargs["fc_method"] = fc_method
 
     bc_kwargs.update(kwargs)
+
+    # Width: always pass to BCGrounder (for SLD/RTF it activates the hook)
+    if "width" not in bc_kwargs:
+        bc_kwargs["width"] = cfg["width"]
 
     if cfg["is_lazy"]:
         return LazyGrounder(kb, **bc_kwargs)

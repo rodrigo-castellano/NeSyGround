@@ -2,7 +2,7 @@
 
 Configuration replaces classes:
   resolution: 'sld' | 'rtf' | 'enum'
-  filter:     'prune' | 'provset' | 'none'
+  filter:     'fp_batch' | 'fp_global' | 'none'
   depth, width, hooks
   standardization: None | StandardizationConfig
 
@@ -34,6 +34,7 @@ from grounder.bc.common import (
 )
 from grounder.types import GroundingResult
 from grounder.filters import check_in_provable
+from grounder.filters.search import filter_width, filter_prune_dead
 from grounder.resolution.sld import resolve_sld
 from grounder.resolution.rtf import resolve_rtf
 from grounder.resolution.enum import resolve_enum_step
@@ -46,7 +47,7 @@ class BCGrounder(Grounder):
       depth (d):    number of proof steps
       width (w):    max unknown body atoms per grounding (enum only; None=∞)
       resolution:   'sld' | 'rtf' | 'enum'
-      filter:       'prune' | 'provset' | 'none'
+      filter:       'fp_batch' | 'fp_global' | 'none'
       hooks:        GroundingHook list (post-grounding scoring/filtering)
       fact_hook:    ResolutionFactHook (filters fact candidates during resolution)
       rule_hook:    ResolutionRuleHook (filters rule candidates during resolution)
@@ -59,7 +60,7 @@ class BCGrounder(Grounder):
         depth: int = 2,
         width: Optional[int] = 1,
         resolution: str = "enum",
-        filter: str = "prune",
+        filter: str = "fp_batch",
         max_total_groundings: int = 64,
         compile_mode: Optional[str] = None,
         hooks: Optional[List] = None,
@@ -71,6 +72,7 @@ class BCGrounder(Grounder):
         K_MAX: int = 550,
         max_derived_per_state: Optional[int] = None,
         track_grounding_body: bool = True,
+        step_prune_dead: bool = False,
         max_groundings_per_rule: Optional[int] = None,
         # Enum params
         max_groundings_per_query: int = 32,
@@ -90,6 +92,20 @@ class BCGrounder(Grounder):
         self.fact_hook = fact_hook
         self.rule_hook = rule_hook
         self.track_grounding_body = track_grounding_body
+
+        # Per-step search filters
+        self._step_width = width if resolution in ("sld", "rtf") and width is not None else None
+
+        # prune_dead: only for SLD/RTF
+        if step_prune_dead and resolution == "enum":
+            import warnings
+            warnings.warn(
+                "step_prune_dead has no effect with enum resolution "
+                "(all body atoms are ground). Ignoring.",
+                stacklevel=2,
+            )
+        self._step_prune_dead = step_prune_dead and resolution in ("sld", "rtf")
+
         self.standardization_mode = standardization.mode if standardization else None
 
         # Max goals: shared for all resolutions.
@@ -185,22 +201,73 @@ class BCGrounder(Grounder):
             self._compiled = True
             self._multi_step = True
 
-        # Provable set (for provset filter)
-        self._has_provable_set = False
-        if self.filter_mode == "provset" and self.resolution == "enum":
-            self._build_provable_set(self.kb.device_)
+        # Per-step search filter buffers
+        if self._step_prune_dead:
+            P = self.kb.predicate_no + 1
+            head_pred_mask = torch.zeros(P, dtype=torch.bool, device=self.kb.device_)
+            head_preds = self.kb.rule_index.rules_heads_sorted[:, 0]
+            head_pred_mask.scatter_(0, head_preds, True)
+            self.register_buffer("_step_head_pred_mask", head_pred_mask)
 
-    def _build_provable_set(self, device: torch.device) -> None:
+            fi = self.kb.fact_index
+            if hasattr(fi, '_a0_offsets'):
+                a0_lens = fi._a0_offsets[1:] - fi._a0_offsets[:-1]
+                a1_lens = fi._a1_offsets[1:] - fi._a1_offsets[:-1]
+                self.register_buffer("_step_a0_lens", a0_lens)
+                self.register_buffer("_step_a1_lens", a1_lens)
+                self._step_key_scale = fi._key_scale
+                self._step_has_csr = True
+            else:
+                self._step_has_csr = False
+            if hasattr(fi, '_p_offsets'):
+                p_lens = fi._p_offsets[1:] - fi._p_offsets[:-1]
+                self.register_buffer("_step_p_lens", p_lens)
+
+        # Provable set (for fp_global filter)
+        self._has_provable_set = False
+        if self.filter_mode == "fp_global":
+            if self.resolution == "enum":
+                self._build_provable_set(self.kb.device_)
+            else:
+                # SLD/RTF: build a temporary RuleIndexEnum for FC patterns
+                from grounder.rule_index import RuleIndexEnum
+                P = self.kb.predicate_no + 1
+                E = self.kb.constant_no + 1
+                enum_ri = RuleIndexEnum(
+                    self.kb.rule_index.rules_heads_sorted,
+                    self.kb.rule_index.rules_bodies_sorted,
+                    self.kb.rule_index.rule_lens_sorted,
+                    constant_no=self.kb.constant_no,
+                    num_predicates=P,
+                    padding_idx=self.kb.padding_idx,
+                    device=self.kb.device_,
+                )
+                self._build_provable_set(
+                    self.kb.device_, compiled_rules=enum_ri.patterns,
+                    P=P, E=E,
+                )
+
+    def _build_provable_set(
+        self, device: torch.device,
+        compiled_rules=None, P: int = 0, E: int = 0,
+    ) -> None:
         from grounder.fc.fc import run_forward_chaining
-        method = self.fc_method
+        if compiled_rules is None:
+            compiled_rules = self._enum_ri.patterns
+        if P == 0:
+            P = self._P
+        if E == 0:
+            E = self._E
+        method = getattr(self, 'fc_method', 'dynamic')
         if method in ("join", "spmm"):
             method = "dynamic"
+        fc_depth = getattr(self, 'fc_depth', 10)
         provable_tensor, n_provable = run_forward_chaining(
-            compiled_rules=self._enum_ri.patterns,
+            compiled_rules=compiled_rules,
             facts_idx=self.kb.fact_index.facts_idx,
-            num_entities=self._E,
-            num_predicates=self._P,
-            depth=self.fc_depth,
+            num_entities=E,
+            num_predicates=P,
+            depth=fc_depth,
             device=str(device),
         )
         self.register_buffer("provable_hashes", provable_tensor)
@@ -208,6 +275,8 @@ class BCGrounder(Grounder):
             "num_provable",
             torch.tensor(n_provable, dtype=torch.long, device=device))
         self._has_provable_set = n_provable > 0
+        self._P_provable = P
+        self._E_provable = E
 
     # ==================================================================
     # Canonical loop
@@ -324,6 +393,9 @@ class BCGrounder(Grounder):
             active_mask, states, d,
         )
 
+        # ── SEARCH FILTERS (between RESOLVE and PACK) ──
+        resolved = self._apply_search_filters(resolved)
+
         # ── HOOKS (between RESOLVE and PACK) ──
         resolved = self._apply_hooks(resolved, states)
 
@@ -355,15 +427,15 @@ class BCGrounder(Grounder):
         if self.kb.num_rules == 0:
             return self._empty_result(B, tG, M, dev)
 
-        if self.filter_mode == "prune":
-            from grounder.filters.prune import apply_prune
-            mask = apply_prune(
+        if self.filter_mode == "fp_batch":
+            from grounder.filters.soundness.fp_batch import apply_fp_batch
+            mask = apply_fp_batch(
                 body, mask, states["queries"], self.kb.fact_index,
                 self.kb.fact_index.pack_base, self.kb.padding_idx, self.depth)
 
-        elif self.filter_mode == "provset":
-            from grounder.filters.provset import apply_provset
-            mask = apply_provset(
+        elif self.filter_mode == "fp_global":
+            from grounder.filters.soundness.fp_global import apply_fp_global
+            mask = apply_fp_global(
                 body, mask, self.kb.fact_index,
                 self.kb.fact_index.pack_base, self.kb.padding_idx,
                 self.provable_hashes)
@@ -474,6 +546,46 @@ class BCGrounder(Grounder):
     ) -> Tuple[Tensor, ...]:
         """Apply resolution hooks. Subclasses override for RL filtering."""
         return resolved
+
+    # ==================================================================
+    # Per-step search filters (between RESOLVE and PACK)
+    # ==================================================================
+
+    def _apply_search_filters(
+        self,
+        resolved: Tuple[Tensor, ...],
+    ) -> Tuple[Tensor, ...]:
+        """Per-step search filters. No gradients, zero overhead when disabled."""
+        if not self._step_prune_dead and self._step_width is None:
+            return resolved
+
+        (fg, fgb, fs, rule_goals, rgb, rule_success, sri) = resolved
+
+        if self._step_prune_dead:
+            rule_success = filter_prune_dead(
+                rule_goals, rule_success,
+                head_pred_mask=self._step_head_pred_mask,
+                fact_index=self.kb.fact_index,
+                constant_no=self.kb.constant_no,
+                padding_idx=self.kb.padding_idx,
+                M=self.kb.M,
+                a0_lens=self._step_a0_lens if self._step_has_csr else None,
+                a1_lens=self._step_a1_lens if self._step_has_csr else None,
+                p_lens=getattr(self, '_step_p_lens', None),
+                key_scale=self._step_key_scale if self._step_has_csr else 0,
+            )
+
+        if self._step_width is not None:
+            rule_success = filter_width(
+                rule_goals, rule_success,
+                fact_index=self.kb.fact_index,
+                constant_no=self.kb.constant_no,
+                padding_idx=self.kb.padding_idx,
+                M=self.kb.M,
+                width=self._step_width,
+            )
+
+        return (fg, fgb, fs, rule_goals, rgb, rule_success, sri)
 
     # ==================================================================
     # Phase 3: PACK (shared)
@@ -612,12 +724,13 @@ class BCGrounder(Grounder):
             "collected_ridx": collected_ridx,
         }
 
-        # SELECT → RESOLVE → HOOKS → PACK → POSTPROCESS
+        # SELECT → RESOLVE → SEARCH FILTERS → HOOKS → PACK → POSTPROCESS
         queries, remaining, active_mask = self._select(states)
         resolved = self._resolve(
             queries, remaining, grounding_body, state_valid,
             active_mask, states, d=1, use_hooks=False,
         )
+        resolved = self._apply_search_filters(resolved)
         resolved = self._apply_hooks(resolved, states)
         states = self._pack(resolved, states)
         states = self._postprocess(states)
@@ -636,7 +749,7 @@ class BCGrounder(Grounder):
         """Check if atoms are known facts or in provable set."""
         is_fact = self.kb.fact_index.exists(atoms)
         if hasattr(self, "_has_provable_set") and self._has_provable_set:
-            E = self._E
+            E = getattr(self, '_E_provable', getattr(self, '_E', self.kb.constant_no + 1))
             h = atoms[..., 0] * (E * E) + atoms[..., 1] * E + atoms[..., 2]
             in_provable = check_in_provable(h, self.provable_hashes)
             return is_fact | in_provable

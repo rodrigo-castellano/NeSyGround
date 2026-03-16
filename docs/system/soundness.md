@@ -20,8 +20,8 @@ Formal properties of each grounder in NeSyGround. Every grounder is **sound** â€
 |---------------|-------|----------|--------|-------|
 | `resolution='sld'` | Yes | Yes (up to K_max) | D, K=K_f+K_r | Single-level SLD, K additive |
 | `resolution='rtf'` | Yes | Yes (up to K_max) | D, K=K_f*K_r | Two-level rule-then-fact, K multiplicative |
-| `filter='prune'` | Yes | Yes minus pruned | D, K_max | Removes unsupported groundings |
-| `filter='provset'` | Yes | No | D, D_fc, K_max | Depth-1 + FC provability filter |
+| `filter='fp_batch'` | Yes | Yes minus pruned | D, K_max | Cross-query Kleene T_P fixed-point |
+| `filter='fp_global'` | Yes | No | D, D_fc, K_max | FC provable set check (precomputed) |
 | `resolution='enum', width=W` | Yes | No (deliberately) | D, W, K_max | Width controls completeness |
 | `resolution='enum', width=None` | Yes | Yes | tG | Enumerates all entities |
 | FCSemiNaive | Yes | Yes if fixpoint reached | D (iterations) | Semi-naive T_P |

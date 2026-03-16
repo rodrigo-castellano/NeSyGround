@@ -8,7 +8,7 @@ Usage:
     from grounder import BCGrounder
     ds = KGDataset('kge_experiments/data/family', device='cuda')
     kb = ds.make_kb()
-    grounder = BCGrounder(kb, resolution='sld', filter='prune', depth=2)
+    grounder = BCGrounder(kb, resolution='sld', filter='fp_batch', depth=2)
 """
 
 from __future__ import annotations

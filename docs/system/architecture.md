@@ -194,7 +194,7 @@ Unified backward-chaining grounder. One class, configured by:
 | Axis | Options |
 |------|---------|
 | resolution | `'sld'` \| `'rtf'` \| `'enum'` |
-| filter | `'prune'` \| `'provset'` \| `'none'` |
+| filter | `'fp_batch'` \| `'fp_global'` \| `'none'` |
 | hooks | `List[GroundingHook]` |
 | depth | int (proof steps) |
 | width | int \| None (enum: max unknown body atoms) |

@@ -83,7 +83,7 @@ def _run_groundings(
     grounder = BCGrounder(
         kb,
         resolution=grounder_type,
-        filter='prune',
+        filter='fp_batch',
         max_goals=max_goals,
         depth=depth,
         max_total_groundings=64,
