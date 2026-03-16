@@ -62,8 +62,8 @@ class TestPruneFilter:
         query_mask = torch.tensor([True])
         result_none = grounder_none(queries, query_mask)
         result_prune = grounder_prune(queries, query_mask)
-        # filter='none' returns a states dict; count collected groundings
-        none_count = result_none["collected_mask"][0].sum().item()
+        # filter='none' returns a GroundingResult; count collected groundings
+        none_count = result_none.count[0].item()
         assert none_count >= result_prune.count[0].item()
 
 
