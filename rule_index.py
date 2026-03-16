@@ -15,7 +15,7 @@ compile_rules()   standalone: raw tensors → List[RulePattern]
 
 from __future__ import annotations
 
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -75,17 +75,15 @@ class RuleIndex(nn.Module):
 
         preds = heads[:, 0]
         uniq, cnts = torch.unique_consecutive(preds, return_counts=True)
-        offsets = torch.zeros_like(cnts)
-        offsets[1:] = cnts[:-1]
-        seg_starts = offsets.cumsum(0)
 
         num_pred = (predicate_no + 1 if predicate_no is not None
                     else int(preds.max().item()) + 2)
-        starts = torch.zeros(num_pred, dtype=torch.long, device=device)
-        seg_lens = torch.zeros(num_pred, dtype=torch.long, device=device)
+        # CSR offsets: offsets[p] = start, offsets[p+1] - offsets[p] = count
+        seg_offsets = torch.zeros(num_pred + 1, dtype=torch.long, device=device)
+        cum = cnts.cumsum(0)
         mask = uniq < num_pred
-        starts[uniq[mask]] = seg_starts[mask]
-        seg_lens[uniq[mask]] = cnts[mask]
+        seg_offsets[uniq[mask] + 1] = cum[mask]
+        seg_offsets = seg_offsets.cummax(0).values
 
         self._max_rule_pairs = int(cnts.max().item())
 
@@ -93,8 +91,7 @@ class RuleIndex(nn.Module):
         self.register_buffer("rules_bodies_sorted", bodies)
         self.register_buffer("rules_idx_sorted", idx)
         self.register_buffer("rule_lens_sorted", lens)
-        self.register_buffer("_seg_starts", starts)
-        self.register_buffer("_seg_lens", seg_lens)
+        self.register_buffer("_seg_offsets", seg_offsets)
 
     @property
     def num_rules(self) -> int:
@@ -134,8 +131,9 @@ class RuleIndex(nn.Module):
             z = torch.zeros((0, max_pairs), dtype=torch.long, device=dev)
             return z, z.bool(), z
 
-        lens = self._seg_lens[query_preds.long()]
-        starts = self._seg_starts[query_preds.long()]
+        qp = query_preds.long().clamp(0, self._seg_offsets.shape[0] - 2)
+        starts = self._seg_offsets[qp]
+        lens = (self._seg_offsets[qp + 1] - starts).clamp(max=max_pairs)
         offsets = torch.arange(max_pairs, device=dev).unsqueeze(0)
         return (
             starts.unsqueeze(1) + offsets,
@@ -375,29 +373,20 @@ class RuleIndexEnum(RuleIndex):
         self.register_buffer("enum_dir", enum_dir)
         self.register_buffer("arg_source", arg_source)
 
-        # Predicate → rule clustering
+        # Predicate → rule clustering (derived from base segment offsets)
         P = num_predicates
-        pred_to_rules: Dict[int, List[int]] = {}
-        for i, p in enumerate(self.patterns):
-            pred_to_rules.setdefault(p.head_pred_idx, []).append(i)
-
-        R_eff = max((len(v) for v in pred_to_rules.values()), default=1)
-        pred_rule_indices = torch.zeros(
-            P, R_eff, dtype=torch.long, device=device)
-        pred_rule_mask = torch.zeros(
-            P, R_eff, dtype=torch.bool, device=device)
-        for p_idx, indices in pred_to_rules.items():
-            for j, ri in enumerate(indices[:R_eff]):
-                pred_rule_indices[p_idx, j] = ri
-                pred_rule_mask[p_idx, j] = True
+        R_eff = self._max_rule_pairs
+        all_preds = torch.arange(P, device=device).clamp(
+            0, self._seg_offsets.shape[0] - 2)
+        seg_starts = self._seg_offsets[all_preds]          # [P]
+        seg_counts = self._seg_offsets[all_preds + 1] - seg_starts  # [P]
+        pos = torch.arange(R_eff, device=device).unsqueeze(0)  # [1, R_eff]
+        pred_rule_indices = (seg_starts.unsqueeze(1) + pos).clamp(
+            0, max(R - 1, 0))
+        pred_rule_mask = pos < seg_counts.unsqueeze(1)
 
         self.register_buffer("pred_rule_indices", pred_rule_indices)
         self.register_buffer("pred_rule_mask", pred_rule_mask)
-        self._R_eff_enum = R_eff
-
-    @property
-    def R_eff(self) -> int:
-        return self._R_eff_enum
 
 
 # ======================================================================
