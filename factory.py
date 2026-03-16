@@ -1,17 +1,22 @@
-"""Grounder factory — parse grounder_type string and instantiate BCGrounder.
+"""Grounder factory — parse grounder type string and instantiate BCGrounder.
 
-All grounder types map to BCGrounder (or LazyGrounder wrapping BCGrounder)
-with appropriate resolution, filter, width, and depth settings.
+Naming convention (dot-separated):
+    {resolution}[.{filter}].d{depth}[.w{width}]
 
-Naming convention:
-  BC grounders:       '{name}_{depth}'        (e.g., bcprune_2, bcprovset_3)
-  Parametrized:       '{name}_{width}_{depth}' (e.g., lazy_0_1, soft_1_2)
-  backward_W_D is also accepted (maps to BCGrounder with enum resolution).
+Examples:
+    sld.d2           SLD resolution, no filter, depth 2
+    sld.prune.d2     SLD + PruneIncompleteProofs, depth 2
+    sld.provset.d3   SLD + provable-set filter, depth 3
+    rtf.d2           Rule-Then-Fact, depth 2
+    enum.prune.w1.d2 Enum resolution, prune, width 1, depth 2
+    enum.full        Enum, all entities, depth 1
+    lazy.enum.prune.w0.d1  Lazy-filtered enum
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+import re
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -22,63 +27,59 @@ from grounder.bc.bc import BCGrounder
 from grounder.bc.lazy import LazyGrounder
 
 
-# (prefix, resolution, filter, uses_width)
-# Order matters: longer prefixes first to avoid prefix collisions.
-_REGISTRY = [
-    # NeSy grounders (enum resolution, hooks TBD) — width+depth: prefix_W_D
-    ("softneural_", "enum", "prune", True),
-    ("soft_",       "enum", "prune", True),
-    ("sampler_",    "enum", "prune", True),
-    ("kge_",        "enum", "prune", True),
-    ("neural_",     "enum", "prune", True),
-    # Lazy grounder — width+depth: lazy_W_D
-    ("lazy_",       "enum", "prune", True),
-    # SLD-based grounders — depth only: prefix_D
-    ("bcprovset_",  "sld",  "provset", False),
-    ("bcprune_",    "sld",  "prune",   False),
-    ("bcsld_",      "sld",  "none",    False),
-    ("bcprolog_",   "sld",  "none",    False),
-    ("prolog_",     "sld",  "none",    False),
-    # RTF grounder — depth only: rtf_D
-    ("rtf_",        "rtf",  "none",    False),
-    # Full BC — no suffix
-    ("full",        "enum", "prune",   False),
-    # Parametrized BC fallback — width+depth: backward_W_D
-    ("backward_",   "enum", "prune",   True),
-]
+# ======================================================================
+# Parser
+# ======================================================================
+
+_PATTERN = re.compile(
+    r"^(?P<lazy>lazy\.)?"
+    r"(?P<resolution>sld|rtf|enum)"
+    r"(\.(?P<filter>prune|provset|none))?"
+    r"(\.full|\.w(?P<width>\d+))?"
+    r"(\.d(?P<depth>\d+))?$"
+)
 
 
-def parse_grounder_type(grounder_type: str) -> Tuple[int, int]:
-    """Parse grounder name into (width, depth).
+def parse_grounder_type(grounder_type: str) -> dict:
+    """Parse a grounder type string into a config dict.
+
+    Returns dict with keys: resolution, filter, depth, width, is_lazy, is_full.
 
     Examples:
-        'bcprune_2'    → (1, 2)
-        'backward_1_2' → (1, 2)
-        'lazy_0_1'     → (0, 1)
-        'full'         → (1, 1)
+        'sld.prune.d2'         → {resolution:'sld', filter:'prune', depth:2, ...}
+        'enum.prune.w1.d2'     → {resolution:'enum', filter:'prune', depth:2, width:1}
+        'enum.full'            → {resolution:'enum', filter:'prune', depth:1, is_full:True}
+        'lazy.enum.prune.w0.d1'→ {resolution:'enum', filter:'prune', depth:1, width:0, is_lazy:True}
     """
-    suffix = None
-    for prefix, _, _, _ in _REGISTRY:
-        if grounder_type.startswith(prefix):
-            suffix = grounder_type[len(prefix):]
-            break
+    m = _PATTERN.match(grounder_type)
+    if not m:
+        raise ValueError(
+            f"Unknown grounder type: {grounder_type!r}. "
+            f"Expected format: {{resolution}}[.{{filter}}].d{{depth}}[.w{{width}}]  "
+            f"(e.g. 'sld.prune.d2', 'enum.prune.w1.d2', 'rtf.d4')"
+        )
 
-    if suffix is None:
-        parts = grounder_type.split("_")
-        if len(parts) >= 3:
-            return int(parts[-2]), int(parts[-1])
-        return 1, 1
+    resolution = m.group("resolution")
+    is_full = ".full" in grounder_type
 
-    if not suffix:
-        return 1, 1
+    if resolution == "enum":
+        default_filter = "prune"
+    else:
+        default_filter = "none"
 
-    suffix_parts = suffix.split("_")
-    if len(suffix_parts) == 1:
-        return 1, int(suffix_parts[0])
-    elif len(suffix_parts) >= 2:
-        return int(suffix_parts[-2]), int(suffix_parts[-1])
-    return 1, 1
+    return {
+        "resolution": resolution,
+        "filter": m.group("filter") or default_filter,
+        "depth": int(m.group("depth")) if m.group("depth") else 1,
+        "width": int(m.group("width")) if m.group("width") else 1,
+        "is_lazy": bool(m.group("lazy")),
+        "is_full": is_full,
+    }
 
+
+# ======================================================================
+# Factory
+# ======================================================================
 
 def create_grounder(
     grounder_type: str,
@@ -98,7 +99,6 @@ def create_grounder(
     max_groundings: int = 32,
     max_total_groundings: int = 64,
     fc_method: str = "join",
-    kge_model: Optional[nn.Module] = None,
     max_goals: int = 256,
     **kwargs,
 ) -> nn.Module:
@@ -106,28 +106,14 @@ def create_grounder(
 
     Builds a KB from the data params, then instantiates the right grounder.
 
+    Args:
+        grounder_type: e.g. 'sld.prune.d2', 'enum.prune.w1.d2', 'rtf.d4'.
+
     Returns:
         Grounder module instance (BCGrounder or LazyGrounder).
     """
-    width, depth = parse_grounder_type(grounder_type)
+    cfg = parse_grounder_type(grounder_type)
 
-    # Look up resolution and filter from registry
-    resolution = "enum"
-    filter_mode = "prune"
-    uses_width = True
-    is_lazy = False
-    is_full = False
-
-    for prefix, res, filt, uw in _REGISTRY:
-        if grounder_type.startswith(prefix):
-            resolution = res
-            filter_mode = filt
-            uses_width = uw
-            is_lazy = prefix == "lazy_"
-            is_full = prefix == "full"
-            break
-
-    # Build KB from data params
     kb = KB(
         facts_idx, rule_heads, rule_bodies, rule_lens,
         constant_no=constant_no, predicate_no=predicate_no,
@@ -136,29 +122,26 @@ def create_grounder(
         fact_index_type=fact_index_type,
     )
 
-    # BCGrounder-specific kwargs
     bc_kwargs = dict(
-        resolution=resolution,
-        filter=filter_mode,
-        depth=depth,
+        resolution=cfg["resolution"],
+        filter=cfg["filter"],
+        depth=cfg["depth"],
         max_total_groundings=max_total_groundings,
         max_goals=max_goals,
     )
 
-    # Enum resolution: set width + enum-specific params
-    if resolution == "enum":
-        if is_full:
+    if cfg["resolution"] == "enum":
+        if cfg["is_full"]:
             bc_kwargs["width"] = None
             bc_kwargs["depth"] = 1
         else:
-            bc_kwargs["width"] = width
+            bc_kwargs["width"] = cfg["width"]
         bc_kwargs["max_groundings_per_query"] = max_groundings
         bc_kwargs["fc_method"] = fc_method
 
-    # Merge extra kwargs (compile_mode, hooks, etc.)
     bc_kwargs.update(kwargs)
 
-    if is_lazy:
+    if cfg["is_lazy"]:
         return LazyGrounder(kb, **bc_kwargs)
 
     return BCGrounder(kb, **bc_kwargs)

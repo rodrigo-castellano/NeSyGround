@@ -74,52 +74,54 @@ def resolve_rtf(
             torch.zeros(B, S, 0, dtype=torch.long, device=dev),
         )
 
-    # ── Step 1: Rule head unification → K_r children ──
-    rule_body_subst, rule_remaining, rule_gbody_l1, rule_success_l1, \
-        sub_rule_idx_l1, _, Bmax = mgu_resolve_rules(
-            queries, remaining, rule_index,
-            constant_no, padding_idx, K_r,
-            max_vars_per_rule, num_rules,
-            state_valid, active_mask, next_var_indices,
-            grounding_body if track_grounding_body else None)
+    # All MGU operations are pure index ops — no gradients needed
+    with torch.no_grad():
+        # Step 1: Rule head unification → K_r children
+        rule_body_subst, rule_remaining, rule_gbody_l1, rule_success_l1, \
+            sub_rule_idx_l1, _, Bmax = mgu_resolve_rules(
+                queries, remaining, rule_index,
+                constant_no, padding_idx, K_r,
+                max_vars_per_rule, num_rules,
+                state_valid, active_mask, next_var_indices,
+                grounding_body if track_grounding_body else None)
 
-    # ── Step 2: Resolve first body atom against facts → K_f children per rule ──
-    # Build remaining for fact resolution: body[1:] + rule_remaining
-    n_body_rem = max(Bmax - 1, 0)
-    n_goal_rem = min(G - n_body_rem, G)
-    body_rem = torch.full(
-        (B, S, K_r, G, 3), pad, dtype=torch.long, device=dev)
-    if n_body_rem > 0:
-        body_rem[:, :, :, :n_body_rem, :] = rule_body_subst[:, :, :, 1:Bmax, :]
-    if n_goal_rem > 0:
-        body_rem[:, :, :, n_body_rem:n_body_rem + n_goal_rem, :] = \
-            rule_remaining[:, :, :, :n_goal_rem, :]
+        # Step 2: Resolve first body atom against facts → K_f children per rule
+        n_body_rem = max(Bmax - 1, 0)
+        n_goal_rem = min(G - n_body_rem, G)
+        body_rem = torch.full(
+            (B, S, K_r, G, 3), pad, dtype=torch.long, device=dev)
+        if n_body_rem > 0:
+            body_rem[:, :, :, :n_body_rem, :] = rule_body_subst[:, :, :, 1:Bmax, :]
+        if n_goal_rem > 0:
+            body_rem[:, :, :, n_body_rem:n_body_rem + n_goal_rem, :] = \
+                rule_remaining[:, :, :, :n_goal_rem, :]
 
-    # Flatten [B, S] → [N] for fact resolution
-    N = B * S
-    flat_atoms = rule_body_subst[:, :, :, 0, :].reshape(N, K_r, 3)
-    flat_rem = body_rem.reshape(N, K_r, G, 3)
-    flat_valid = rule_success_l1.reshape(N, K_r)
-    flat_active = torch.ones(N, K_r, dtype=torch.bool, device=dev)
+        # Flatten [B, S] → [N] for fact resolution
+        N = B * S
+        flat_atoms = rule_body_subst[:, :, :, 0, :].reshape(N, K_r, 3)
+        flat_rem = body_rem.reshape(N, K_r, G, 3)
+        flat_valid = rule_success_l1.reshape(N, K_r)
+        flat_active = torch.ones(N, K_r, dtype=torch.bool, device=dev)
 
-    children, _, success = mgu_resolve_facts(
-        flat_atoms, flat_rem, fact_index, facts_idx,
-        constant_no, padding_idx, max_fact_pairs_body,
-        flat_valid, flat_active, grounding_body=None)
+        children, _, success = mgu_resolve_facts(
+            flat_atoms, flat_rem, fact_index, facts_idx,
+            constant_no, padding_idx, max_fact_pairs_body,
+            flat_valid, flat_active, grounding_body=None)
 
-    K_f_actual = children.shape[2]
-    K_rtf = K_r * K_f_actual
+        K_f_actual = children.shape[2]
+        K_rtf = K_r * K_f_actual
 
-    # Reshape to [B, S, K_rtf, ...]
-    rule_goals = children.reshape(B, S, K_rtf, G, 3)
-    rule_success_out = success.reshape(B, S, K_rtf)
+        # Reshape to [B, S, K_rtf, ...]
+        rule_goals = children.reshape(B, S, K_rtf, G, 3)
+        rule_success_out = success.reshape(B, S, K_rtf)
 
-    # Propagate gbody and ridx from level-1 rule resolution
-    rule_gbody_out = rule_gbody_l1.unsqueeze(3).expand(
-        B, S, K_r, K_f_actual, M_g, 3).reshape(B, S, K_rtf, M_g, 3)
-    sub_ridx_out = sub_rule_idx_l1.unsqueeze(3).expand(
-        B, S, K_r, K_f_actual).reshape(B, S, K_rtf)
+        # Propagate gbody and ridx from level-1 rule resolution
+        rule_gbody_out = rule_gbody_l1.unsqueeze(3).expand(
+            B, S, K_r, K_f_actual, M_g, 3).reshape(B, S, K_rtf, M_g, 3)
+        sub_ridx_out = sub_rule_idx_l1.unsqueeze(3).expand(
+            B, S, K_r, K_f_actual).reshape(B, S, K_rtf)
 
+    # Hook: may contain learned parameters — outside no_grad
     if rule_hook is not None:
         rule_success_out = rule_hook.filter_rules(
             rule_goals, rule_success_out, queries)

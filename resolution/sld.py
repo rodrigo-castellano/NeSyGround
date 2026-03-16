@@ -60,18 +60,20 @@ def resolve_sld(
     dev = queries.device
     pad = padding_idx
 
-    # Fact resolution
-    fact_goals, fact_gbody, fact_success = mgu_resolve_facts(
-        queries, remaining, fact_index, facts_idx,
-        constant_no, padding_idx, K_f,
-        state_valid, active_mask,
-        grounding_body if track_grounding_body else None,
-        excluded_queries=excluded_queries)
+    # Fact resolution (pure index ops — no gradients needed)
+    with torch.no_grad():
+        fact_goals, fact_gbody, fact_success = mgu_resolve_facts(
+            queries, remaining, fact_index, facts_idx,
+            constant_no, padding_idx, K_f,
+            state_valid, active_mask,
+            grounding_body if track_grounding_body else None,
+            excluded_queries=excluded_queries)
 
+    # Hook: may contain learned parameters (KGE scorer, etc.)
     if fact_hook is not None:
         fact_success = fact_hook.filter_facts(fact_goals, fact_success, queries)
 
-    # Rule resolution
+    # Rule resolution (pure index ops — no gradients needed)
     if num_rules == 0:
         return (
             fact_goals, fact_gbody, fact_success,
@@ -81,27 +83,27 @@ def resolve_sld(
             torch.zeros(B, S, 0, dtype=torch.long, device=dev),
         )
 
-    rule_body_subst, rule_remaining, rule_gbody_out, rule_success, \
-        sub_rule_idx, _, Bmax = mgu_resolve_rules(
-            queries, remaining, rule_index,
-            constant_no, padding_idx, K_r,
-            max_vars_per_rule, num_rules,
-            state_valid, active_mask, next_var_indices,
-            grounding_body if track_grounding_body else None)
+    with torch.no_grad():
+        rule_body_subst, rule_remaining, rule_gbody_out, rule_success, \
+            sub_rule_idx, _, Bmax = mgu_resolve_rules(
+                queries, remaining, rule_index,
+                constant_no, padding_idx, K_r,
+                max_vars_per_rule, num_rules,
+                state_valid, active_mask, next_var_indices,
+                grounding_body if track_grounding_body else None)
 
-    # Assemble goals = body + remaining
-    rule_goals = torch.full(
-        (B, S, K_r, G, 3), pad, dtype=torch.long, device=dev)
-    rule_goals[:, :, :, :Bmax, :] = rule_body_subst
-    n_rem = min(G - Bmax, G)
-    if n_rem > 0:
-        rule_goals[:, :, :, Bmax:Bmax + n_rem, :] = \
-            rule_remaining[:, :, :, :n_rem, :]
+        # Assemble goals = body + remaining
+        rule_goals = torch.full(
+            (B, S, K_r, G, 3), pad, dtype=torch.long, device=dev)
+        rule_goals[:, :, :, :Bmax, :] = rule_body_subst
+        n_rem = min(G - Bmax, G)
+        if n_rem > 0:
+            rule_goals[:, :, :, Bmax:Bmax + n_rem, :] = \
+                rule_remaining[:, :, :, :n_rem, :]
 
+    # Hook: may contain learned parameters
     if rule_hook is not None:
         rule_success = rule_hook.filter_rules(rule_goals, rule_success, queries)
 
     return (fact_goals, fact_gbody, fact_success,
             rule_goals, rule_gbody_out, rule_success, sub_rule_idx)
-
-

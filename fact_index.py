@@ -90,23 +90,34 @@ class FactIndex(nn.Module):
 
     @staticmethod
     def _shuffle_per_predicate(facts_idx: Tensor, seed: int) -> Tensor:
-        """Shuffle facts within each predicate group."""
+        """Shuffle facts within each predicate group (vectorized)."""
         device = facts_idx.device
+        N = facts_idx.shape[0]
+        if N <= 1:
+            return facts_idx.clone()
         gen = torch.Generator(device=device).manual_seed(seed)
         preds = facts_idx[:, 0]
-        num_preds = int(preds.max().item()) + 1 if preds.numel() > 0 else 1
+        # Sort facts by predicate
         sort_order = torch.argsort(preds, stable=True)
         sorted_facts = facts_idx[sort_order]
-        counts = torch.bincount(preds.long(), minlength=num_preds)
-        starts = torch.zeros(num_preds + 1, dtype=torch.long, device=device)
-        starts[1:] = counts.cumsum(0)
-        shuffled = sorted_facts.clone()
-        for p in range(num_preds):
-            s, e = starts[p].item(), starts[p + 1].item()
-            if e - s > 1:
-                shuffled[s:e] = sorted_facts[
-                    s + torch.randperm(e - s, device=device, generator=gen)]
-        return shuffled
+        sorted_preds = preds[sort_order]
+        # Compute within-group positions
+        _, _, counts = torch.unique_consecutive(
+            sorted_preds, return_inverse=True, return_counts=True)
+        group_starts = torch.zeros(counts.shape[0] + 1, dtype=torch.long, device=device)
+        group_starts[1:] = counts.cumsum(0)
+        # For each element, compute its group start: expand starts per element
+        group_ids = torch.arange(counts.shape[0], device=device).repeat_interleave(counts)
+        element_group_starts = group_starts[group_ids]  # [N]
+        # Within-group position for each element
+        positions = torch.arange(N, dtype=torch.long, device=device) - element_group_starts
+        # Generate random keys for within-group shuffling
+        random_keys = torch.rand(N, device=device, generator=gen)
+        # Composite sort key: (group_id, random_key) — stable sort by group preserving random order within
+        # Multiply group_ids by 2.0 so random_keys (in [0,1)) don't cross group boundaries
+        composite = group_ids.float() * 2.0 + random_keys
+        shuffle_order = torch.argsort(composite, stable=True)
+        return sorted_facts[shuffle_order]
 
     @property
     def num_facts(self) -> int:
@@ -181,17 +192,26 @@ class ArgKeyFactIndex(FactIndex):
     @staticmethod
     def _build_segment_index(
         keys: Tensor, max_key: int, device: torch.device,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
-        """Build (order, starts, lens) segment index for sorted composite keys."""
+    ) -> Tuple[Tensor, Tensor]:
+        """Build (order, offsets) CSR-style segment index for sorted composite keys.
+
+        Returns:
+            order: argsort permutation of keys
+            offsets: CSR offsets of size [max_key + 1], where
+                     start = offsets[key], count = offsets[key+1] - offsets[key]
+        """
         order = keys.argsort(stable=True)
         sorted_keys = keys[order]
         unique, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
-        starts = torch.zeros(max_key, dtype=torch.long, device=device)
-        lens = torch.zeros(max_key, dtype=torch.long, device=device)
+        # Build CSR offsets: offsets[key] = start, offsets[key+1] - offsets[key] = count
+        offsets = torch.zeros(max_key + 1, dtype=torch.long, device=device)
         cum = counts.cumsum(0)
-        starts[unique] = cum - counts
-        lens[unique] = counts
-        return order, starts, lens
+        # Set offsets[key+1] = cumulative count for each unique key
+        offsets[unique + 1] = cum
+        # Forward-fill: for keys without entries, offsets[k+1] should equal offsets[k]
+        # This is achieved by taking cummax of the offsets
+        offsets = offsets.cummax(0).values
+        return order, offsets
 
     def _build_indices(self, device: torch.device) -> None:
         facts = self.facts_idx
@@ -201,24 +221,28 @@ class ArgKeyFactIndex(FactIndex):
         self._key_scale = ks
         bsi = self._build_segment_index
 
-        o0, s0, l0 = bsi(preds * ks + arg0,
-                          int((preds * ks + arg0).max()) + 1, device)
-        o1, s1, l1 = bsi(preds * ks + arg1,
-                          int((preds * ks + arg1).max()) + 1, device)
-        op, sp, lp = bsi(preds, int(preds.max()) + 1, device)
+        o0, off0 = bsi(preds * ks + arg0,
+                        int((preds * ks + arg0).max()) + 2, device)
+        o1, off1 = bsi(preds * ks + arg1,
+                        int((preds * ks + arg1).max()) + 2, device)
+        op, offp = bsi(preds, int(preds.max()) + 2, device)
 
         self.register_buffer("_a0_order", o0)
-        self.register_buffer("_a0_starts", s0)
-        self.register_buffer("_a0_lens", l0)
+        self.register_buffer("_a0_offsets", off0)
         self.register_buffer("_a1_order", o1)
-        self.register_buffer("_a1_starts", s1)
-        self.register_buffer("_a1_lens", l1)
+        self.register_buffer("_a1_offsets", off1)
         self.register_buffer("_p_order", op)
-        self.register_buffer("_p_starts", sp)
-        self.register_buffer("_p_lens", lp)
+        self.register_buffer("_p_offsets", offp)
 
-        max0 = int(l0.max().item()) if l0.numel() > 0 else 1
-        max1 = int(l1.max().item()) if l1.numel() > 0 else 1
+        # Compute max segment length from offsets: max(offsets[k+1] - offsets[k])
+        def _max_seg(offsets: Tensor) -> int:
+            if offsets.numel() < 2:
+                return 1
+            lens = offsets[1:] - offsets[:-1]
+            return max(int(lens.max().item()), 1)
+
+        max0 = _max_seg(off0)
+        max1 = _max_seg(off1)
         self._max_fact_pairs = max(max0, max1, 1)
 
     @property
@@ -238,28 +262,28 @@ class ArgKeyFactIndex(FactIndex):
         preds, a0, a1 = query_atoms[:, 0], query_atoms[:, 1], query_atoms[:, 2]
         is_c0 = (a0 <= cno) & (a0 != pad)
         is_c1 = (a1 <= cno) & (a1 != pad)
-        offsets = torch.arange(max_results, device=dev).unsqueeze(0)
+        pos = torch.arange(max_results, device=dev).unsqueeze(0)
 
-        def _lookup(order, starts, lens, keys, is_const):
-            safe = keys.clamp(0, starts.shape[0] - 1)
-            left = starts[safe]
-            cnt = lens[safe].clamp(max=max_results)
-            idx = (left.unsqueeze(1) + offsets).clamp(0, clamp_max)
-            v = (offsets < cnt.unsqueeze(1)) & is_const.unsqueeze(1)
+        def _lookup(order, offsets, keys, is_const):
+            safe = keys.clamp(0, offsets.shape[0] - 2)
+            left = offsets[safe]
+            cnt = (offsets[safe + 1] - left).clamp(max=max_results)
+            idx = (left.unsqueeze(1) + pos).clamp(0, clamp_max)
+            v = (pos < cnt.unsqueeze(1)) & is_const.unsqueeze(1)
             return order[idx.reshape(-1)].reshape(B, max_results), v
 
-        fi0, v0 = _lookup(self._a0_order, self._a0_starts, self._a0_lens,
+        fi0, v0 = _lookup(self._a0_order, self._a0_offsets,
                            preds * ks + a0, is_c0)
-        fi1, v1 = _lookup(self._a1_order, self._a1_starts, self._a1_lens,
+        fi1, v1 = _lookup(self._a1_order, self._a1_offsets,
                            preds * ks + a1, is_c1)
 
         use0 = is_c0.unsqueeze(1)
         fact_idx = torch.where(use0, fi0, fi1)
         valid = torch.where(use0, v0, v1)
 
-        if F > 0 and self._p_starts.numel() > 0:
+        if F > 0 and self._p_offsets.numel() > 0:
             both_var = ~is_c0 & ~is_c1 & (preds != pad)
-            fip, vp = _lookup(self._p_order, self._p_starts, self._p_lens,
+            fip, vp = _lookup(self._p_order, self._p_offsets,
                               preds, both_var)
             bv = both_var.unsqueeze(1)
             fact_idx = torch.where(bv, fip, fact_idx)
@@ -424,22 +448,60 @@ class BlockSparseFactIndex(InvertedFactIndex):
         self._use_dense = True
         self._K = K
 
-        ps_blocks = torch.zeros(P, E, K, dtype=torch.long)
-        ps_counts = torch.zeros(P, E, dtype=torch.long)
-        po_blocks = torch.zeros(P, E, K, dtype=torch.long)
-        po_counts = torch.zeros(P, E, dtype=torch.long)
+        def _fill_blocks(
+            group_a: Tensor, group_b: Tensor, values: Tensor,
+        ) -> Tuple[Tensor, Tensor]:
+            """Vectorized dense block fill for (group_a, group_b) → values.
 
-        p_c, s_c, o_c = preds.cpu(), subjs.cpu(), objs.cpu()
-        for i in range(facts.shape[0]):
-            pi, si, oi = int(p_c[i]), int(s_c[i]), int(o_c[i])
-            j = int(ps_counts[pi, si])
-            if j < K:
-                ps_blocks[pi, si, j] = oi
-                ps_counts[pi, si] = j + 1
-            j = int(po_counts[pi, oi])
-            if j < K:
-                po_blocks[pi, oi, j] = si
-                po_counts[pi, oi] = j + 1
+            For each (a, b) group, stores up to K values sequentially.
+            Returns blocks [P, E, K] and counts [P, E].
+            """
+            # Composite keys for sorting
+            comp_keys = group_a * E + group_b  # [N]
+            sort_idx = torch.argsort(comp_keys, stable=True)
+            sorted_keys = comp_keys[sort_idx]
+            sorted_vals = values[sort_idx]
+
+            # Find group boundaries via unique_consecutive
+            _, inverse, counts = torch.unique_consecutive(
+                sorted_keys, return_inverse=True, return_counts=True,
+            )
+            # Compute within-group positions
+            group_starts = torch.zeros(
+                counts.shape[0] + 1, dtype=torch.long, device=facts.device,
+            )
+            group_starts[1:] = counts.cumsum(0)
+            # For each element, its group start
+            group_ids = torch.arange(
+                counts.shape[0], device=facts.device,
+            ).repeat_interleave(counts)
+            within_pos = (
+                torch.arange(sorted_keys.shape[0], dtype=torch.long, device=facts.device)
+                - group_starts[group_ids]
+            )
+
+            # Mask positions >= K
+            valid = within_pos < K
+            s_keys = sorted_keys[valid]
+            s_vals = sorted_vals[valid]
+            s_pos = within_pos[valid]
+
+            # Scatter into dense blocks
+            blocks = torch.zeros(P * E, K, dtype=torch.long, device=facts.device)
+            flat_idx = s_keys.unsqueeze(1) * K + s_pos.unsqueeze(1)
+            # Use linear indexing
+            blocks.view(-1)[s_keys * K + s_pos] = s_vals
+
+            # Counts per group: min(actual_count, K)
+            count_arr = torch.zeros(P * E, dtype=torch.long, device=facts.device)
+            clamped_counts = counts.clamp(max=K)
+            unique_keys = sorted_keys[group_starts[:-1]]
+            count_arr[unique_keys] = clamped_counts
+
+            return blocks.view(P, E, K), count_arr.view(P, E)
+
+        ps_blocks, ps_counts = _fill_blocks(preds, subjs, objs)
+        po_blocks, po_counts = _fill_blocks(preds, objs, subjs)
 
         self.register_buffer("_ps_blocks", ps_blocks.to(device))
         self.register_buffer("_ps_counts", ps_counts.to(device))

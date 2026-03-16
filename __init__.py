@@ -34,7 +34,7 @@ Usage::
 
     # Factory construction (recommended)
     grounder = create_grounder(
-        'bcprune_2', facts_idx=facts, rule_heads=heads,
+        'sld.prune.d2', facts_idx=facts, rule_heads=heads,
         rule_bodies=bodies, rule_lens=lens, constant_no=C,
         padding_idx=P, device=dev,
     )
