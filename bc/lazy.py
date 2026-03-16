@@ -46,10 +46,10 @@ class LazyGrounder(nn.Module):
         rules_heads_idx: Tensor,
         rules_bodies_idx: Tensor,
         rule_lens: Tensor,
+        *,
         constant_no: int,
         padding_idx: int,
         device: torch.device,
-        *,
         query_predicates: Optional[Set[int]] = None,
         **kwargs,
     ) -> None:
@@ -89,7 +89,7 @@ class LazyGrounder(nn.Module):
 
         self._inner = BCGrounder(
             facts_idx, filtered_heads, filtered_bodies, filtered_lens,
-            constant_no, padding_idx, device,
+            constant_no=constant_no, padding_idx=padding_idx, device=device,
             **kwargs,
         )
 

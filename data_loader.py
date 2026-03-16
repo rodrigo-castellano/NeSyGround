@@ -165,18 +165,18 @@ class KGDataset:
             facts_path = self.data_dir / "train.txt"
         self._facts_file = facts_path.name
 
-        # Parse raw data (kept for analysis tools)
-        facts_raw = _parse_triples(facts_path)
-        rules_raw = _parse_rules(self.data_dir / "rules.txt")
+        # Parse raw data, sorted alphabetically for deterministic ordering
+        facts_raw = sorted(_parse_triples(facts_path))
+        rules_raw = sorted(_parse_rules(self.data_dir / "rules.txt"))
         self._facts_raw: List[Tuple[str, str, str]] = facts_raw
         self._rules_raw: List[Tuple[Tuple[str, str, str], List[Tuple[str, str, str]]]] = rules_raw
 
-        # Parse all splits
+        # Parse all splits, sorted alphabetically
         self._splits_raw: Dict[str, List[Tuple[str, str, str]]] = {}
         for split in ("train", "valid", "test"):
             split_path = self.data_dir / f"{split}.txt"
             if split_path.exists():
-                self._splits_raw[split] = _parse_triples(split_path)
+                self._splits_raw[split] = sorted(_parse_triples(split_path))
 
         # Build vocabularies from ALL data
         all_preds: set[str] = set()
@@ -214,10 +214,10 @@ class KGDataset:
 
         self.constant_no = len(self.entity2idx)
         self.padding_idx = self.constant_no + len(var_names) + 10
-        # predicate_no must be >= padding_idx so RuleIndex segment table
-        # can handle padding values that appear as predicate indices in
-        # inactive proof states
-        self.predicate_no = max(len(self.pred2idx) + 1, self.padding_idx)
+        # predicate_no must be > padding_idx: padding values appear in
+        # predicate slots of inactive proof states and must fit in
+        # index tables sized predicate_no + 1.
+        self.predicate_no = max(len(self.pred2idx) + 1, self.padding_idx + 1)
 
         def _lookup(arg: str) -> int:
             if arg in var2idx:

@@ -98,7 +98,6 @@ def create_grounder(
     fc_method: str = "join",
     kge_model: Optional[nn.Module] = None,
     predicate_no: Optional[int] = None,
-    num_entities: Optional[int] = None,
     max_facts_per_query: int = 64,
     fact_index_type: str = "block_sparse",
     max_goals: int = 256,
@@ -134,7 +133,6 @@ def create_grounder(
         fc_method: FC method for provable set ('join').
         kge_model: KGE model (for future hook integration).
         predicate_no: Number of predicates.
-        num_entities: Number of entities.
         max_facts_per_query: K_f for fact index.
         fact_index_type: Fact index type.
         max_goals: Max goals for BFS-based grounders.
@@ -170,7 +168,6 @@ def create_grounder(
         padding_idx=padding_idx,
         device=device,
         predicate_no=predicate_no,
-        num_entities=num_entities,
         max_facts_per_query=max_facts_per_query,
         fact_index_type=fact_index_type,
     )

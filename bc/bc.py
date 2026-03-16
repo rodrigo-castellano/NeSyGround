@@ -143,7 +143,7 @@ class BCGrounder(Grounder):
             meta = init_enum(
                 rule_index=self.rule_index,
                 fact_index=self.fact_index,
-                facts_idx=self.facts_idx,
+                facts_idx=self.fact_index.facts_idx,
                 constant_no=self.constant_no,
                 num_rules=self.num_rules, M=self.M,
                 width=self.width,
@@ -196,7 +196,7 @@ class BCGrounder(Grounder):
             method = "dynamic"
         provable_tensor, n_provable = run_forward_chaining(
             compiled_rules=self._enum_ri.patterns,
-            facts_idx=self.facts_idx,
+            facts_idx=self.fact_index.facts_idx,
             num_entities=self._E,
             num_predicates=self._P,
             depth=self.fc_depth,
@@ -358,13 +358,13 @@ class BCGrounder(Grounder):
             from grounder.filters.prune import apply_prune
             mask = apply_prune(
                 body, mask, states["queries"], self.fact_index,
-                self.pack_base, self.padding_idx, self.depth)
+                self.fact_index.pack_base, self.padding_idx, self.depth)
 
         elif self.filter_mode == "provset":
             from grounder.filters.provset import apply_provset
             mask = apply_provset(
                 body, mask, self.fact_index,
-                self.pack_base, self.padding_idx,
+                self.fact_index.pack_base, self.padding_idx,
                 self.provable_hashes)
 
         count = mask.sum(dim=1)
@@ -412,7 +412,7 @@ class BCGrounder(Grounder):
             return resolve_sld(
                 queries, remaining, grounding_body, state_valid, active_mask,
                 next_var_indices=states["next_var_indices"],
-                fact_index=self.fact_index, facts_idx=self.facts_idx,
+                fact_index=self.fact_index, facts_idx=self.fact_index.facts_idx,
                 rule_index=self.rule_index,
                 constant_no=self.constant_no, padding_idx=self.padding_idx,
                 K_f=self.K_f, K_r=self.K_r,
@@ -426,7 +426,7 @@ class BCGrounder(Grounder):
             return resolve_rtf(
                 queries, remaining, grounding_body, state_valid, active_mask,
                 next_var_indices=states["next_var_indices"],
-                fact_index=self.fact_index, facts_idx=self.facts_idx,
+                fact_index=self.fact_index, facts_idx=self.fact_index.facts_idx,
                 rule_index=self.rule_index,
                 constant_no=self.constant_no, padding_idx=self.padding_idx,
                 K_f=self.K_f, K_r=self.K_r, K=self.K,
@@ -509,7 +509,7 @@ class BCGrounder(Grounder):
         """Prune ground facts, compact atoms, collect completed groundings."""
         proof_goals, _, _ = prune_ground_facts(
             states["proof_goals"], states["state_valid"],
-            self.fact_hashes, self.pack_base,
+            self.fact_index.fact_hashes, self.fact_index.pack_base,
             self.constant_no, self.padding_idx,
             excluded_queries=states.get("excluded_queries"),
         )

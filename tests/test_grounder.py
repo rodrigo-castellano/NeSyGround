@@ -211,9 +211,9 @@ class TestMultipleRules:
 
 
 class TestNoRules:
-    """Edge case: no rules in KB."""
+    """Edge case: no rules in KB must raise ValueError."""
 
-    def test_no_rules(self):
+    def test_no_rules_raises(self):
         facts = torch.cat([
             torch.tensor([[1, 1, 2]], dtype=torch.long),
             _PAD_FACTS,
@@ -221,24 +221,20 @@ class TestNoRules:
         heads = torch.empty(0, 3, dtype=torch.long)
         bodies = torch.empty(0, 1, 3, dtype=torch.long)
         rule_lens = torch.empty(0, dtype=torch.long)
-        grounder = BCGrounder(
-            facts_idx=facts,
-            rules_heads_idx=heads,
-            rules_bodies_idx=bodies,
-            rule_lens=rule_lens,
-            constant_no=23,
-            padding_idx=99,
-            device=DEVICE,
-            predicate_no=2,
-            resolution='sld',
-            filter='prune',
-            max_goals=4,
-            depth=2,
-            max_total_groundings=16,
-            fact_index_type='arg_key',
-        )
-        queries = torch.tensor([[1, 1, 24]], dtype=torch.long)
-        query_mask = torch.tensor([True])
-        result = grounder(queries, query_mask)
-        # No rules → no groundings
-        assert result.count[0].item() == 0
+        with pytest.raises(ValueError, match="rules_heads_idx is empty"):
+            BCGrounder(
+                facts_idx=facts,
+                rules_heads_idx=heads,
+                rules_bodies_idx=bodies,
+                rule_lens=rule_lens,
+                constant_no=23,
+                padding_idx=99,
+                device=DEVICE,
+                predicate_no=2,
+                resolution='sld',
+                filter='prune',
+                max_goals=4,
+                depth=2,
+                max_total_groundings=16,
+                fact_index_type='arg_key',
+            )

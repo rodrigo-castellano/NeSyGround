@@ -1,21 +1,18 @@
 """Fact indexing — hashing, membership, targeted lookup, and enumeration.
 
-FactIndex(nn.Module)
-    Base: sort facts by hash, exists() via binary search.
+Hierarchy
+---------
+FactIndex(nn.Module)          base: sort facts by hash, exists() via binary search
+├── ArgKeyFactIndex           MGU: O(1) targeted lookup via (pred, arg) composite keys
+├── InvertedFactIndex         Enum: O(1) enumeration via (pred*E + bound) offset tables
+└── BlockSparseFactIndex      Enum: dense [P, E, K] blocks, offset fallback
 
-ArgKeyFactIndex(FactIndex)
-    MGU: O(1) targeted lookup via (pred, arg) composite-key tables.
-
-InvertedFactIndex(FactIndex)
-    Enum: O(1) enumeration via (pred*E + bound) offset tables.
-
-BlockSparseFactIndex(InvertedFactIndex)
-    Enum: dense [P, E, K] blocks, falls back to offset when memory exceeds limit.
+Factory: ``FactIndex.create(facts_idx, type='arg_key', ...)``
 """
 
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -23,7 +20,7 @@ from torch import Tensor
 
 
 # ======================================================================
-# Module-level helpers
+# Hashing helpers (module-level, used across classes)
 # ======================================================================
 
 @torch.no_grad()
@@ -46,54 +43,18 @@ def fact_contains(atoms: Tensor, fact_hashes: Tensor, pack_base: int) -> Tensor:
     return (idx < F) & (fact_hashes[idx.clamp(max=F - 1)] == keys)
 
 
-def _build_segment_index(
-    keys: Tensor, max_key: int, device: torch.device,
-) -> Tuple[Tensor, Tensor, Tensor]:
-    """Build (order, starts, lens) segment index for sorted composite keys.
-
-    Returns:
-        order:  [N] sort permutation.
-        starts: [max_key] start offset per key.
-        lens:   [max_key] count per key.
-    """
-    order = keys.argsort(stable=True)
-    sorted_keys = keys[order]
-    unique, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
-    starts = torch.zeros(max_key, dtype=torch.long, device=device)
-    lens = torch.zeros(max_key, dtype=torch.long, device=device)
-    cum = counts.cumsum(0)
-    starts[unique] = cum - counts
-    lens[unique] = counts
-    return order, starts, lens
-
-
-def _build_offset_table(
-    keys: Tensor, values: Tensor, num_slots: int, device: torch.device,
-) -> Tuple[Tensor, Tensor]:
-    """Build offset table: sorted values + cumulative offset array.
-
-    Returns:
-        sorted_values: [N] values sorted by key.
-        offsets:       [num_slots + 1] cumulative offsets per key.
-    """
-    sort_idx = torch.argsort(keys)
-    sorted_keys = keys[sort_idx]
-    sorted_values = values[sort_idx]
-    offsets = torch.zeros(num_slots + 1, dtype=torch.long, device=device)
-    ones = torch.ones(keys.size(0), dtype=torch.long, device=device)
-    offsets.scatter_add_(0, sorted_keys + 1, ones)
-    offsets = torch.cumsum(offsets, dim=0)
-    return sorted_values, offsets
-
-
 # ======================================================================
-# FactIndex — base: sort, hash, exists
+# FactIndex — base
 # ======================================================================
+
+_FACT_INDEX_TYPES = {}  # filled after subclass definitions
+
 
 class FactIndex(nn.Module):
     """Base fact index: sorted facts + binary-search membership.
 
     Subclasses add targeted lookup (ArgKey) or enumeration (Inverted, BlockSparse).
+    Use ``FactIndex.create(...)`` to construct the right subclass by name.
     """
 
     pack_base: int
@@ -101,10 +62,14 @@ class FactIndex(nn.Module):
     def __init__(
         self,
         facts_idx: Tensor,
+        *,
         constant_no: int,
         padding_idx: int,
         device: torch.device,
         pack_base: Optional[int] = None,
+        order: Literal["original", "shuffle"] = "original",
+        order_seed: int = 42,
+        **kwargs,
     ) -> None:
         super().__init__()
         self._constant_no = constant_no
@@ -113,21 +78,82 @@ class FactIndex(nn.Module):
                           else max(int(constant_no), int(padding_idx)) + 2)
 
         if facts_idx.numel() == 0:
-            self.register_buffer("facts_idx",
-                                 torch.zeros(0, 3, dtype=torch.long, device=device))
-            self.register_buffer("fact_hashes",
-                                 torch.zeros(0, dtype=torch.long, device=device))
-            return
+            raise ValueError("facts_idx is empty — cannot build a fact index without facts")
 
         facts = facts_idx.long().to(device)
+        if order == "shuffle":
+            facts = self._shuffle_per_predicate(facts, order_seed)
         hashes = pack_triples_64(facts, self.pack_base)
-        order = hashes.argsort()
-        self.register_buffer("facts_idx", facts[order])
-        self.register_buffer("fact_hashes", hashes[order])
+        sort_order = hashes.argsort()
+        self.register_buffer("facts_idx", facts[sort_order])
+        self.register_buffer("fact_hashes", hashes[sort_order])
+
+    @staticmethod
+    def _shuffle_per_predicate(facts_idx: Tensor, seed: int) -> Tensor:
+        """Shuffle facts within each predicate group."""
+        device = facts_idx.device
+        gen = torch.Generator(device=device).manual_seed(seed)
+        preds = facts_idx[:, 0]
+        num_preds = int(preds.max().item()) + 1 if preds.numel() > 0 else 1
+        sort_order = torch.argsort(preds, stable=True)
+        sorted_facts = facts_idx[sort_order]
+        counts = torch.bincount(preds.long(), minlength=num_preds)
+        starts = torch.zeros(num_preds + 1, dtype=torch.long, device=device)
+        starts[1:] = counts.cumsum(0)
+        shuffled = sorted_facts.clone()
+        for p in range(num_preds):
+            s, e = starts[p].item(), starts[p + 1].item()
+            if e - s > 1:
+                shuffled[s:e] = sorted_facts[
+                    s + torch.randperm(e - s, device=device, generator=gen)]
+        return shuffled
+
+    @property
+    def num_facts(self) -> int:
+        return self.facts_idx.shape[0]
 
     def exists(self, atoms: Tensor) -> Tensor:
         """[N, 3] → [N] bool via binary search."""
         return fact_contains(atoms, self.fact_hashes, self.pack_base)
+
+    @classmethod
+    def create(
+        cls,
+        facts_idx: Tensor,
+        *,
+        type: Literal["arg_key", "inverted", "block_sparse"] = "arg_key",
+        constant_no: int,
+        predicate_no: int,
+        padding_idx: int,
+        device: torch.device,
+        pack_base: Optional[int] = None,
+        max_facts_per_query: int = 64,
+        max_memory_mb: int = 256,
+        order: Literal["original", "shuffle"] = "original",
+        order_seed: int = 42,
+    ) -> "FactIndex":
+        """Factory: create a FactIndex subclass by type name.
+
+        Args:
+            type: 'arg_key' (MGU lookup), 'inverted' (offset enumeration),
+                  or 'block_sparse' (dense blocks with offset fallback).
+            order: 'original' (keep input order) or 'shuffle' (random within
+                   each predicate group — useful when K_f caps results).
+            order_seed: random seed for shuffle reproducibility.
+        """
+        if type not in _FACT_INDEX_TYPES:
+            raise ValueError(
+                f"Unknown fact index type: {type!r}. "
+                f"Choose from {list(_FACT_INDEX_TYPES)}"
+            )
+        return _FACT_INDEX_TYPES[type](
+            facts_idx,
+            constant_no=constant_no, predicate_no=predicate_no,
+            padding_idx=padding_idx, device=device, pack_base=pack_base,
+            max_facts_per_query=max_facts_per_query,
+            max_memory_mb=max_memory_mb,
+            order=order, order_seed=order_seed,
+        )
 
 
 # ======================================================================
@@ -135,48 +161,51 @@ class FactIndex(nn.Module):
 # ======================================================================
 
 class ArgKeyFactIndex(FactIndex):
-    """O(1) targeted fact lookup via (pred, arg) composite-key tables.
-
-    Given a partially-bound atom (pred, ?X, const) or (pred, const, ?Y),
-    returns matching fact indices in constant time.
-    """
+    """O(1) targeted fact lookup via (pred, arg) composite-key tables."""
 
     def __init__(
         self,
         facts_idx: Tensor,
+        *,
         constant_no: int,
         padding_idx: int,
         device: torch.device,
         pack_base: Optional[int] = None,
+        **kwargs,
     ) -> None:
-        super().__init__(facts_idx, constant_no, padding_idx, device,
+        super().__init__(facts_idx, constant_no=constant_no,
+                         padding_idx=padding_idx, device=device,
                          pack_base=pack_base)
         self._build_indices(device)
 
+    @staticmethod
+    def _build_segment_index(
+        keys: Tensor, max_key: int, device: torch.device,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Build (order, starts, lens) segment index for sorted composite keys."""
+        order = keys.argsort(stable=True)
+        sorted_keys = keys[order]
+        unique, counts = torch.unique_consecutive(sorted_keys, return_counts=True)
+        starts = torch.zeros(max_key, dtype=torch.long, device=device)
+        lens = torch.zeros(max_key, dtype=torch.long, device=device)
+        cum = counts.cumsum(0)
+        starts[unique] = cum - counts
+        lens[unique] = counts
+        return order, starts, lens
+
     def _build_indices(self, device: torch.device) -> None:
         facts = self.facts_idx
-        if facts.numel() == 0:
-            z = torch.zeros(0, dtype=torch.long, device=device)
-            for name in ("_a0_order", "_a0_starts", "_a0_lens",
-                         "_a1_order", "_a1_starts", "_a1_lens",
-                         "_p_order", "_p_starts", "_p_lens"):
-                self.register_buffer(name, z.clone())
-            self._key_scale = self._constant_no + 2
-            self._max_fact_pairs = 1
-            return
-
         preds = facts[:, 0].long()
         arg0, arg1 = facts[:, 1].long(), facts[:, 2].long()
         ks = max(int(self._constant_no), int(self._padding_idx)) + 2
         self._key_scale = ks
+        bsi = self._build_segment_index
 
-        # (pred, arg0), (pred, arg1), pred-only — same pattern via helper
-        o0, s0, l0 = _build_segment_index(preds * ks + arg0,
-                                           int((preds * ks + arg0).max()) + 1, device)
-        o1, s1, l1 = _build_segment_index(preds * ks + arg1,
-                                           int((preds * ks + arg1).max()) + 1, device)
-        op, sp, lp = _build_segment_index(preds,
-                                           int(preds.max()) + 1, device)
+        o0, s0, l0 = bsi(preds * ks + arg0,
+                          int((preds * ks + arg0).max()) + 1, device)
+        o1, s1, l1 = bsi(preds * ks + arg1,
+                          int((preds * ks + arg1).max()) + 1, device)
+        op, sp, lp = bsi(preds, int(preds.max()) + 1, device)
 
         self.register_buffer("_a0_order", o0)
         self.register_buffer("_a0_starts", s0)
@@ -199,10 +228,7 @@ class ArgKeyFactIndex(FactIndex):
     def targeted_lookup(
         self, query_atoms: Tensor, max_results: int,
     ) -> Tuple[Tensor, Tensor]:
-        """O(1) fact lookup. Preference: (pred,arg0) → (pred,arg1) → pred-only.
-
-        Returns: (fact_idx [B, K], valid [B, K]).
-        """
+        """O(1) fact lookup. Returns: (fact_idx [B, K], valid [B, K])."""
         B = query_atoms.shape[0]
         dev = query_atoms.device
         cno, pad, ks = self._constant_no, self._padding_idx, self._key_scale
@@ -231,7 +257,6 @@ class ArgKeyFactIndex(FactIndex):
         fact_idx = torch.where(use0, fi0, fi1)
         valid = torch.where(use0, v0, v1)
 
-        # Pred-only fallback for both-variable queries
         if F > 0 and self._p_starts.numel() > 0:
             both_var = ~is_c0 & ~is_c1 & (preds != pad)
             fip, vp = _lookup(self._p_order, self._p_starts, self._p_lens,
@@ -260,46 +285,50 @@ class InvertedFactIndex(FactIndex):
     def __init__(
         self,
         facts_idx: Tensor,
+        *,
         constant_no: int,
+        predicate_no: int,
         padding_idx: int,
         device: torch.device,
-        num_entities: int,
-        num_predicates: int,
         max_facts_per_query: int = 64,
+        **kwargs,
     ) -> None:
-        super().__init__(facts_idx, constant_no, padding_idx, device)
-        self._num_entities = num_entities
-        self._num_predicates = num_predicates
+        super().__init__(facts_idx, constant_no=constant_no,
+                         padding_idx=padding_idx, device=device)
+        self._num_entities = constant_no
+        self._num_predicates = predicate_no + 1
         self._max_facts_per_query = max_facts_per_query
         self._build_offset_tables(device)
+
+    @staticmethod
+    def _build_offset_table(
+        keys: Tensor, values: Tensor, num_slots: int, device: torch.device,
+    ) -> Tuple[Tensor, Tensor]:
+        """Build offset table: sorted values + cumulative offset array."""
+        sort_idx = torch.argsort(keys)
+        sorted_keys = keys[sort_idx]
+        sorted_values = values[sort_idx]
+        offsets = torch.zeros(num_slots + 1, dtype=torch.long, device=device)
+        ones = torch.ones(keys.size(0), dtype=torch.long, device=device)
+        offsets.scatter_add_(0, sorted_keys + 1, ones)
+        offsets = torch.cumsum(offsets, dim=0)
+        return sorted_values, offsets
 
     def _build_offset_tables(self, device: torch.device) -> None:
         facts = self.facts_idx
         E, P = self._num_entities, self._num_predicates
         num_slots = P * E
-
-        if facts.shape[0] == 0:
-            z = torch.zeros(1, dtype=torch.long, device=device)
-            o = torch.zeros(num_slots + 1, dtype=torch.long, device=device)
-            self.register_buffer("_ps_values", z)
-            self.register_buffer("_ps_offsets", o)
-            self.register_buffer("_po_values", z)
-            self.register_buffer("_po_offsets", o)
-            return
-
         preds, subjs, objs = facts[:, 0].long(), facts[:, 1].long(), facts[:, 2].long()
+        bot = self._build_offset_table
 
-        # (pred, subj) → objs
-        ps_vals, ps_off = _build_offset_table(preds * E + subjs, objs, num_slots, device)
+        ps_vals, ps_off = bot(preds * E + subjs, objs, num_slots, device)
         self.register_buffer("_ps_values", ps_vals)
         self.register_buffer("_ps_offsets", ps_off)
 
-        # (pred, obj) → subjs
-        po_vals, po_off = _build_offset_table(preds * E + objs, subjs, num_slots, device)
+        po_vals, po_off = bot(preds * E + objs, subjs, num_slots, device)
         self.register_buffer("_po_values", po_vals)
         self.register_buffer("_po_offsets", po_off)
 
-    # Backward compat aliases
     @property
     def ps_sorted_objs(self): return self._ps_values
     @property
@@ -363,26 +392,23 @@ class BlockSparseFactIndex(InvertedFactIndex):
     def __init__(
         self,
         facts_idx: Tensor,
+        *,
         constant_no: int,
+        predicate_no: int,
         padding_idx: int,
         device: torch.device,
-        num_entities: int,
-        num_predicates: int,
         max_facts_per_query: int = 64,
         max_memory_mb: int = 256,
+        **kwargs,
     ) -> None:
-        super().__init__(facts_idx, constant_no, padding_idx, device,
-                         num_entities, num_predicates, max_facts_per_query)
+        super().__init__(facts_idx, constant_no=constant_no,
+                         predicate_no=predicate_no, padding_idx=padding_idx,
+                         device=device, max_facts_per_query=max_facts_per_query)
         self._build_dense(device, max_memory_mb)
 
     def _build_dense(self, device: torch.device, max_memory_mb: int) -> None:
         facts = self.facts_idx
         P, E, M = self._num_predicates, self._num_entities, self._max_facts_per_query
-
-        if facts.shape[0] == 0:
-            self._use_dense = False
-            return
-
         preds, subjs, objs = facts[:, 0], facts[:, 1], facts[:, 2]
 
         _, ps_cnt = torch.unique(preds * E + subjs, return_counts=True)
@@ -398,7 +424,6 @@ class BlockSparseFactIndex(InvertedFactIndex):
         self._use_dense = True
         self._K = K
 
-        # Build on CPU then move
         ps_blocks = torch.zeros(P, E, K, dtype=torch.long)
         ps_counts = torch.zeros(P, E, dtype=torch.long)
         po_blocks = torch.zeros(P, E, K, dtype=torch.long)
@@ -458,30 +483,13 @@ class BlockSparseFactIndex(InvertedFactIndex):
 
 
 # ======================================================================
-# Utilities
+# Registry
 # ======================================================================
 
-def shuffle_facts_per_predicate(
-    facts_idx: Tensor,
-    predicate_no: Optional[int] = None,
-    seed: int = 42,
-) -> Tensor:
-    """Randomly shuffle facts within each predicate segment."""
-    device = facts_idx.device
-    gen = torch.Generator(device=device).manual_seed(seed)
-    preds = facts_idx[:, 0]
-    num_preds = max(int(preds.max().item()) + 1,
-                    (predicate_no + 1) if predicate_no else 1)
-    order = torch.argsort(preds, stable=True)
-    facts_sorted = facts_idx[order]
-    counts = torch.bincount(preds.long(), minlength=num_preds)
-    starts = torch.zeros(num_preds + 1, dtype=torch.long, device=device)
-    starts[1:] = counts.cumsum(0)
+_FACT_INDEX_TYPES.update({
+    "arg_key": ArgKeyFactIndex,
+    "inverted": InvertedFactIndex,
+    "block_sparse": BlockSparseFactIndex,
+})
 
-    shuffled = facts_sorted.clone()
-    for p in range(num_preds):
-        s, e = starts[p].item(), starts[p + 1].item()
-        if e - s > 1:
-            shuffled[s:e] = facts_sorted[
-                s + torch.randperm(e - s, device=device, generator=gen)]
-    return shuffled
+

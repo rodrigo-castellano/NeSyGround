@@ -51,7 +51,7 @@ class TestFactContains:
 class TestArgKeyFactIndex:
     def test_targeted_lookup(self):
         facts = _make_facts()
-        idx = ArgKeyFactIndex(facts, C_NO, PAD, DEVICE, pack_base=100)
+        idx = ArgKeyFactIndex(facts, constant_no=C_NO, padding_idx=PAD, device=DEVICE, pack_base=100)
         # Query: parent(alice, V0) -> should find parent(alice, bob)
         queries = torch.tensor([[1, 1, 6]])  # pred=1, arg0=1 (ground), arg1=6 (var)
         item_idx, valid = idx.targeted_lookup(queries, max_results=4)
@@ -63,7 +63,7 @@ class TestArgKeyFactIndex:
 
     def test_no_match(self):
         facts = _make_facts()
-        idx = ArgKeyFactIndex(facts, C_NO, PAD, DEVICE, pack_base=100)
+        idx = ArgKeyFactIndex(facts, constant_no=C_NO, padding_idx=PAD, device=DEVICE, pack_base=100)
         # Query with predicate 5 (doesn't exist) — targeted_lookup may return
         # clamped indices but unification will fail on predicate mismatch.
         # Check that no unification succeeds:
@@ -79,7 +79,7 @@ class TestArgKeyFactIndex:
 
     def test_both_vars(self):
         facts = _make_facts()
-        idx = ArgKeyFactIndex(facts, C_NO, PAD, DEVICE, pack_base=100)
+        idx = ArgKeyFactIndex(facts, constant_no=C_NO, padding_idx=PAD, device=DEVICE, pack_base=100)
         # Both args are vars: parent(V0, V1)
         queries = torch.tensor([[1, 6, 7]])
         item_idx, valid = idx.targeted_lookup(queries, max_results=4)
@@ -89,7 +89,7 @@ class TestArgKeyFactIndex:
 
     def test_exists(self):
         facts = _make_facts()
-        idx = ArgKeyFactIndex(facts, C_NO, PAD, DEVICE, pack_base=100)
+        idx = ArgKeyFactIndex(facts, constant_no=C_NO, padding_idx=PAD, device=DEVICE, pack_base=100)
         atoms = torch.tensor([
             [1, 1, 2],  # parent(alice, bob) — exists
             [1, 2, 3],  # parent(bob, charlie) — exists
@@ -104,8 +104,8 @@ class TestInvertedFactIndex:
     def test_enumerate(self):
         facts = _make_facts()
         idx = InvertedFactIndex(
-            facts, C_NO, PAD, DEVICE,
-            num_entities=4, num_predicates=3, max_facts_per_query=4,
+            facts, constant_no=C_NO, predicate_no=2,
+            padding_idx=PAD, device=DEVICE, max_facts_per_query=4,
         )
         # Enumerate parent facts with arg0=1
         pred = torch.tensor([1])
@@ -122,8 +122,8 @@ class TestBlockSparseFactIndex:
     def test_enumerate(self):
         facts = _make_facts()
         idx = BlockSparseFactIndex(
-            facts, C_NO, PAD, DEVICE,
-            num_entities=4, num_predicates=3, max_facts_per_query=4,
+            facts, constant_no=C_NO, predicate_no=2,
+            padding_idx=PAD, device=DEVICE, max_facts_per_query=4,
             max_memory_mb=256,
         )
         pred = torch.tensor([1])

@@ -61,10 +61,11 @@ def init_enum(
         rule_index.rules_heads_sorted,
         rule_index.rules_bodies_sorted,
         rule_index.rule_lens_sorted,
-        constant_no, device,
+        constant_no=constant_no,
         num_predicates=P,
         predicate_no=P - 1 if P > 0 else None,
         padding_idx=rule_index.padding_idx,
+        device=device,
     )
 
     # Head predicate mask

@@ -1,20 +1,21 @@
 """Rule indexing — sorted storage, lookup, and binding analysis.
 
-RuleIndex(nn.Module)
-    Sorted rule tensors + segment-based predicate→rule lookup.
-    Used directly by MGU resolution (SLD, RTF).
+Hierarchy
+---------
+RuleIndex(nn.Module)          base: sorted rules + segment-based predicate→rule lookup
+└── RuleIndexEnum             + per-rule binding analysis + tensorized enum metadata
 
-RuleIndexEnum(RuleIndex)
-    Adds per-rule binding analysis + tensorized enum metadata.
-    Used by enum resolution and forward chaining.
+Factory: ``RuleIndex.create(rules_heads_idx, ..., type='base', ...)``
 
-RulePattern
-    Per-rule variable binding pattern (internal to RuleIndexEnum).
+Supporting classes
+------------------
+RulePattern       per-rule variable binding pattern (used by RuleIndexEnum and FC)
+compile_rules()   standalone: raw tensors → List[RulePattern]
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,19 +31,14 @@ BINDING_FREE_VAR_OFFSET = 2
 # RuleIndex — base: sorted storage + segment lookup
 # ======================================================================
 
+_RULE_INDEX_TYPES = {}  # filled after subclass definitions
+
+
 class RuleIndex(nn.Module):
     """Sorted rules with predicate→rule segment lookup.
 
     Sufficient for MGU resolution (SLD, RTF). For enum resolution,
-    use RuleIndexEnum which adds binding analysis.
-
-    Args:
-        rules_heads_idx:  [R, 3] rule head atoms.
-        rules_bodies_idx: [R, Bmax, 3] rule body atoms.
-        rule_lens:        [R] body lengths.
-        device:           target device.
-        predicate_no:     total predicates (exclusive upper bound).
-        padding_idx:      padding value.
+    use ``RuleIndex.create(type='enum', ...)`` or ``RuleIndexEnum`` directly.
     """
 
     def __init__(
@@ -50,44 +46,48 @@ class RuleIndex(nn.Module):
         rules_heads_idx: Tensor,
         rules_bodies_idx: Tensor,
         rule_lens: Tensor,
-        device: torch.device,
+        *,
         predicate_no: Optional[int] = None,
         padding_idx: int = 0,
+        device: torch.device,
+        order: Literal["original", "shuffle"] = "original",
+        order_seed: int = 42,
+        **kwargs,
     ) -> None:
         super().__init__()
         self.padding_idx = padding_idx
         R = rules_heads_idx.shape[0]
 
-        if R > 0:
-            order = torch.argsort(rules_heads_idx[:, 0], stable=True)
-            heads = rules_heads_idx.index_select(0, order).to(device)
-            bodies = rules_bodies_idx.index_select(0, order).to(device)
-            idx = order.to(device)
-            lens = rule_lens.index_select(0, order).to(device)
+        if R == 0:
+            raise ValueError("rules_heads_idx is empty — cannot build a rule index without rules")
 
-            preds = heads[:, 0]
-            uniq, cnts = torch.unique_consecutive(preds, return_counts=True)
-            offsets = torch.zeros_like(cnts)
-            offsets[1:] = cnts[:-1]
-            seg_starts = offsets.cumsum(0)
+        if order == "shuffle":
+            perm = self._shuffle_within_head_pred(
+                rules_heads_idx, R, device, order_seed)
+            rules_heads_idx = rules_heads_idx[perm]
+            rules_bodies_idx = rules_bodies_idx[perm]
+            rule_lens = rule_lens[perm]
+        sort_perm = torch.argsort(rules_heads_idx[:, 0], stable=True)
+        heads = rules_heads_idx.index_select(0, sort_perm).to(device)
+        bodies = rules_bodies_idx.index_select(0, sort_perm).to(device)
+        idx = sort_perm.to(device)
+        lens = rule_lens.index_select(0, sort_perm).to(device)
 
-            num_pred = (predicate_no + 1 if predicate_no is not None
-                        else int(preds.max().item()) + 2)
-            starts = torch.zeros(num_pred, dtype=torch.long, device=device)
-            seg_lens = torch.zeros(num_pred, dtype=torch.long, device=device)
-            mask = uniq < num_pred
-            starts[uniq[mask]] = seg_starts[mask]
-            seg_lens[uniq[mask]] = cnts[mask]
+        preds = heads[:, 0]
+        uniq, cnts = torch.unique_consecutive(preds, return_counts=True)
+        offsets = torch.zeros_like(cnts)
+        offsets[1:] = cnts[:-1]
+        seg_starts = offsets.cumsum(0)
 
-            self._max_rule_pairs = int(cnts.max().item())
-        else:
-            heads = rules_heads_idx.to(device)
-            bodies = rules_bodies_idx.to(device)
-            idx = torch.zeros(0, dtype=torch.long, device=device)
-            lens = rule_lens.to(device)
-            starts = torch.zeros(1, dtype=torch.long, device=device)
-            seg_lens = torch.zeros(1, dtype=torch.long, device=device)
-            self._max_rule_pairs = 0
+        num_pred = (predicate_no + 1 if predicate_no is not None
+                    else int(preds.max().item()) + 2)
+        starts = torch.zeros(num_pred, dtype=torch.long, device=device)
+        seg_lens = torch.zeros(num_pred, dtype=torch.long, device=device)
+        mask = uniq < num_pred
+        starts[uniq[mask]] = seg_starts[mask]
+        seg_lens[uniq[mask]] = cnts[mask]
+
+        self._max_rule_pairs = int(cnts.max().item())
 
         self.register_buffer("rules_heads_sorted", heads)
         self.register_buffer("rules_bodies_sorted", bodies)
@@ -95,6 +95,10 @@ class RuleIndex(nn.Module):
         self.register_buffer("rule_lens_sorted", lens)
         self.register_buffer("_seg_starts", starts)
         self.register_buffer("_seg_lens", seg_lens)
+
+    @property
+    def num_rules(self) -> int:
+        return self.rules_heads_sorted.shape[0]
 
     @property
     def max_rule_pairs(self) -> int:
@@ -139,19 +143,78 @@ class RuleIndex(nn.Module):
             torch.arange(B, device=dev).unsqueeze(1).expand(-1, max_pairs),
         )
 
-    # Backward compat alias
     lookup_by_segments = lookup
+
+    @staticmethod
+    def _shuffle_within_head_pred(
+        rules_heads_idx: Tensor, R: int, device: torch.device, seed: int,
+    ) -> Tensor:
+        """Return a permutation that shuffles rules within each head-predicate group."""
+        gen = torch.Generator(device=rules_heads_idx.device).manual_seed(seed)
+        head_preds = rules_heads_idx[:, 0]
+        sort_order = torch.argsort(head_preds, stable=True)
+        sorted_preds = head_preds[sort_order]
+        num_preds = int(sorted_preds.max().item()) + 1 if R > 0 else 1
+        counts = torch.bincount(sorted_preds.long(), minlength=num_preds)
+        starts = torch.zeros(num_preds + 1, dtype=torch.long,
+                             device=rules_heads_idx.device)
+        starts[1:] = counts.cumsum(0)
+        perm = sort_order.clone()
+        for p in range(num_preds):
+            s, e = starts[p].item(), starts[p + 1].item()
+            if e - s > 1:
+                perm[s:e] = sort_order[
+                    s + torch.randperm(e - s, device=rules_heads_idx.device,
+                                       generator=gen)]
+        return perm
+
+    @classmethod
+    def create(
+        cls,
+        rules_heads_idx: Tensor,
+        rules_bodies_idx: Tensor,
+        rule_lens: Tensor,
+        *,
+        type: Literal["base", "enum"] = "base",
+        constant_no: Optional[int] = None,
+        predicate_no: Optional[int] = None,
+        padding_idx: int = 0,
+        device: torch.device,
+        num_predicates: Optional[int] = None,
+        order: Literal["original", "shuffle"] = "original",
+        order_seed: int = 42,
+    ) -> "RuleIndex":
+        """Factory: create a RuleIndex subclass by type name.
+
+        Args:
+            type: 'base' (segment lookup only) or 'enum' (+ binding analysis).
+            order: 'original' (keep input order) or 'shuffle' (random within
+                   each head-predicate group — useful when K_r caps results).
+            order_seed: random seed for shuffle reproducibility.
+        """
+        if type not in _RULE_INDEX_TYPES:
+            raise ValueError(
+                f"Unknown rule index type: {type!r}. "
+                f"Choose from {list(_RULE_INDEX_TYPES)}"
+            )
+        return _RULE_INDEX_TYPES[type](
+            rules_heads_idx, rules_bodies_idx, rule_lens,
+            constant_no=constant_no, predicate_no=predicate_no,
+            padding_idx=padding_idx, device=device,
+            num_predicates=num_predicates,
+            order=order, order_seed=order_seed,
+        )
 
 
 # ======================================================================
-# RulePattern — per-rule binding analysis (internal)
+# RulePattern — per-rule binding analysis
 # ======================================================================
 
 class RulePattern:
     """Per-rule variable binding pattern with enumeration ordering.
 
     Identifies head/free variables, computes binding sources for each
-    body atom argument, and reorders body atoms so each has ≥1 known arg.
+    body atom argument, and reorders body atoms so each has >= 1 known arg.
     """
 
     def __init__(
@@ -167,7 +230,6 @@ class RulePattern:
         self.body_pred_indices: List[int] = [
             body[j, 0].item() for j in range(body_len)]
 
-        # Free variables = body vars not in head
         head_vars = {v for v in (self.head_var0, self.head_var1)
                      if v > constant_no}
         body_vars = {body[j, k].item()
@@ -236,8 +298,6 @@ class RulePattern:
         self.body_pred_indices = [self.body_pred_indices[i] for i in order]
 
 
-
-
 # ======================================================================
 # RuleIndexEnum — adds binding analysis + enum metadata tensors
 # ======================================================================
@@ -247,10 +307,6 @@ class RuleIndexEnum(RuleIndex):
 
     Extends RuleIndex with per-rule binding patterns and tensorized
     metadata for compiled enumeration resolution.
-
-    Additional args (vs RuleIndex):
-        constant_no:     highest constant index (for binding analysis).
-        num_predicates:  total predicates (for pred→rule clustering).
     """
 
     def __init__(
@@ -258,16 +314,18 @@ class RuleIndexEnum(RuleIndex):
         rules_heads_idx: Tensor,
         rules_bodies_idx: Tensor,
         rule_lens: Tensor,
-        constant_no: int,
-        device: torch.device,
         *,
+        constant_no: int,
         num_predicates: int,
         predicate_no: Optional[int] = None,
         padding_idx: int = 0,
+        device: torch.device,
+        **kwargs,
     ) -> None:
         super().__init__(
-            rules_heads_idx, rules_bodies_idx, rule_lens, device,
+            rules_heads_idx, rules_bodies_idx, rule_lens,
             predicate_no=predicate_no, padding_idx=padding_idx,
+            device=device,
         )
         R = self.rules_heads_sorted.size(0)
 
@@ -283,7 +341,7 @@ class RuleIndexEnum(RuleIndex):
         M = self.max_body
         Rt = max(R, 1)
 
-        # ── Tensorize rule metadata ──
+        # Tensorize rule metadata
         head_preds = torch.zeros(Rt, dtype=torch.long, device=device)
         body_preds = torch.zeros(Rt, M, dtype=torch.long, device=device)
         num_body = torch.zeros(Rt, dtype=torch.long, device=device)
@@ -317,7 +375,7 @@ class RuleIndexEnum(RuleIndex):
         self.register_buffer("enum_dir", enum_dir)
         self.register_buffer("arg_source", arg_source)
 
-        # ── Predicate → rule clustering ──
+        # Predicate → rule clustering
         P = num_predicates
         pred_to_rules: Dict[int, List[int]] = {}
         for i, p in enumerate(self.patterns):
@@ -343,7 +401,17 @@ class RuleIndexEnum(RuleIndex):
 
 
 # ======================================================================
-# Standalone compile (for FC and legacy callers without a RuleIndexEnum)
+# Registry
+# ======================================================================
+
+_RULE_INDEX_TYPES.update({
+    "base": RuleIndex,
+    "enum": RuleIndexEnum,
+})
+
+
+# ======================================================================
+# Standalone compile (for FC and nesy callers without a full RuleIndex)
 # ======================================================================
 
 def compile_rules(
