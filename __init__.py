@@ -105,6 +105,9 @@ from grounder.nesy.neural import NeuralScorer, GroundingAttention
 from grounder.nesy.soft import SoftScorer, ProvabilityMLP
 from grounder.nesy.sampler import RandomSampler
 
+# --- Utilities ---
+from grounder.utils import timed_warmup
+
 __all__ = [
     # Primitives
     "apply_substitutions",
@@ -166,4 +169,6 @@ __all__ = [
     "SoftScorer",
     "ProvabilityMLP",
     "RandomSampler",
+    # Utilities
+    "timed_warmup",
 ]
