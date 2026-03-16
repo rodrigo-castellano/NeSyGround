@@ -54,7 +54,7 @@ def run_swi_prolog(
 
 def run_gpu_static(
     dataset: KGDataset,
-    grounder_cls,
+    resolution: str,
     split: str,
     max_depth: int,
     max_goals: int = 20,
@@ -74,7 +74,7 @@ def run_gpu_static(
     t0 = time.perf_counter()
     depths = generate_depths_static(
         dataset=dataset,
-        grounder_cls=grounder_cls,
+        resolution=resolution,
         split=split,
         max_depth=max_depth,
         max_goals=max_goals,
@@ -92,7 +92,7 @@ def run_gpu_static(
 
 def run_gpu_dynamic(
     dataset: KGDataset,
-    grounder_cls,
+    resolution: str,
     split: str,
     max_depth: int,
     max_goals: int = 20,
@@ -111,7 +111,7 @@ def run_gpu_dynamic(
     t0 = time.perf_counter()
     depths = generate_depths_dynamic(
         dataset=dataset,
-        grounder_cls=grounder_cls,
+        resolution=resolution,
         split=split,
         max_depth=max_depth,
         max_goals=max_goals,
@@ -266,16 +266,10 @@ def main() -> None:
     N = len(queries)
     print(f"Split: {args.split}, Queries: {N}")
 
-    # Import grounder classes lazily (only if needed)
-    grounder_classes = {}
-    if any(g in grounder_names for g in ("sld", "sld_dynamic")):
-        from grounder import PrologGrounder
-        grounder_classes["sld"] = PrologGrounder
-    if any(g in grounder_names for g in ("rtf", "rtf_dynamic")):
-        from grounder import RTFGrounder
-        grounder_classes["rtf"] = RTFGrounder
-
     results: Dict[str, Tuple[Set[int], float]] = {}
+
+    # Map grounder names to resolution strings
+    _RESOLUTION = {"sld": "sld", "rtf": "rtf", "sld_dynamic": "sld", "rtf_dynamic": "rtf"}
 
     for name in grounder_names:
         print(f"\n--- Running: {name} ---")
@@ -288,10 +282,10 @@ def main() -> None:
                 depth_semantics=args.depth_semantics,
                 exclude_self=args.exclude_self,
             )
-        elif name == "sld":
+        elif name in ("sld", "rtf"):
             provable, elapsed = run_gpu_static(
                 dataset=dataset,
-                grounder_cls=grounder_classes["sld"],
+                resolution=_RESOLUTION[name],
                 split=args.split,
                 max_depth=args.max_depth,
                 max_goals=args.max_goals,
@@ -300,34 +294,10 @@ def main() -> None:
                 compile_mode=args.compile_mode,
                 device=args.device,
             )
-        elif name == "rtf":
-            provable, elapsed = run_gpu_static(
-                dataset=dataset,
-                grounder_cls=grounder_classes["rtf"],
-                split=args.split,
-                max_depth=args.max_depth,
-                max_goals=args.max_goals,
-                hard_cap=args.hard_cap,
-                batch_size=args.batch_size,
-                compile_mode=args.compile_mode,
-                device=args.device,
-            )
-        elif name == "sld_dynamic":
+        elif name in ("sld_dynamic", "rtf_dynamic"):
             provable, elapsed = run_gpu_dynamic(
                 dataset=dataset,
-                grounder_cls=grounder_classes["sld"],
-                split=args.split,
-                max_depth=args.max_depth,
-                max_goals=args.max_goals,
-                batch_size=args.batch_size,
-                max_frontier=args.max_frontier,
-                max_per_query=args.max_per_query,
-                device=args.device,
-            )
-        elif name == "rtf_dynamic":
-            provable, elapsed = run_gpu_dynamic(
-                dataset=dataset,
-                grounder_cls=grounder_classes["rtf"],
+                resolution=_RESOLUTION[name],
                 split=args.split,
                 max_depth=args.max_depth,
                 max_goals=args.max_goals,

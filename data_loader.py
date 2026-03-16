@@ -5,8 +5,10 @@ builds vocabularies and converts to tensors suitable for BCGrounder.
 
 Usage:
     from grounder.data_loader import KGDataset
+    from grounder import BCGrounder
     ds = KGDataset('kge_experiments/data/family', device='cuda')
-    grounder = ds.make_grounder(PrologGrounder, max_goals=20, depth=3)
+    kb = ds.make_kb()
+    grounder = BCGrounder(kb, resolution='sld', filter='prune', depth=2)
 """
 
 from __future__ import annotations
@@ -14,7 +16,7 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -298,28 +300,6 @@ class KGDataset:
             predicate_no=self.predicate_no,
             padding_idx=self.padding_idx,
             device=self.device,
-            **kwargs,
-        )
-
-    def make_grounder(
-        self,
-        grounder_cls: Type,
-        max_goals: int,
-        depth: int = 1,
-        max_states: Optional[int] = None,
-        compile_mode: Optional[str] = None,
-        track_grounding_body: bool = True,
-        **kwargs,
-    ):
-        """Create a KB + BCGrounder from this dataset's tensors."""
-        kb = self.make_kb()
-        return grounder_cls(
-            kb,
-            max_goals=max_goals,
-            depth=depth,
-            max_states=max_states,
-            compile_mode=compile_mode,
-            track_grounding_body=track_grounding_body,
             **kwargs,
         )
 

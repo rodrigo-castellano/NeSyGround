@@ -7,19 +7,11 @@ Provides a fully compilable unification engine with fixed-shape tensors, masked 
 ## Usage
 
 ```python
-from grounder import PrologGrounder
+from grounder import KB, BCGrounder
 
-grounder = PrologGrounder(
-    facts_idx=facts,          # [F, 3] (pred, arg0, arg1)
-    rules_heads_idx=heads,    # [R, 3]
-    rules_bodies_idx=bodies,  # [R, Bmax, 3]
-    rule_lens=lens,           # [R]
-    constant_no=C,
-    padding_idx=P,
-    device=dev,
-    max_goals=G,
-    depth=2,
-)
+kb = KB(facts, heads, bodies, lens,
+        constant_no=C, predicate_no=P, padding_idx=P, device=dev)
+grounder = BCGrounder(kb, resolution='sld', filter='prune', depth=2)
 result = grounder(queries, query_mask)
 # result.collected_body:  [B, tG, M, 3]
 # result.collected_mask:  [B, tG]
@@ -30,11 +22,15 @@ result = grounder(queries, query_mask)
 ## Class Hierarchy
 
 ```
-Grounder(nn.Module)          - base: owns KB state (facts, rules, indices)
-  +- BCGrounder              - backward chaining: step() + multi-depth forward()
-     +- PrologGrounder       - K = K_f + K_r, independent fact + rule resolution
-     +- RTFGrounder          - K = K_f * K_r, two-level Rule-Then-Fact
+Grounder(nn.Module)          - base: owns a KB reference
+  +- BCGrounder              - backward chaining, configured via resolution/filter/depth
+  +- LazyGrounder            - predicate-filtered wrapper around BCGrounder
 ```
+
+Resolution is configured, not subclassed:
+- `resolution='sld'`: K = K_f + K_r, independent fact + rule resolution
+- `resolution='rtf'`: K = K_f * K_r, two-level Rule-Then-Fact
+- `resolution='enum'`: full entity enumeration
 
 ## Package Structure
 

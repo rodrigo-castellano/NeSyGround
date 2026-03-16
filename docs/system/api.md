@@ -396,7 +396,7 @@ class Grounder(nn.Module):
 
 ## 5. Backward Chaining Pipeline Methods
 
-The BC pipeline consists of three stages: **SELECT**, **RESOLVE**, **PACK**. SELECT and PACK are implemented on BCGrounder (the abstract base). RESOLVE is split into two abstract methods (`_resolve_facts`, `_resolve_rules`) that must be implemented by a concrete subclass — PrologGrounder (single-level, `K = K_f + K_r`) or RTFGrounder (two-level, `K = K_f * K_r`). The shared `_resolve_rule_heads()` method on BCGrounder handles level-1 head unification for both strategies.
+The BC pipeline consists of three stages: **SELECT**, **RESOLVE**, **PACK**. SELECT and PACK are shared across all resolution modes. RESOLVE dispatches to the configured resolution strategy — SLD (single-level, `K = K_f + K_r`), RTF (two-level, `K = K_f * K_r`), or enum (full entity enumeration). The resolution strategy is selected via the `resolution` parameter at construction time.
 
 All shapes are fixed at construction time.
 

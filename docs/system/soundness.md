@@ -16,14 +16,14 @@ Formal properties of each grounder in NeSyGround. Every grounder is **sound** â€
 
 ## 2. Properties Table
 
-| Grounder | Sound | Complete | Bounds | Notes |
-|----------|-------|----------|--------|-------|
-| PrologGrounder | Yes | Yes (up to K_max) | D, K=K_f+K_r | Single-level SLD, K additive |
-| RTFGrounder | Yes | Yes (up to K_max) | D, K=K_f*K_r | Two-level rule-then-fact, K multiplicative |
-| BCPruneGrounder | Yes | Yes minus pruned | D, K_max | Removes unsupported groundings |
-| BCProvsetGrounder | Yes | No | D, D_fc, K_max | Depth-1 + FC provability filter |
-| ParametrizedBC(D,W) | Yes | No (deliberately) | D, W, K_max | Width controls completeness |
-| FullBCGrounder | Yes | Yes | tG | Enumerates all entities |
+| Configuration | Sound | Complete | Bounds | Notes |
+|---------------|-------|----------|--------|-------|
+| `resolution='sld'` | Yes | Yes (up to K_max) | D, K=K_f+K_r | Single-level SLD, K additive |
+| `resolution='rtf'` | Yes | Yes (up to K_max) | D, K=K_f*K_r | Two-level rule-then-fact, K multiplicative |
+| `filter='prune'` | Yes | Yes minus pruned | D, K_max | Removes unsupported groundings |
+| `filter='provset'` | Yes | No | D, D_fc, K_max | Depth-1 + FC provability filter |
+| `resolution='enum', width=W` | Yes | No (deliberately) | D, W, K_max | Width controls completeness |
+| `resolution='enum', width=None` | Yes | Yes | tG | Enumerates all entities |
 | FCSemiNaive | Yes | Yes if fixpoint reached | D (iterations) | Semi-naive T_P |
 | FCSPMM | Yes | Yes if fixpoint reached | D (iterations) | SpMM-based T_P |
 | SamplerGrounder | Yes | No | D, W, max_sample | Random subset of parent |

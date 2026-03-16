@@ -20,13 +20,14 @@ import torch
 from torch import Tensor
 
 from grounder.data_loader import KGDataset
+from grounder.bc.bc import BCGrounder
 from grounder.analysis._report import DepthStats, write_report
 
 
 @torch.no_grad()
 def generate_depths_static(
     dataset: KGDataset,
-    grounder_cls,
+    resolution: str,
     split: str,
     max_depth: int,
     max_goals: int,
@@ -41,7 +42,7 @@ def generate_depths_static(
 
     Args:
         dataset: Loaded KGDataset
-        grounder_cls: PrologGrounder or RTFGrounder class
+        resolution: 'sld' or 'rtf'
         split: 'train', 'valid', or 'test'
         max_depth: Maximum proof depth
         max_goals: G dimension (max atoms per state)
@@ -66,11 +67,14 @@ def generate_depths_static(
     queries_idx = queries_idx.to(dev)
 
     # Create grounder with full depth
-    grounder = dataset.make_grounder(
-        grounder_cls,
-        max_goals=max_goals,
+    kb = dataset.make_kb()
+    grounder = BCGrounder(
+        kb,
+        resolution=resolution,
+        filter="prune",
         depth=max_depth,
-        max_states=max_states if max_states is not None else min(grounder_cls.__name__ == "RTFGrounder" and hard_cap or hard_cap, hard_cap),
+        max_goals=max_goals,
+        max_states=max_states if max_states is not None else hard_cap,
         compile_mode=compile_mode if dev.type == "cuda" else None,
         track_grounding_body=False,
     )
@@ -86,7 +90,7 @@ def generate_depths_static(
         grounder._build_compiled_fns()
 
     grounder = grounder.to(dev)
-    grounder_type = grounder_cls.__name__
+    grounder_type = resolution
 
     print(f"\n{'='*60}")
     print(f"Static depth generation: {dataset.data_dir.name} / {split}")
@@ -201,16 +205,13 @@ def main() -> None:
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--max_states_cap", type=int, default=4096,
                         help="Hard cap for auto-S calculation")
-    parser.add_argument("--grounder", type=str, default="prolog",
-                        choices=["prolog", "rtf"])
+    parser.add_argument("--grounder", type=str, default="sld",
+                        choices=["sld", "rtf"])
     parser.add_argument("--compile_mode", type=str, default="reduce-overhead")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--facts_file", type=str, default="facts.txt")
     parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
-
-    from grounder import PrologGrounder, RTFGrounder
-    grounder_cls = RTFGrounder if args.grounder == "rtf" else PrologGrounder
 
     dataset = KGDataset(args.data_dir, facts_file=args.facts_file, device=args.device)
     print(f"Loaded: {dataset}")
@@ -218,7 +219,7 @@ def main() -> None:
     for split in args.splits:
         generate_depths_static(
             dataset=dataset,
-            grounder_cls=grounder_cls,
+            resolution=args.grounder,
             split=split,
             max_depth=args.max_depth,
             max_goals=args.max_goals,

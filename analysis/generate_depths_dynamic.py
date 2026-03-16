@@ -24,6 +24,7 @@ from torch import Tensor
 torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None  # type: ignore[attr-defined]
 
 from grounder.data_loader import KGDataset
+from grounder.bc.bc import BCGrounder
 from grounder.bc.common import compact_atoms, prune_ground_facts
 from grounder.analysis._dedup import (
     dedup_within_depth,
@@ -126,7 +127,7 @@ def _process_chunk(
 @torch.no_grad()
 def generate_depths_dynamic(
     dataset: KGDataset,
-    grounder_cls,
+    resolution: str,
     split: str,
     max_depth: int,
     max_goals: int,
@@ -141,7 +142,7 @@ def generate_depths_dynamic(
 
     Args:
         dataset: Loaded KGDataset
-        grounder_cls: PrologGrounder or RTFGrounder class
+        resolution: 'sld' or 'rtf'
         split: 'train', 'valid', or 'test'
         max_depth: Maximum BFS depth
         max_goals: G dimension (max atoms per state)
@@ -166,15 +167,18 @@ def generate_depths_dynamic(
     queries_idx = queries_idx.to(dev)
 
     # Create grounder with depth=1 (external loop), no internal compilation
-    grounder = dataset.make_grounder(
-        grounder_cls,
-        max_goals=max_goals,
+    kb = dataset.make_kb()
+    grounder = BCGrounder(
+        kb,
+        resolution=resolution,
+        filter="prune",
         depth=1,
+        max_goals=max_goals,
         compile_mode=None,  # we compile externally
         track_grounding_body=False,  # skip proof body tracking
     )
     grounder = grounder.to(dev)
-    grounder_type = grounder_cls.__name__
+    grounder_type = resolution
 
     K = grounder.K
     G = max_goals
@@ -428,15 +432,12 @@ def main() -> None:
     parser.add_argument("--max_per_query", type=int, default=5000)
     parser.add_argument("--query_batch_size", type=int, default=0,
                         help="Queries to BFS simultaneously (0 = all)")
-    parser.add_argument("--grounder", type=str, default="prolog",
-                        choices=["prolog", "rtf"])
+    parser.add_argument("--grounder", type=str, default="sld",
+                        choices=["sld", "rtf"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--facts_file", type=str, default="facts.txt")
     parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
-
-    from grounder import PrologGrounder, RTFGrounder
-    grounder_cls = RTFGrounder if args.grounder == "rtf" else PrologGrounder
 
     dataset = KGDataset(args.data_dir, facts_file=args.facts_file, device=args.device)
     print(f"Loaded: {dataset}")
@@ -444,7 +445,7 @@ def main() -> None:
     for split in args.splits:
         generate_depths_dynamic(
             dataset=dataset,
-            grounder_cls=grounder_cls,
+            resolution=args.grounder,
             split=split,
             max_depth=args.max_depth,
             max_goals=args.max_goals,

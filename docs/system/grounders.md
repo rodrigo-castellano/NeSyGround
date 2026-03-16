@@ -7,51 +7,40 @@ Every grounder variant in NeSyGround, with algorithm, formal definition, full co
 ## Class Hierarchy
 
 ```
-Grounder (nn.Module)                        # KB ownership (facts_idx, rule_index, etc.)
-├── BCGrounder (abstract)                   # Pipeline skeleton: SELECT → RESOLVE → PACK
-│   ├── PrologGrounder                      # Single-level SLD (K = K_f + K_r)
-│   ├── RTFGrounder                         # Two-level Rule-Then-Fact (K = K_f * K_r)
-│   ├── BCPruneGrounder                     # + fixed-point pruning
-│   ├── BCProvsetGrounder                   # + FC provable set filtering
-│   ├── ParametrizedBCGrounder              # + width control (W)
-│   │   ├── SamplerGrounder                 # + random selection
-│   │   ├── KGEGrounder                     # + KGE-scored selection
-│   │   ├── NeuralGrounder                  # + learned attention selection
-│   │   ├── SoftGrounder                    # + soft provability scoring
-│   │   └── LazyGrounder                    # + predicate reachability filtering
-│   └── FullBCGrounder                      # Full entity enumeration
-├── FCSemiNaiveGrounder                     # Semi-naive forward chaining
-│   └── FCSPMMGrounder                      # SpMM-based forward chaining
+Grounder (nn.Module)                        # Base: owns a KB reference
+├── BCGrounder                              # Unified backward chaining (configured, not subclassed)
+└── LazyGrounder                            # Predicate-filtered wrapper around BCGrounder
 ```
 
-Two concrete resolution strategies implement BCGrounder's abstract `_resolve_facts` and `_resolve_rules`:
+BCGrounder is configured via three orthogonal axes (no subclasses):
 
-| Strategy | Class | K formula | How it works |
-|----------|-------|-----------|--------------|
-| Single-level | **PrologGrounder** | `K = K_f + K_r` | Facts and rules resolved independently, children concatenated |
-| Two-level | **RTFGrounder** | `K = K_f * K_r` | Rules resolved first, then body atoms resolved against facts |
+| Axis | Options | Description |
+|------|---------|-------------|
+| **resolution** | `'sld'`, `'rtf'`, `'enum'` | How unification candidates are generated |
+| **filter** | `'prune'`, `'provset'`, `'none'` | How incomplete proof branches are pruned |
+| **hooks** | `ResolutionFactHook`, `ResolutionRuleHook`, `GroundingHook` | Optional neuro-symbolic callbacks |
+
+Resolution strategies:
+
+| Strategy | Config | K formula | How it works |
+|----------|--------|-----------|--------------|
+| Single-level SLD | `resolution='sld'` | `K = K_f + K_r` | Facts and rules resolved independently, children concatenated |
+| Rule-Then-Fact | `resolution='rtf'` | `K = K_f * K_r` | Rules resolved first, then body atoms resolved against facts |
+| Entity enumeration | `resolution='enum'` | `K = R_eff * E` | Full entity enumeration with width control |
 
 ---
 
-## 1. BCGrounder — Abstract Pipeline Base
+## 1. BCGrounder — Unified Backward Chaining
 
-The abstract base class for all backward chaining grounders. BCGrounder defines the 5-stage pipeline skeleton (SELECT, RESOLVE FACTS, RESOLVE RULES, PACK, POSTPROCESS) and implements the shared infrastructure: proof loop, state management, compilation, and the shared `_resolve_rule_heads()` method.
-
-BCGrounder does **not** implement `_resolve_facts` or `_resolve_rules` — these are abstract and must be provided by a concrete subclass. The two concrete resolution strategies are:
-
-- **PrologGrounder** (section 13): single-level `K = K_f + K_r`, facts and rules resolved independently
-- **RTFGrounder** (section 14): two-level `K = K_f * K_r`, rules first then body atoms against facts
-
-All other BC grounders (BCPrune, BCProvset, Parametrized, etc.) extend BCGrounder by adding filtering, scoring, or width control on top of the pipeline, and use one of these two concrete strategies for resolution.
+The single backward-chaining grounder class. Configured at construction time via `resolution`, `filter`, `depth`, `width`, and optional hooks. There are no subclasses — all behaviour is composed from the configuration.
 
 ### Pipeline
 
 SLD resolution with MGU-based unification, up to depth `D`. Each step:
 1. **SELECT** the first unresolved goal atom
-2. **RESOLVE FACTS** (abstract) — match goal against facts
-3. **RESOLVE RULES** (abstract) — match goal against rule heads, substitute body
-4. **PACK** children into fixed-size state tensor, deduplicate, truncate
-5. **POSTPROCESS** — prune ground facts, collect completed groundings
+2. **RESOLVE** — dispatch to the configured resolution strategy (`sld`, `rtf`, or `enum`)
+3. **PACK** children into fixed-size state tensor, deduplicate, truncate
+4. **POSTPROCESS** — apply configured filter (`prune`, `provset`, or `none`), collect completed groundings
 
 ### Formal definition
 
@@ -63,15 +52,19 @@ Ground_BC(Q, KB, D) -> G
 
 ```python
 BCGrounder(
-    fact_index: FactIndex,
-    rules: List[Rule],
-    kb: KnowledgeBase,
+    kb: KB,                                 # Knowledge base (facts + rules + indices)
+    *,
     depth: int = 2,                         # D — max resolution steps
-    max_states: int = None,                 # S — states per query (auto-computed if None)
+    width: Optional[int] = 1,              # W — max unproven body atoms (enum only; None=∞)
+    resolution: str = "enum",              # 'sld' | 'rtf' | 'enum'
+    filter: str = "prune",                 # 'prune' | 'provset' | 'none'
     max_total_groundings: int = 64,         # tG — output budget
-    max_goals: int = None,                  # G — auto-computed as 1 + D*(M-1) if None
-    compile_mode: str = "reduce-overhead",  # torch.compile mode
-    device: str = "cuda",
+    compile_mode: Optional[str] = None,     # torch.compile mode
+    hooks: Optional[List] = None,           # GroundingHook list
+    fact_hook = None,                       # ResolutionFactHook
+    rule_hook = None,                       # ResolutionRuleHook
+    max_goals: Optional[int] = None,        # G — auto-computed if None
+    max_states: Optional[int] = None,       # S — auto-computed if None
 )
 ```
 
@@ -82,38 +75,30 @@ def forward(
     self,
     queries: Tensor,            # [B, 3]
     query_mask: Tensor,         # [B]
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Multi-depth proof loop.
-
-    Returns:
-        body: [B, tG, M, 3]
-        mask: [B, tG]
-        count: [B]
-        rule_idx: [B, tG]
-    """
+) -> GroundingResult:
+    """Multi-depth proof loop."""
 
 def _step_impl(self, proof_goals, state_valid, grounding_body, rule_idx, depth):
     """One SELECT -> RESOLVE -> PACK cycle."""
-
-# --- Abstract methods (must be implemented by subclasses) ---
-
-def _resolve_facts(self, queries, remaining, grounding_body, state_valid, active_mask):
-    """Resolve selected goal against facts. Returns (goals, gbody, success)."""
-
-def _resolve_rules(self, queries, remaining, grounding_body, state_valid, active_mask, next_var_indices):
-    """Resolve selected goal against rules. Returns (goals, gbody, success, rule_idx)."""
-
-# --- Shared infrastructure (used by both PrologGrounder and RTFGrounder) ---
-
-def _resolve_rule_heads(self, queries, remaining, grounding_body, state_valid, active_mask, next_var_indices):
-    """Level-1 rule head unification: lookup + standardize + unify + apply subs.
-    Returns: (rule_body_subst, rule_remaining, rule_gbody, rule_success, sub_rule_idx, sub_lens, Bmax)
-    """
 ```
 
-### Not instantiated directly
+### Usage
 
-BCGrounder is not used directly — instantiate PrologGrounder or RTFGrounder (or one of their descendants) instead.
+```python
+from grounder import KB, BCGrounder
+
+kb = KB(facts, heads, bodies, lens,
+        constant_no=C, predicate_no=P, padding_idx=pad, device=dev)
+
+# SLD resolution with pruning (formerly PrologGrounder + BCPruneGrounder)
+g = BCGrounder(kb, resolution='sld', filter='prune', depth=2)
+
+# RTF resolution, no filter (formerly RTFGrounder)
+g = BCGrounder(kb, resolution='rtf', filter='none', depth=2)
+
+# Entity enumeration with provable-set filter (formerly ParametrizedBCGrounder + BCProvsetGrounder)
+g = BCGrounder(kb, resolution='enum', filter='provset', depth=1, width=1)
+```
 
 ---
 
@@ -746,46 +731,23 @@ Large KBs with many predicates where only a subset is relevant to the queries. R
 
 ---
 
-## 13. PrologGrounder — Single-Level SLD Resolution
+## 13. Resolution: SLD (`resolution='sld'`)
 
-The concrete single-level resolution strategy for BCGrounder. `K = K_f + K_r` — facts and rules are resolved **independently** against the selected goal, and children are concatenated.
+Single-level SLD resolution. `K = K_f + K_r` — facts and rules are resolved **independently** against the selected goal, and children are concatenated.
 
 This is the standard SLD resolution algorithm with full MGU-based unification (including var-var bindings).
 
 ### Algorithm
 
-1. **Resolve facts**: look up facts matching the selected goal via FactIndex. Two paths depending on the fact index type:
-   - `ArgKeyFactIndex`: targeted lookup (`_resolve_facts_argkey`)
-   - `InvertedFactIndex` / `BlockSparseFactIndex`: enumeration-based (`_resolve_facts_enumerate`)
-2. **Resolve rules**: find rules whose head unifies with the goal via shared `_resolve_rule_heads()`, then assemble new goal states with `body + remaining`
-3. Children from facts (`K_f`) and rules (`K_r`) are passed to PACK as separate sets, producing `K = K_f + K_r` total children per state
+1. **Resolve facts**: look up facts matching the selected goal via FactIndex
+2. **Resolve rules**: find rules whose head unifies with the goal, then assemble new goal states with `body + remaining`
+3. Children from facts (`K_f`) and rules (`K_r`) are concatenated, producing `K = K_f + K_r` total children per state
 
-### Formal definition
-
-```
-Ground_BC(Q, KB, D) -> G
-```
-
-### Constructor
+### Usage
 
 ```python
-PrologGrounder(
-    fact_index: FactIndex,
-    rules: List[Rule],
-    kb: KnowledgeBase,
-    depth: int = 2,
-    max_states: int = None,
-    max_total_groundings: int = 64,
-    max_goals: int = None,
-    compile_mode: str = "reduce-overhead",
-    device: str = "cuda",
-)
+grounder = BCGrounder(kb, resolution='sld', filter='prune', depth=2)
 ```
-
-### Implements
-
-- `_resolve_facts`: fact matching with full MGU (var-var bindings), dispatches to argkey or enumerate path
-- `_resolve_rules`: rule head unification via `_resolve_rule_heads()` + goal assembly (body atoms prepended to remaining goals)
 
 ### Soundness
 
@@ -795,147 +757,88 @@ PrologGrounder(
 
 ### When to use
 
-The default concrete BC grounder. Use when you need standard SLD resolution with additive `K = K_f + K_r` children. This is typically the base resolution strategy used by BCPruneGrounder, BCProvsetGrounder, and other pipeline-extending grounders.
+The default resolution for standard backward chaining. Use with `filter='prune'` for the most common setup.
 
 ---
 
-## 14. RTFGrounder — Two-Level Rule-Then-Fact Resolution
+## 14. Resolution: RTF (`resolution='rtf'`)
 
-The alternative concrete resolution strategy for BCGrounder. `K = K_f * K_r` — instead of resolving facts and rules independently (as PrologGrounder does with `K = K_f + K_r`), RTFGrounder first resolves against rule heads, then resolves the resulting body atoms against facts — producing a multiplicative combination.
+Two-level Rule-Then-Fact resolution. `K = K_f * K_r` — instead of resolving facts and rules independently (as SLD does with `K = K_f + K_r`), RTF first resolves against rule heads, then resolves the resulting body atoms against facts — producing a multiplicative combination.
 
 ### Algorithm
 
-1. **Level 1 — Rule head unification**: resolve the selected goal against all matching rule heads via shared `_resolve_rule_heads()`. Produces `K_r` intermediate states, each containing the rule's body atoms (after substitution) concatenated with the remaining goals.
+1. **Level 1 — Rule head unification**: resolve the selected goal against all matching rule heads. Produces `K_r` intermediate states, each containing the rule's body atoms (after substitution) concatenated with the remaining goals.
 2. **Level 2 — Body-fact resolution**: for each of the `K_r` intermediate states, resolve the first body atom against facts via `targeted_lookup`, producing up to `K_f` children per intermediate state. Total: `K_r * K_f` children.
 
-Fact resolution at the SELECT stage is empty — all work is done inside `_resolve_rules`.
+Fact resolution at the SELECT stage is empty — all work is done inside the rule resolution phase.
 
-### Formal definition
-
-```
-Ground_RTF(Q, KB, D) -> G
-```
-
-Same soundness as BCGrounder, different resolution strategy.
-
-### Constructor
+### Usage
 
 ```python
-RTFGrounder(
-    # All BCGrounder args:
-    fact_index: FactIndex,
-    rules: List[Rule],
-    kb: KnowledgeBase,
-    depth: int = 2,
-    max_states: int = None,
-    max_total_groundings: int = 64,
-    max_goals: int = None,
-    compile_mode: str = "reduce-overhead",
-    device: str = "cuda",
-    # Additional:
-    body_order_agnostic: bool = False,  # Try all body atom positions against facts
-    rtf_cascade: bool = False,          # Cascade: resolve multiple body atoms sequentially
-)
-```
-
-### Options
-
-**`body_order_agnostic`**: when `False` (default), only the first body atom is resolved against facts at level 2. When `True`, each body atom position is tried against facts independently, and results are concatenated. This produces `M * K_r * K_f` children but catches more groundings when the optimal resolution order is unknown.
-
-**`rtf_cascade`**: when `True`, level-2 resolution cascades through all body atoms sequentially. After resolving the first body atom against facts, the second body atom of each surviving state is resolved against facts, and so on. This produces deeper resolution within a single step but is more expensive. Chunked execution (`cascade_step_chunked`) controls memory for large batches.
-
-### Overrides
-
-- `_compute_K_uncapped`: returns `K_f * K_r` (multiplicative, not additive)
-- `_resolve_facts`: returns empty tensors (no standalone fact resolution)
-- `_resolve_rules`: two-level resolution — rule heads then body-fact matching
-
-### Key helper functions (module-level)
-
-```python
-def resolve_body_atom_with_facts(
-    eng: RTFGrounder,
-    atoms: Tensor,              # [B, K_r, 3] — body atoms to resolve
-    remaining: Tensor,          # [B, K_r, G, 3] — remaining goals
-    rule_success: Tensor,       # [B, K_r] — validity mask
-    excluded_queries: Tensor | None,
-) -> Tuple[Tensor, Tensor]:    # (derived_states [B, K_r*K_f, G, 3], valid [B, K_r*K_f])
-    """Resolve a batch of atoms against facts using targeted_lookup."""
-
-def resolve_rules_with_facts(
-    eng: RTFGrounder,
-    rule_states: Tensor,        # [B, K_r, M, 3] — intermediate states from level 1
-    rule_success: Tensor,       # [B, K_r] — validity mask
-    excluded_queries: Tensor | None,
-) -> Tuple[Tensor, Tensor]:    # (resolved_states, resolved_valid)
-    """Full two-level resolution. Dispatches to body_order_agnostic or cascade."""
-
-def cascade_step_chunked(
-    eng: RTFGrounder,
-    cap_states: Tensor,         # [B, K_cap, G_cur, 3]
-    cap_ok: Tensor,             # [B, K_cap]
-    excluded_queries: Tensor | None,
-    K_budget: int,
-) -> Tuple[Tensor, Tensor]:
-    """B-chunked cascade step with memory-aware execution."""
+grounder = BCGrounder(kb, resolution='rtf', filter='prune', depth=2)
 ```
 
 ### Soundness
 
 - **Sound**: Yes — every grounding is backed by valid rule head unification + fact matching
-- **Complete within D**: Yes, up to `K_max` truncation (same as BCGrounder)
+- **Complete within D**: Yes, up to `K_max` truncation
 - **Bounds**: D, K = K_f * K_r, tG
 
 ### When to use
 
-When rules have body atoms that benefit from immediate fact grounding within the same resolution step. The multiplicative `K = K_f * K_r` gives denser coverage per step at the cost of more children. Particularly useful with `rtf_cascade=True` for rules with multiple body atoms that can be resolved against facts in sequence. Also used by the RL layer (`RTFEngine`) which shares the module-level helper functions.
+When rules have body atoms that benefit from immediate fact grounding within the same resolution step. The multiplicative `K = K_f * K_r` gives denser coverage per step at the cost of more children.
 
 ---
 
 ## 15. Factory
 
-The factory creates grounders by parsing a type string:
+The factory creates grounders by parsing a dot-separated type string:
 
 ```python
 def create_grounder(
     grounder_type: str,
-    fact_index: FactIndex,
-    rules: List[Rule],
-    kb: KnowledgeBase,
-    max_groundings: int,
-    max_total_groundings: int,
-    provable_set_method: str = "join",
-    device: str = "cuda",
-    kge_model: nn.Module | None = None,
-) -> Grounder: ...
+    *,
+    facts_idx: Tensor,
+    rule_heads: Tensor,
+    rule_bodies: Tensor,
+    rule_lens: Tensor,
+    constant_no: int,
+    padding_idx: int,
+    device: torch.device,
+    predicate_no: Optional[int] = None,
+    max_facts_per_query: int = 64,
+    fact_index_type: str = "block_sparse",
+    max_groundings: int = 32,
+    max_total_groundings: int = 64,
+    fc_method: str = "join",
+    max_goals: int = 256,
+    **kwargs,
+) -> nn.Module: ...
 ```
 
-### Registry naming conventions
+### Naming convention
 
-| Pattern | Grounder | Example |
-|---------|----------|---------|
-| `bc_{D}` | BCGrounder | `bc_2` |
-| `bcprune_{D}` | BCPruneGrounder | `bcprune_2` |
-| `bcprovset_{D}` | BCProvsetGrounder | `bcprovset_2` |
-| `bcprolog_{D}` | PrologGrounder | `bcprolog_2` |
-| `rtf_{D}` | RTFGrounder | `rtf_2` |
-| `backward_{W}_{D}` | ParametrizedBCGrounder | `backward_1_2` |
-| `full` | FullBCGrounder | `full` |
-| `lazy_{W}_{D}` | LazyGrounder | `lazy_0_1` |
-| `sampler_{W}_{D}` | SamplerGrounder | `sampler_1_2` |
-| `kge_{W}_{D}` | KGEGrounder | `kge_1_2` |
-| `neural_{W}_{D}` | NeuralGrounder | `neural_1_2` |
-| `soft_{W}_{D}` | SoftGrounder | `soft_1_2` |
+Format: `{resolution}[.{filter}].d{depth}[.w{width}]`
+
+| Pattern | Config | Example |
+|---------|--------|---------|
+| `sld.d2` | resolution=sld, filter=none, depth=2 | `BCGrounder(kb, resolution='sld', depth=2)` |
+| `sld.prune.d2` | resolution=sld, filter=prune, depth=2 | `BCGrounder(kb, resolution='sld', filter='prune', depth=2)` |
+| `sld.provset.d3` | resolution=sld, filter=provset, depth=3 | `BCGrounder(kb, resolution='sld', filter='provset', depth=3)` |
+| `rtf.d2` | resolution=rtf, depth=2 | `BCGrounder(kb, resolution='rtf', depth=2)` |
+| `enum.prune.w1.d2` | resolution=enum, filter=prune, width=1, depth=2 | `BCGrounder(kb, resolution='enum', filter='prune', width=1, depth=2)` |
+| `enum.full` | resolution=enum, all entities, depth=1 | `BCGrounder(kb, resolution='enum', width=None, depth=1)` |
+| `lazy.enum.prune.w0.d1` | LazyGrounder wrapping enum | `LazyGrounder(kb, resolution='enum', ...)` |
 
 ### parse_grounder_type
 
 ```python
-def parse_grounder_type(grounder_type: str) -> Tuple[int, int]:
-    """Parse grounder type string into (width, depth).
+def parse_grounder_type(grounder_type: str) -> dict:
+    """Parse grounder type string into config dict.
 
-    "bc_2"          -> (1, 2)     # BC grounders: width defaults to 1
-    "backward_1_2"  -> (1, 2)
-    "lazy_0_1"      -> (0, 1)
-    "full"          -> (None, 1)
+    'sld.prune.d2'         → {resolution:'sld', filter:'prune', depth:2, ...}
+    'enum.prune.w1.d2'     → {resolution:'enum', filter:'prune', depth:2, width:1}
+    'enum.full'            → {resolution:'enum', filter:'prune', depth:1, is_full:True}
+    'lazy.enum.prune.w0.d1'→ {resolution:'enum', filter:'prune', depth:1, width:0, is_lazy:True}
     """
 ```

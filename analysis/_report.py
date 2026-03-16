@@ -40,7 +40,7 @@ def write_report(
         mode: 'dynamic' or 'static'
         dataset_name: Name of the dataset
         split: Data split ('train', 'valid', 'test')
-        grounder_type: 'PrologGrounder' or 'RTFGrounder'
+        grounder_type: Resolution type ('sld' or 'rtf')
         total_queries: Total number of queries processed
         total_proven: Number of queries proven
         depth_stats: Per-depth statistics
