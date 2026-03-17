@@ -31,7 +31,7 @@ def resolve_facts(
     active_mask: Tensor,        # [B, S]
     grounding_body: Optional[Tensor] = None,  # [B, S, M_g, 3]
     excluded_queries: Optional[Tensor] = None,  # [B, 1, 3]
-) -> Tuple[Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Resolve goal atoms against facts via MGU.
 
     Dispatches on fact_index type:
@@ -52,10 +52,11 @@ def resolve_facts(
         excluded_queries:   [B, 1, 3] atoms to exclude (cycle prevention).
 
     Returns:
-        children:  [B, S, K_f, G, 3] resolved successor states.
+        children:  [B, S, K_f, G, 5] resolved successor states.
         gbody:     [B, S, K_f, M_g, 3] grounding body with subs applied
                    (zeros if grounding_body is None).
         success:   [B, S, K_f] validity mask.
+        fact_subs: [B, S, K_f, 2, 2] substitution pairs per fact child.
     """
     if isinstance(fact_index, ArgKeyFactIndex):
         return _resolve_facts_argkey(
@@ -81,7 +82,7 @@ def resolve_rules(
     active_mask: Tensor,        # [B, S]
     next_var_indices: Tensor,   # [B]
     grounding_body: Optional[Tensor] = None,  # [B, S, M_g, 3]
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int, Tensor]:
     """Resolve goal atoms against rules via MGU head unification.
 
     Lookup matching rules → standardize apart → unify head → apply subs
@@ -110,6 +111,7 @@ def resolve_rules(
         rule_idx:      [B, S, K_r] original rule indices.
         sub_lens:      [B, S, K_r] body lengths per matched rule.
         Bmax:          int — max body size across rules.
+        rule_subs:     [B, S, K_r, 2, 2] substitution pairs per rule child.
     """
     B, S, _ = goals.shape
     G = remaining.shape[2]
@@ -130,6 +132,7 @@ def resolve_rules(
             torch.zeros(B, S, 0, dtype=torch.long, device=dev),
             torch.zeros(B, S, 0, dtype=torch.long, device=dev),
             Bmax,
+            torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev),
         )
 
     query_preds = goals[:, :, 0]
@@ -195,23 +198,23 @@ def resolve_rules(
         & state_valid.unsqueeze(-1) & active_mask.unsqueeze(-1)
     )
 
-    # ---- Apply substitutions to [body, remaining, grounding_body] ----
+    # ---- Apply substitutions to [body, remaining] and grounding_body ----
+    # Grounding body is substituted separately to avoid inflating the combined
+    # buffer (G_body can be much larger than Bmax+G for deep proofs).
     subs_flat_apply = rule_subs.reshape(N_r, 2, 2)
     rem_exp = remaining.unsqueeze(2).expand(B, S, K_r, G, 3).reshape(N_r, G, 3)
+
+    combined = torch.cat([std_bodies, rem_exp], dim=1)
+    combined = apply_substitutions(combined, subs_flat_apply, pad)
+    rule_body_subst = combined[:, :Bmax, :].view(B, S, K_r, Bmax, 3)
+    rule_remaining = combined[:, Bmax:, :].view(B, S, K_r, G, 3)
 
     if grounding_body is not None:
         gbody_exp = grounding_body.unsqueeze(2).expand(
             B, S, K_r, M_g, 3).reshape(N_r, M_g, 3)
-        combined = torch.cat([std_bodies, rem_exp, gbody_exp], dim=1)
-        combined = apply_substitutions(combined, subs_flat_apply, pad)
-        rule_body_subst = combined[:, :Bmax, :].view(B, S, K_r, Bmax, 3)
-        rule_remaining = combined[:, Bmax:Bmax + G, :].view(B, S, K_r, G, 3)
-        rule_gbody_out = combined[:, Bmax + G:, :].view(B, S, K_r, M_g, 3)
+        rule_gbody_out = apply_substitutions(gbody_exp, subs_flat_apply, pad)
+        rule_gbody_out = rule_gbody_out.view(B, S, K_r, M_g, 3)
     else:
-        combined = torch.cat([std_bodies, rem_exp], dim=1)
-        combined = apply_substitutions(combined, subs_flat_apply, pad)
-        rule_body_subst = combined[:, :Bmax, :].view(B, S, K_r, Bmax, 3)
-        rule_remaining = combined[:, Bmax:, :].view(B, S, K_r, G, 3)
         rule_gbody_out = torch.zeros(B, S, K_r, M_g, 3, dtype=torch.long, device=dev)
 
     # ---- Mask body atoms beyond rule length ----
@@ -224,7 +227,7 @@ def resolve_rules(
         rule_body_subst,
     )
 
-    return rule_body_subst, rule_remaining, rule_gbody_out, rule_success, sub_rule_idx, sub_lens_v, Bmax
+    return rule_body_subst, rule_remaining, rule_gbody_out, rule_success, sub_rule_idx, sub_lens_v, Bmax, rule_subs
 
 
 # ---------------------------------------------------------------------------
@@ -243,7 +246,7 @@ def _resolve_facts_argkey(
     active_mask: Tensor,        # [B, S]
     grounding_body: Optional[Tensor],
     excluded_queries: Optional[Tensor],
-) -> Tuple[Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """ArgKey-based fact resolution: targeted_lookup → unify → substitute."""
     B, S, _ = goals.shape
     G = remaining.shape[2]
@@ -270,6 +273,7 @@ def _resolve_facts_argkey(
             torch.full((B, S, K_f, G, 3), pad, dtype=torch.long, device=dev),
             gbody_out,
             torch.zeros(B, S, K_f, dtype=torch.bool, device=dev),
+            torch.full((B, S, K_f, 2, 2), pad, dtype=torch.long, device=dev),
         )
 
     safe_idx = fact_item_idx.clamp(0, max(F - 1, 0))
@@ -319,7 +323,8 @@ def _resolve_facts_argkey(
             torch.tensor(0, dtype=torch.long, device=dev))
 
     fact_success = success.view(B, S, K_f)
-    return fact_goals, fact_gbody, fact_success
+    fact_subs_out = subs.view(B, S, K_f, 2, 2)
+    return fact_goals, fact_gbody, fact_success, fact_subs_out
 
 
 def _resolve_facts_enumerate(
@@ -332,7 +337,7 @@ def _resolve_facts_enumerate(
     active_mask: Tensor,        # [B, S]
     grounding_body: Optional[Tensor],
     excluded_queries: Optional[Tensor],
-) -> Tuple[Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Enumerate-based fact resolution for Inverted/BlockSparse indices."""
     B, S, _ = goals.shape
     G = remaining.shape[2]
@@ -404,7 +409,9 @@ def _resolve_facts_enumerate(
         fact_goals = apply_substitutions(rem_exp, subs, pad).view(B, S, K_f, G, 3)
         fact_gbody = torch.zeros(B, S, K_f, max(M_g, 1), 3, dtype=torch.long, device=dev)
 
-    return fact_goals, fact_gbody, fact_success
+    # Return subs reshaped to [B, S, K_f, 2, 2]
+    fact_subs_out = subs.view(B, S, K_f, 2, 2)
+    return fact_goals, fact_gbody, fact_success, fact_subs_out
 
 
 # ======================================================================

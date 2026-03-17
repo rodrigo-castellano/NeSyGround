@@ -27,15 +27,21 @@ class StepResult:
     proof_goals: Tensor              # [B, S, G, 3]
     next_var_indices: Tensor         # [B]
     state_valid: Tensor              # [B, S]
-    grounding_body: Optional[Tensor] = None  # [B, S, M, 3]
+    grounding_body: Optional[Tensor] = None  # [B, S, G_body, 3] (G_body = depth * M)
     top_ridx: Optional[Tensor] = None       # [B, S]
     fact_counts: Optional[Tensor] = None    # [B]
 
 
 @dataclass
 class GroundingResult:
-    """Output of grounding — ground rule instantiations for a batch of queries."""
-    body: Tensor       # [B, tG, M, 3]
+    """Output of grounding — ground rule instantiations for a batch of queries.
+
+    The body tensor accumulates body atoms from ALL rule applications across
+    depths. Each depth step adds up to M body atoms (one rule application),
+    so body contains up to depth * M atoms per grounding.
+    """
+    body: Tensor       # [B, tG, G_body, 3] where G_body = depth * M
     mask: Tensor       # [B, tG]
     count: Tensor      # [B]
     rule_idx: Tensor   # [B, tG]
+    body_count: Optional[Tensor] = None  # [B, tG] valid body atoms per grounding

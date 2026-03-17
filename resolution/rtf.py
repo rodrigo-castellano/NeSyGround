@@ -42,10 +42,11 @@ def resolve_rtf(
     track_grounding_body: bool = True,
     fact_hook: Optional[ResolutionFactHook] = None,
     rule_hook: Optional[ResolutionRuleHook] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+           Tensor, Tensor]:
     """RTF resolution: rules first, then facts on first body atom.
 
-    Returns 7-tensor tuple (same format as resolve_sld):
+    Returns 9-tensor tuple (same format as resolve_sld):
         fact_goals   [B, S, 0, G, 3]     (empty — no standalone facts)
         fact_gbody   [B, S, 0, M, 3]
         fact_success [B, S, 0]
@@ -53,6 +54,8 @@ def resolve_rtf(
         rule_gbody   [B, S, K_rtf, M, 3]
         rule_success [B, S, K_rtf]
         sub_rule_idx [B, S, K_rtf]
+        fact_subs    [B, S, 0, 2, 2]     (empty — no standalone facts)
+        rule_subs    [B, S, K_rtf, 2, 2]
     """
     B, S, _ = queries.shape
     G = remaining.shape[2]
@@ -64,6 +67,7 @@ def resolve_rtf(
     fact_goals = torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev)
     fact_gbody = torch.zeros(B, S, 0, M_g, 3, dtype=torch.long, device=dev)
     fact_success = torch.zeros(B, S, 0, dtype=torch.bool, device=dev)
+    fact_subs = torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev)
 
     if num_rules == 0:
         return (
@@ -72,18 +76,21 @@ def resolve_rtf(
             torch.zeros(B, S, 0, M_g, 3, dtype=torch.long, device=dev),
             torch.zeros(B, S, 0, dtype=torch.bool, device=dev),
             torch.zeros(B, S, 0, dtype=torch.long, device=dev),
+            fact_subs,
+            torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev),
         )
 
     # All MGU operations are pure index ops — no gradients needed
     with torch.no_grad():
         # Step 1: Rule head unification → K_r children
+        # Pass grounding_body=None: accumulated body sync is handled separately
         rule_body_subst, rule_remaining, rule_gbody_l1, rule_success_l1, \
-            sub_rule_idx_l1, _, Bmax = mgu_resolve_rules(
+            sub_rule_idx_l1, _, Bmax, rule_subs_l1 = mgu_resolve_rules(
                 queries, remaining, rule_index,
                 constant_no, padding_idx, K_r,
                 max_vars_per_rule, num_rules,
                 state_valid, active_mask, next_var_indices,
-                grounding_body if track_grounding_body else None)
+                grounding_body=None)
 
         # Step 2: Resolve first body atom against facts → K_f children per rule
         n_body_rem = max(Bmax - 1, 0)
@@ -103,7 +110,7 @@ def resolve_rtf(
         flat_valid = rule_success_l1.reshape(N, K_r)
         flat_active = torch.ones(N, K_r, dtype=torch.bool, device=dev)
 
-        children, _, success = mgu_resolve_facts(
+        children, _, success, _ = mgu_resolve_facts(
             flat_atoms, flat_rem, fact_index, facts_idx,
             constant_no, padding_idx, max_fact_pairs_body,
             flat_valid, flat_active, grounding_body=None)
@@ -123,10 +130,16 @@ def resolve_rtf(
         sub_ridx_out = sub_rule_idx_l1.unsqueeze(3).expand(
             B, S, K_r, K_f_actual).reshape(B, S, K_rtf)
 
+        # Propagate rule_subs from level-1 (rule head unification subs)
+        # Expand to K_rtf: each rule child's K_f_actual fact children share the same subs
+        rule_subs_out = rule_subs_l1.unsqueeze(3).expand(
+            B, S, K_r, K_f_actual, 2, 2).reshape(B, S, K_rtf, 2, 2)
+
     # Hook: may contain learned parameters — outside no_grad
     if rule_hook is not None:
         rule_success_out = rule_hook.filter_rules(
             rule_goals, rule_success_out, queries)
 
     return (fact_goals, fact_gbody, fact_success,
-            rule_goals, rule_gbody_out, rule_success_out, sub_ridx_out)
+            rule_goals, rule_gbody_out, rule_success_out, sub_ridx_out,
+            fact_subs, rule_subs_out)

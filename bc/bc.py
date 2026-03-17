@@ -25,6 +25,7 @@ from torch import Tensor
 
 from grounder.base import Grounder
 from grounder.kb import KB
+from grounder.primitives import apply_substitutions
 from grounder.resolution.standardization import StandardizationConfig
 from grounder.bc.common import (
     compact_atoms,
@@ -114,6 +115,8 @@ class BCGrounder(Grounder):
         if max_goals is None:
             max_goals = 1 + depth * max(self.kb.M - 1, 1)
         self.max_goals = max(max_goals, self.kb.M)
+        # Body capacity: depth * M (each depth adds up to M body atoms)
+        self.max_body_capacity = depth * self.kb.M
 
         # Init resolution + compilation
         self._init_resolution(
@@ -306,11 +309,13 @@ class BCGrounder(Grounder):
                 mask=result["collected_mask"],
                 count=result["collected_mask"].sum(dim=1),
                 rule_idx=result["collected_ridx"],
+                body_count=result["collected_bcount"],
             )
         for hook in self.hooks:
             body, mask, ridx = hook.apply(result.body, result.mask, result.rule_idx)
             result = GroundingResult(
-                body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx)
+                body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
+                body_count=result.body_count)
         return result
 
 
@@ -336,9 +341,14 @@ class BCGrounder(Grounder):
         dev = queries.device
         pad = self.kb.padding_idx
         G = self.max_goals
-        M = self.kb.M
         tG = self.effective_total_G
-        M_body = 1 if not self.track_grounding_body else M
+        M = self.kb.M  # max body atoms in any single rule
+        # G_body: accumulated body capacity across all depths.
+        # Each depth step adds up to M body atoms (one rule application).
+        # Upper bound = depth * M (not G, which bounds open goals).
+        G_body = 1 if not self.track_grounding_body else self.depth * M
+        # M_work: working buffer for the current depth's body atoms.
+        M_work = 1 if not self.track_grounding_body else M
 
         proof_goals = torch.full(
             (B, 1, G, 3), pad, dtype=torch.long, device=dev)
@@ -347,8 +357,13 @@ class BCGrounder(Grounder):
             proof_goals[:, 0, :M_in, :] = initial_goals
         else:
             proof_goals[:, 0, 0, :] = queries
+        # M-sized working buffer (current depth's rule body atoms)
         grounding_body = torch.full(
-            (B, 1, M_body, 3), pad, dtype=torch.long, device=dev)
+            (B, 1, M_work, 3), pad, dtype=torch.long, device=dev)
+        # G_body-sized accumulator (all depths' body atoms)
+        accumulated_body = torch.full(
+            (B, 1, G_body, 3), pad, dtype=torch.long, device=dev)
+        body_count = torch.zeros(B, 1, dtype=torch.long, device=dev)
         top_ridx = torch.full((B, 1), -1, dtype=torch.long, device=dev)
         state_valid = query_mask.unsqueeze(1)
 
@@ -362,13 +377,16 @@ class BCGrounder(Grounder):
             "query_mask": query_mask,
             "proof_goals": proof_goals,
             "grounding_body": grounding_body,
+            "accumulated_body": accumulated_body,
+            "body_count": body_count,
             "top_ridx": top_ridx,
             "state_valid": state_valid,
             "next_var_indices": next_var_indices,
             "initial_next_var": next_var_indices,
-            "collected_body": queries.new_zeros(B, tG, M, 3),
+            "collected_body": queries.new_zeros(B, tG, G_body, 3),
             "collected_mask": torch.zeros(B, tG, dtype=torch.bool, device=dev),
             "collected_ridx": queries.new_zeros(B, tG),
+            "collected_bcount": torch.zeros(B, tG, dtype=torch.long, device=dev),
         }
         if initial_goals is not None:
             states["initial_goals"] = initial_goals
@@ -416,7 +434,7 @@ class BCGrounder(Grounder):
         return states
 
     def filter_terminal(self, states: Dict):
-        """Apply soundness filter on collected groundings → GroundingResult.
+        """Apply soundness filter on collected groundings -> GroundingResult.
 
         When ``filter='none'``, returns the raw states dict (no collection).
         """
@@ -425,7 +443,7 @@ class BCGrounder(Grounder):
 
         B = states["collected_body"].size(0)
         tG = self.effective_total_G
-        M = self.kb.M
+        G_body = states["collected_body"].shape[2]  # G (accumulated body dim)
         dev = states["collected_body"].device
 
         body = states["collected_body"]
@@ -433,7 +451,7 @@ class BCGrounder(Grounder):
         ridx = states["collected_ridx"]
 
         if self.kb.num_rules == 0:
-            return self._empty_result(B, tG, M, dev)
+            return self._empty_result(B, tG, G_body, dev)
 
         if self.filter_mode == "fp_batch":
             from grounder.filters.soundness.fp_batch import apply_fp_batch
@@ -449,9 +467,11 @@ class BCGrounder(Grounder):
                 self.provable_hashes)
 
         count = mask.sum(dim=1)
+        bcount = states.get("collected_bcount")
         return GroundingResult(
             body=body, mask=mask,
             count=count, rule_idx=ridx,
+            body_count=bcount,
         )
 
     # ==================================================================
@@ -484,8 +504,9 @@ class BCGrounder(Grounder):
         states: Dict,
         d: int,
         use_hooks: bool = True,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Dispatch to resolution strategy. Returns common 7-tensor format."""
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+               Tensor, Tensor]:
+        """Dispatch to resolution strategy. Returns common 9-tensor format."""
         fh = self.fact_hook if use_hooks else None
         rh = self.rule_hook if use_hooks else None
 
@@ -567,7 +588,8 @@ class BCGrounder(Grounder):
         if not self._step_prune_dead and self._step_width is None:
             return resolved
 
-        (fg, fgb, fs, rule_goals, rgb, rule_success, sri) = resolved
+        (fg, fgb, fs, rule_goals, rgb, rule_success, sri,
+         f_subs, r_subs) = resolved
 
         if self._step_prune_dead:
             rule_success = filter_prune_dead(
@@ -593,7 +615,8 @@ class BCGrounder(Grounder):
                 width=self._step_width,
             )
 
-        return (fg, fgb, fs, rule_goals, rgb, rule_success, sri)
+        return (fg, fgb, fs, rule_goals, rgb, rule_success, sri,
+                f_subs, r_subs)
 
     # ==================================================================
     # Phase 3: PACK (shared)
@@ -604,52 +627,157 @@ class BCGrounder(Grounder):
         resolved: Tuple[Tensor, ...],
         states: Dict,
     ) -> Dict:
-        """Flatten S×K children, propagate grounding body, compact to S."""
+        """Flatten S*K children, propagate grounding body, compact to S."""
         S_in = states["top_ridx"].shape[1]
 
-        new_gbody, new_goals, new_ridx, new_valid = pack_states(
+        (new_gbody, new_goals, new_ridx, new_valid, new_bcount,
+         parent_map, winning_subs, has_new_body) = pack_states(
             *resolved,
             states["top_ridx"], states["grounding_body"],
+            states["body_count"],
             self.S, self.kb.padding_idx,
             track_grounding_body=self.track_grounding_body,
+            M_rule=self.kb.M,
         )
 
         states["grounding_body"] = new_gbody
         states["proof_goals"] = new_goals
         states["top_ridx"] = new_ridx
         states["state_valid"] = new_valid
+        # Store sync params for deferred sync (outside compiled step)
+        states["_parent_map"] = parent_map
+        states["_winning_subs"] = winning_subs
+        states["_has_new_body"] = has_new_body
+        states["_parent_bcount"] = new_bcount
+
         states["next_var_indices"] = (
             states["next_var_indices"] + S_in * self.max_vars_per_rule)
+        return states
+
+    def _sync_accumulated(
+        self,
+        states: Dict,
+        parent_map: Tensor,      # [B, S_out]
+        winning_subs: Tensor,    # [B, S_out, 2, 2]
+        has_new_body: Tensor,    # [B, S_out]
+        parent_bcount: Tensor,   # [B, S_out] — body_count inherited from parent
+    ) -> Dict:
+        """Propagate accumulated_body: gather from parents, apply subs, append new atoms.
+
+        All operations are static-shape and torch.compile(fullgraph=True) compatible.
+
+        Args:
+            states: Current states dict with accumulated_body and grounding_body.
+            parent_map: [B, S_out] parent state index for each output state.
+            winning_subs: [B, S_out, 2, 2] substitution pairs per output state.
+            has_new_body: [B, S_out] True for rule children with valid matches.
+            parent_bcount: [B, S_out] body_count inherited from parent.
+        """
+        if not self.track_grounding_body:
+            states["body_count"] = parent_bcount
+            return states
+
+        B, S_out = parent_map.shape
+        G_body = states["accumulated_body"].shape[2]
+        M_work = states["grounding_body"].shape[2]
+        pad = self.kb.padding_idx
+        dev = parent_map.device
+
+        # a. Gather accumulated_body from parents
+        pi = parent_map.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, G_body, 3)
+        acc = states["accumulated_body"].gather(1, pi)  # [B, S_out, G_body, 3]
+
+        # b. Gather body_count from parents (already passed as parent_bcount)
+        bc = parent_bcount  # [B, S_out]
+
+        # c. Apply winning substitutions to accumulated_body
+        acc_flat = acc.reshape(B * S_out, G_body, 3)
+        subs_flat = winning_subs.reshape(B * S_out, 2, 2)
+        acc_flat = apply_substitutions(acc_flat, subs_flat, pad)
+        acc = acc_flat.reshape(B, S_out, G_body, 3)
+
+        # d. Append new body atoms from grounding_body where has_new_body
+        new_atoms = states["grounding_body"]  # [B, S_out, M_work, 3]
+        new_active = (new_atoms[:, :, :, 0] != pad)  # [B, S_out, M_work]
+        new_lens = new_active.long().sum(dim=-1)  # [B, S_out]
+
+        local_idx = torch.arange(M_work, device=dev).view(1, 1, M_work)
+        raw_write_pos = bc.unsqueeze(-1) + local_idx  # [B, S_out, M_work]
+        write_pos = raw_write_pos.clamp(max=G_body - 1)  # [B, S_out, M_work]
+        write_mask = (
+            has_new_body.unsqueeze(-1)
+            & new_active
+            & (raw_write_pos < G_body)
+        )  # [B, S_out, M_work]
+
+        wi = write_pos.unsqueeze(-1).expand(-1, -1, -1, 3)
+        existing = acc.gather(2, wi)
+        to_write = torch.where(write_mask.unsqueeze(-1), new_atoms, existing)
+        acc.scatter_(2, wi, to_write)
+
+        # e. Update body_count
+        bc = bc + torch.where(has_new_body, new_lens, torch.zeros_like(new_lens))
+        bc = bc.clamp(max=G_body)
+
+        states["accumulated_body"] = acc
+        states["body_count"] = bc
         return states
 
     # ==================================================================
     # Phase 4: POSTPROCESS (shared)
     # ==================================================================
 
-    def _postprocess(self, states: Dict) -> Dict:
-        """Prune ground facts, compact atoms, collect completed groundings."""
+    def _postprocess_goals(self, states: Dict) -> Dict:
+        """Prune ground facts and compact atoms (no grounding collection).
+
+        This is the lightweight part of postprocessing that operates on
+        proof_goals only (M-sized). Safe for the compiled step.
+        """
         proof_goals, _, _ = prune_ground_facts(
             states["proof_goals"], states["state_valid"],
             self.kb.fact_index.fact_hashes, self.kb.fact_index.pack_base,
             self.kb.constant_no, self.kb.padding_idx,
             excluded_queries=states.get("excluded_queries"),
         )
-        proof_goals = compact_atoms(proof_goals, self.kb.padding_idx)
+        states["proof_goals"] = compact_atoms(proof_goals, self.kb.padding_idx)
+        return states
 
-        cb, cm, cr, sv = collect_groundings(
-            states["grounding_body"], proof_goals,
+    def _collect_groundings(self, states: Dict) -> Dict:
+        """Collect completed groundings into output buffer.
+
+        Uses accumulated_body (G_body-sized). Called outside the compiled
+        step to keep G_body tensors out of the CUDA graph.
+        """
+        cb, cm, cr, sv, c_bc = collect_groundings(
+            states["accumulated_body"], states["proof_goals"],
             states["state_valid"], states["top_ridx"],
             states["collected_body"], states["collected_mask"],
             states["collected_ridx"],
             self.kb.constant_no, self.kb.padding_idx, self.effective_total_G,
+            body_count=states["body_count"],
+            collected_bcount=states["collected_bcount"],
         )
 
-        states["proof_goals"] = proof_goals
         states["collected_body"] = cb
         states["collected_mask"] = cm
         states["collected_ridx"] = cr
         states["state_valid"] = sv
+        if c_bc is not None:
+            states["collected_bcount"] = c_bc
         return states
+
+    def _postprocess(self, states: Dict) -> Dict:
+        """Full postprocess: prune goals + sync accumulated + collect groundings.
+
+        Used by the non-compiled path. The compiled path splits this into
+        _postprocess_goals (inside compiled) + _sync_and_collect (outside).
+        """
+        states = self._postprocess_goals(states)
+        # Sync accumulated_body using deferred params from _pack
+        states = self._sync_accumulated(
+            states, states["_parent_map"], states["_winning_subs"],
+            states["_has_new_body"], states["_parent_bcount"])
+        return self._collect_groundings(states)
 
     # ==================================================================
     # Output variable standardization (optional)
@@ -690,27 +818,35 @@ class BCGrounder(Grounder):
     # ==================================================================
 
     def _step_compiled(self, states: Dict) -> Dict:
-        """Compiled step: dict ↔ raw tensors."""
+        """Compiled step: dict <-> raw tensors."""
         if self._clone_between_steps:
             states = {k: v.clone() if isinstance(v, Tensor) else v
                       for k, v in states.items()}
 
-        (states["grounding_body"], states["proof_goals"],
+        (states["grounding_body"], states["accumulated_body"],
+         states["body_count"],
+         states["proof_goals"],
          states["top_ridx"], states["state_valid"],
          states["next_var_indices"],
          states["collected_body"], states["collected_mask"],
-         states["collected_ridx"]) = self._fn_step(
-            states["grounding_body"], states["proof_goals"],
+         states["collected_ridx"],
+         states["collected_bcount"]) = self._fn_step(
+            states["grounding_body"], states["accumulated_body"],
+            states["body_count"],
+            states["proof_goals"],
             states["top_ridx"], states["state_valid"],
             states["next_var_indices"],
             states["collected_body"], states["collected_mask"],
             states["collected_ridx"],
+            states["collected_bcount"],
         )
         return states
 
     def _step_impl(
         self,
         grounding_body: Tensor,
+        accumulated_body: Tensor,
+        body_count: Tensor,
         proof_goals: Tensor,
         top_ridx: Tensor,
         state_valid: Tensor,
@@ -718,11 +854,14 @@ class BCGrounder(Grounder):
         collected_body: Tensor,
         collected_mask: Tensor,
         collected_ridx: Tensor,
+        collected_bcount: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
-               Tensor]:
-        """Raw tensor step for torch.compile — same 4 phases as clean path."""
+               Tensor, Tensor, Tensor, Tensor]:
+        """Raw tensor step for torch.compile -- same phases as clean path."""
         states = {
             "grounding_body": grounding_body,
+            "accumulated_body": accumulated_body,
+            "body_count": body_count,
             "proof_goals": proof_goals,
             "top_ridx": top_ridx,
             "state_valid": state_valid,
@@ -730,9 +869,10 @@ class BCGrounder(Grounder):
             "collected_body": collected_body,
             "collected_mask": collected_mask,
             "collected_ridx": collected_ridx,
+            "collected_bcount": collected_bcount,
         }
 
-        # SELECT → RESOLVE → SEARCH FILTERS → HOOKS → PACK → POSTPROCESS
+        # SELECT -> RESOLVE -> SEARCH FILTERS -> HOOKS -> PACK -> POSTPROCESS
         queries, remaining, active_mask = self._select(states)
         resolved = self._resolve(
             queries, remaining, grounding_body, state_valid,
@@ -743,11 +883,14 @@ class BCGrounder(Grounder):
         states = self._pack(resolved, states)
         states = self._postprocess(states)
 
-        return (states["grounding_body"], states["proof_goals"],
+        return (states["grounding_body"], states["accumulated_body"],
+                states["body_count"],
+                states["proof_goals"],
                 states["top_ridx"], states["state_valid"],
                 states["next_var_indices"],
                 states["collected_body"], states["collected_mask"],
-                states["collected_ridx"])
+                states["collected_ridx"],
+                states["collected_bcount"])
 
     # ==================================================================
     # Provability
@@ -771,16 +914,18 @@ class BCGrounder(Grounder):
     # ==================================================================
 
     def _empty_result(
-        self, B: int, tG: int, M: int, dev: torch.device,
+        self, B: int, tG: int, G_body: int, dev: torch.device,
     ) -> GroundingResult:
         return GroundingResult(
             body=torch.zeros(
-                B, tG, M, 3, dtype=torch.long, device=dev),
+                B, tG, G_body, 3, dtype=torch.long, device=dev),
             mask=torch.zeros(
                 B, tG, dtype=torch.bool, device=dev),
             count=torch.zeros(
                 B, dtype=torch.long, device=dev),
             rule_idx=torch.zeros(
+                B, tG, dtype=torch.long, device=dev),
+            body_count=torch.zeros(
                 B, tG, dtype=torch.long, device=dev),
         )
 

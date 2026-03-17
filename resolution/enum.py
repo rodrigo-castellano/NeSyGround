@@ -191,8 +191,9 @@ def resolve_enum_step(
     enum_direction_b: Optional[Tensor] = None,
     check_arg_source_b: Optional[Tensor] = None,
     track_grounding_body: bool = True,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Adapter: resolve_enum output -> common 7-tensor format used by _pack.
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+           Tensor, Tensor]:
+    """Adapter: resolve_enum output -> common 9-tensor format used by _pack.
 
     1. Determine width for this step.
     2. Flatten [B, S, 3] -> [N, 3].
@@ -225,7 +226,7 @@ def resolve_enum_step(
         has_dual..check_arg_source_b: Optional direction B metadata buffers.
 
     Returns:
-        7-tuple of tensors:
+        9-tuple of tensors:
             fact_goals:    [B, S, 0, G, 3]
             fact_gbody:    [B, S, 0, M, 3]
             fact_success:  [B, S, 0]
@@ -233,6 +234,8 @@ def resolve_enum_step(
             rule_gbody:    [B, S, K_enum, M, 3]
             rule_success:  [B, S, K_enum]
             sub_rule_idx:  [B, S, K_enum]
+            fact_subs:     [B, S, 0, 2, 2]
+            rule_subs:     [B, S, K_enum, 2, 2]
     """
     B, S, _ = queries.shape
     G = remaining.shape[2]
@@ -337,23 +340,31 @@ def resolve_enum_step(
             rem.unsqueeze(2).expand(-1, -1, K_enum, -1, -1)
 
     # 8. Build rule_gbody: parent's grounding_body expanded to K_enum children
+    G_body = grounding_body.shape[2]  # G_body >= M (accumulated body dim)
     if track_grounding_body:
         rule_gbody = grounding_body.unsqueeze(2).expand(
-            -1, -1, K_enum, -1, -1)   # [B, S, K_enum, M, 3]
+            -1, -1, K_enum, -1, -1)   # [B, S, K_enum, G_body, 3]
     else:
         rule_gbody = torch.zeros(
-            B, S, K_enum, M, 3, dtype=torch.long, device=dev)
+            B, S, K_enum, G_body, 3, dtype=torch.long, device=dev)
 
     # 9. Empty fact results (enum resolves everything through rules)
     fact_goals = torch.full(
         (B, S, 0, G, 3), pad, dtype=torch.long, device=dev)
     fact_gbody = torch.zeros(
-        B, S, 0, M, 3, dtype=torch.long, device=dev)
+        B, S, 0, G_body, 3, dtype=torch.long, device=dev)
     fact_success = torch.zeros(
         B, S, 0, dtype=torch.bool, device=dev)
 
+    # 10. Zero subs (enum has no MGU — body atoms are pre-filled)
+    fact_subs = torch.full(
+        (B, S, 0, 2, 2), pad, dtype=torch.long, device=dev)
+    rule_subs = torch.full(
+        (B, S, K_enum, 2, 2), pad, dtype=torch.long, device=dev)
+
     return (fact_goals, fact_gbody, fact_success,
-            rule_goals, rule_gbody, success_flat, ridx_flat)
+            rule_goals, rule_gbody, success_flat, ridx_flat,
+            fact_subs, rule_subs)
 
 
 def resolve_enum(
