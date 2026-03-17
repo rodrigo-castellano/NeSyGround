@@ -195,15 +195,25 @@ def pack_states(
         S_in, K_r).reshape(n_r)
     r_parents = r_parents.unsqueeze(0).expand(B, n_r)
 
-    # ── Concatenate all children ──
-    all_gbody = torch.cat([f_gbody, r_gbody], dim=1)     # [B, N, M_work, 3]
-    all_goals = torch.cat([f_goals, r_goals], dim=1)      # [B, N, G, 3]
-    all_valid = torch.cat([f_valid, r_valid], dim=1)      # [B, N]
-    all_ridx = torch.cat([f_ridx, r_ridx], dim=1)        # [B, N]
-    all_bcount = torch.cat([f_bcount, r_bcount], dim=1)   # [B, N]
-    all_subs = torch.cat([f_subs, r_subs], dim=1)        # [B, N, 2, 2]
-    all_parents = torch.cat([f_parents, r_parents], dim=1)  # [B, N]
-    all_has_new = torch.cat([f_has_new, r_has_new], dim=1)  # [B, N]
+    # ── Concatenate all children (skip cat when K_f=0) ──
+    if K_f == 0:
+        all_gbody = r_gbody
+        all_goals = r_goals
+        all_valid = r_valid
+        all_ridx = r_ridx
+        all_bcount = r_bcount
+        all_subs = r_subs
+        all_parents = r_parents
+        all_has_new = r_has_new
+    else:
+        all_gbody = torch.cat([f_gbody, r_gbody], dim=1)     # [B, N, M_work, 3]
+        all_goals = torch.cat([f_goals, r_goals], dim=1)      # [B, N, G, 3]
+        all_valid = torch.cat([f_valid, r_valid], dim=1)      # [B, N]
+        all_ridx = torch.cat([f_ridx, r_ridx], dim=1)        # [B, N]
+        all_bcount = torch.cat([f_bcount, r_bcount], dim=1)   # [B, N]
+        all_subs = torch.cat([f_subs, r_subs], dim=1)        # [B, N, 2, 2]
+        all_parents = torch.cat([f_parents, r_parents], dim=1)  # [B, N]
+        all_has_new = torch.cat([f_has_new, r_has_new], dim=1)  # [B, N]
 
     # ── Scatter-compact to S_out ──
     cumsum = all_valid.long().cumsum(dim=1)

@@ -284,19 +284,16 @@ def resolve_enum_step(
     G_use_b = body_b.size(2)
 
     if G_use_b > 0:
-        # Pad to same G_use and concatenate
-        if G_use_a < G_use_b:
-            body_a = torch.nn.functional.pad(
-                body_a, (0, 0, 0, 0, 0, G_use_b - G_use_a))
-            gmask_a = torch.nn.functional.pad(
-                gmask_a, (0, G_use_b - G_use_a))
-        elif G_use_b < G_use_a:
-            body_b = torch.nn.functional.pad(
-                body_b, (0, 0, 0, 0, 0, G_use_a - G_use_b))
-            gmask_b = torch.nn.functional.pad(
-                gmask_b, (0, G_use_a - G_use_b))
-        body_all = torch.cat([body_a, body_b], dim=2)
-        gmask_all = torch.cat([gmask_a, gmask_b], dim=2)
+        # Direct assembly into combined tensor (avoids pad + pad + cat)
+        G_total = G_use_a + G_use_b
+        body_all = torch.full(
+            (N, Re, G_total, M, 3), pad, dtype=torch.long, device=dev)
+        body_all[:, :, :G_use_a] = body_a
+        body_all[:, :, G_use_a:G_use_a + G_use_b] = body_b[:, :, :G_use_b]
+        gmask_all = torch.zeros(
+            N, Re, G_total, dtype=torch.bool, device=dev)
+        gmask_all[:, :, :G_use_a] = gmask_a
+        gmask_all[:, :, G_use_a:G_use_a + G_use_b] = gmask_b[:, :, :G_use_b]
     else:
         body_all = body_a
         gmask_all = gmask_a

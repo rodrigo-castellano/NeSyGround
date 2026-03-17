@@ -82,11 +82,12 @@ def resolve_rules(
     active_mask: Tensor,        # [B, S]
     next_var_indices: Tensor,   # [B]
     grounding_body: Optional[Tensor] = None,  # [B, S, M_g, 3]
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, int, Tensor]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int, Tensor]:
     """Resolve goal atoms against rules via MGU head unification.
 
     Lookup matching rules → standardize apart → unify head → apply subs
-    to body and remaining atoms.
+    to body and remaining atoms. Returns pre-assembled rule_goals with
+    body at [:Bmax] and remaining at [Bmax:].
 
     Args:
         goals:              [B, S, 3] query atoms to resolve.
@@ -103,8 +104,7 @@ def resolve_rules(
         grounding_body:     [B, S, M_g, 3] optional tracking tensor.
 
     Returns:
-        body_subst:    [B, S, K_r, Bmax, 3] substituted rule body atoms.
-        rule_remaining:[B, S, K_r, G, 3] remaining goals with subs applied.
+        rule_goals:    [B, S, K_r, G, 3] assembled goals (body + remaining).
         gbody:         [B, S, K_r, M_g, 3] grounding body with subs
                        (zeros if grounding_body is None).
         success:       [B, S, K_r] validity mask.
@@ -125,7 +125,6 @@ def resolve_rules(
 
     if num_rules == 0:
         return (
-            torch.full((B, S, 0, Bmax, 3), pad, dtype=torch.long, device=dev),
             torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev),
             torch.zeros(B, S, 0, M_g, 3, dtype=torch.long, device=dev),
             torch.zeros(B, S, 0, dtype=torch.bool, device=dev),
@@ -204,7 +203,7 @@ def resolve_rules(
     subs_flat_apply = rule_subs.reshape(N_r, 2, 2)
     rem_exp = remaining.unsqueeze(2).expand(B, S, K_r, G, 3).reshape(N_r, G, 3)
 
-    combined = torch.cat([std_bodies, rem_exp], dim=1)
+    combined = torch.cat([std_bodies, rem_exp], dim=1)  # [N_r, Bmax+G, 3]
     combined = apply_substitutions(combined, subs_flat_apply, pad)
     rule_body_subst = combined[:, :Bmax, :].view(B, S, K_r, Bmax, 3)
     rule_remaining = combined[:, Bmax:, :].view(B, S, K_r, G, 3)
@@ -221,13 +220,22 @@ def resolve_rules(
     sub_lens_v = sub_lens_flat.view(B, S, K_r)
     atom_idx = torch.arange(Bmax, device=dev).view(1, 1, 1, Bmax)
     inactive = atom_idx >= sub_lens_v.unsqueeze(-1)
+    pad_t = torch.tensor(pad, dtype=torch.long, device=dev)
     rule_body_subst = torch.where(
         inactive.unsqueeze(-1).expand(B, S, K_r, Bmax, 3),
-        torch.tensor(pad, dtype=torch.long, device=dev),
+        pad_t,
         rule_body_subst,
     )
 
-    return rule_body_subst, rule_remaining, rule_gbody_out, rule_success, sub_rule_idx, sub_lens_v, Bmax, rule_subs
+    # ---- Assemble rule_goals: body at 0..Bmax-1, remaining at Bmax..G-1 ----
+    # This avoids a separate allocation + copy in the caller (sld/rtf).
+    rule_goals = torch.full((B, S, K_r, G, 3), pad, dtype=torch.long, device=dev)
+    rule_goals[:, :, :, :Bmax, :] = rule_body_subst
+    n_rem = min(G - Bmax, G)
+    if n_rem > 0:
+        rule_goals[:, :, :, Bmax:Bmax + n_rem, :] = rule_remaining[:, :, :, :n_rem, :]
+
+    return rule_goals, rule_gbody_out, rule_success, sub_rule_idx, sub_lens_v, Bmax, rule_subs
 
 
 # ---------------------------------------------------------------------------

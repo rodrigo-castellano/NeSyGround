@@ -92,22 +92,13 @@ def resolve_sld(
 
     # Pass grounding_body=None: accumulated body sync is handled separately
     with torch.no_grad():
-        rule_body_subst, rule_remaining, rule_gbody_out, rule_success, \
+        rule_goals, rule_gbody_out, rule_success, \
             sub_rule_idx, _, Bmax, rule_subs = mgu_resolve_rules(
                 queries, remaining, rule_index,
                 constant_no, padding_idx, K_r,
                 max_vars_per_rule, num_rules,
                 state_valid, active_mask, next_var_indices,
                 grounding_body=None)
-
-        # Assemble goals = body + remaining
-        rule_goals = torch.full(
-            (B, S, K_r, G, 3), pad, dtype=torch.long, device=dev)
-        rule_goals[:, :, :, :Bmax, :] = rule_body_subst
-        n_rem = min(G - Bmax, G)
-        if n_rem > 0:
-            rule_goals[:, :, :, Bmax:Bmax + n_rem, :] = \
-                rule_remaining[:, :, :, :n_rem, :]
 
     # Hook: may contain learned parameters
     if rule_hook is not None:

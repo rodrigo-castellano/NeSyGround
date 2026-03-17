@@ -84,7 +84,8 @@ def resolve_rtf(
     with torch.no_grad():
         # Step 1: Rule head unification → K_r children
         # Pass grounding_body=None: accumulated body sync is handled separately
-        rule_body_subst, rule_remaining, rule_gbody_l1, rule_success_l1, \
+        # rule_goals_l1 has body at [:Bmax] and remaining at [Bmax:]
+        rule_goals_l1, rule_gbody_l1, rule_success_l1, \
             sub_rule_idx_l1, _, Bmax, rule_subs_l1 = mgu_resolve_rules(
                 queries, remaining, rule_index,
                 constant_no, padding_idx, K_r,
@@ -93,19 +94,22 @@ def resolve_rtf(
                 grounding_body=None)
 
         # Step 2: Resolve first body atom against facts → K_f children per rule
+        # Extract body_rem = body[1:Bmax] + remaining[Bmax:] from assembled goals
+        # rule_goals_l1 layout: [0..Bmax-1] = body, [Bmax..G-1] = remaining
         n_body_rem = max(Bmax - 1, 0)
-        n_goal_rem = min(G - n_body_rem, G)
+        n_avail_rem = G - Bmax  # remaining slots in rule_goals_l1 after body
+        n_goal_rem = min(G - n_body_rem, n_avail_rem)
         body_rem = torch.full(
             (B, S, K_r, G, 3), pad, dtype=torch.long, device=dev)
         if n_body_rem > 0:
-            body_rem[:, :, :, :n_body_rem, :] = rule_body_subst[:, :, :, 1:Bmax, :]
+            body_rem[:, :, :, :n_body_rem, :] = rule_goals_l1[:, :, :, 1:Bmax, :]
         if n_goal_rem > 0:
             body_rem[:, :, :, n_body_rem:n_body_rem + n_goal_rem, :] = \
-                rule_remaining[:, :, :, :n_goal_rem, :]
+                rule_goals_l1[:, :, :, Bmax:Bmax + n_goal_rem, :]
 
         # Flatten [B, S] → [N] for fact resolution
         N = B * S
-        flat_atoms = rule_body_subst[:, :, :, 0, :].reshape(N, K_r, 3)
+        flat_atoms = rule_goals_l1[:, :, :, 0, :].reshape(N, K_r, 3)
         flat_rem = body_rem.reshape(N, K_r, G, 3)
         flat_valid = rule_success_l1.reshape(N, K_r)
         flat_active = torch.ones(N, K_r, dtype=torch.bool, device=dev)
