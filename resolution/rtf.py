@@ -116,8 +116,10 @@ def resolve_rtf(
         rule_success_out = success.reshape(B, S, K_rtf)
 
         # Propagate gbody and ridx from level-1 rule resolution
+        # Use actual M from resolution output (0 when track_grounding_body=False)
+        M_g_actual = rule_gbody_l1.shape[3]
         rule_gbody_out = rule_gbody_l1.unsqueeze(3).expand(
-            B, S, K_r, K_f_actual, M_g, 3).reshape(B, S, K_rtf, M_g, 3)
+            B, S, K_r, K_f_actual, M_g_actual, 3).reshape(B, S, K_rtf, M_g_actual, 3)
         sub_ridx_out = sub_rule_idx_l1.unsqueeze(3).expand(
             B, S, K_r, K_f_actual).reshape(B, S, K_rtf)
 

@@ -91,6 +91,7 @@ class BCGrounder(Grounder):
         self.hooks = hooks or []
         self.fact_hook = fact_hook
         self.rule_hook = rule_hook
+        self.step_hook = None  # Optional StepHook (nn.Module), set externally
         self.track_grounding_body = track_grounding_body
 
         # Per-step search filters
@@ -289,6 +290,13 @@ class BCGrounder(Grounder):
         states = self.init_states(queries, query_mask, **init_kwargs)
         for d in range(self.depth):
             states = self.step(states, d)
+            if self.step_hook is not None:
+                cb, cm, cr = self.step_hook.on_step(
+                    states["collected_body"], states["collected_mask"],
+                    states["collected_ridx"], d)
+                states["collected_body"] = cb
+                states["collected_mask"] = cm
+                states["collected_ridx"] = cr
         result = self.filter_terminal(states)
         # filter='none' returns raw states dict — wrap in GroundingResult
         # outside the compiled region (dataclass init breaks fullgraph).

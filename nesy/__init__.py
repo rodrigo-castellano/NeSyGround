@@ -20,8 +20,10 @@ from grounder.nesy.scoring import (
     kge_score_triples,
     kge_score_all_tails,
     kge_score_all_heads,
+    precompute_partial_scores,
+    score_partial_atoms,
 )
-from grounder.nesy.kge import KGEScorer, KGEFactFilter, KGERuleFilter
+from grounder.nesy.kge import KGEScorer, KGEFactFilter, KGERuleFilter, KGEStepFilter
 from grounder.nesy.neural import GroundingAttention, NeuralScorer
 from grounder.nesy.soft import ProvabilityMLP, SoftScorer
 from grounder.nesy.sampler import RandomSampler
@@ -55,10 +57,13 @@ __all__ = [
     "kge_score_triples",
     "kge_score_all_tails",
     "kge_score_all_heads",
+    "precompute_partial_scores",
+    "score_partial_atoms",
     # Hook implementations
     "KGEScorer",
     "KGEFactFilter",
     "KGERuleFilter",
+    "KGEStepFilter",
     "NeuralScorer",
     "GroundingAttention",
     "SoftScorer",

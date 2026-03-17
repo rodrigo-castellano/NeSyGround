@@ -8,6 +8,10 @@ KGEFactFilter
 
 KGERuleFilter
     ResolutionRuleHook — scores first body atom of rule children, keeps top-k.
+
+KGEStepFilter
+    StepHook — scores collected groundings between BFS depths, keeps top-k.
+    Supports ground + partial scoring via precomputed [P, E] tensors.
 """
 
 from __future__ import annotations
@@ -16,7 +20,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.nesy.scoring import kge_score_triples
+from typing import Optional, Tuple
+
+from grounder.nesy.scoring import kge_score_triples, score_partial_atoms
 
 
 class KGEScorer(nn.Module):
@@ -239,3 +245,147 @@ class KGERuleFilter(nn.Module):
     def __repr__(self) -> str:
         return (f"KGERuleFilter(top_k={self._top_k}, "
                 f"constant_no={self._constant_no})")
+
+
+class KGEStepFilter(nn.Module):
+    """StepHook: score collected groundings between BFS depths, keep top-k.
+
+    Scores the first body atom of each collected grounding:
+    - Ground atoms: scored via kge_score_triples.
+    - Partial atoms: scored via precomputed max_tail_score / max_head_score.
+    - Fully unbound atoms (both args variable): score 0 (kept unconditionally
+      unless displaced by higher-scoring entries).
+
+    Pure tensor ops — CUDA graph compatible when shapes are static.
+
+    Scoring modes:
+        ground_only:  score ground atoms; non-ground atoms unconditionally kept
+        partial_only: score partial atoms; ground atoms unconditionally kept
+        both:         score ground + partial; only fully-unbound kept unconditionally
+
+    Args:
+        kge_model:       nn.Module with score_triples() or score_atoms().
+        top_k:           max groundings to keep per query.
+        constant_no:     highest constant index (for ground detection).
+        padding_idx:     padding value.
+        max_tail_score:  [P, E] precomputed (from precompute_partial_scores).
+        max_head_score:  [P, E] precomputed (from precompute_partial_scores).
+        scoring_mode:    'ground_only' | 'partial_only' | 'both'.
+    """
+
+    def __init__(
+        self,
+        kge_model: nn.Module,
+        top_k: int,
+        constant_no: int,
+        padding_idx: int,
+        max_tail_score: Optional[Tensor] = None,
+        max_head_score: Optional[Tensor] = None,
+        scoring_mode: str = "ground_only",
+    ) -> None:
+        super().__init__()
+        self._kge_ref: list = [kge_model]
+        self._top_k = top_k
+        self._constant_no = constant_no
+        self._padding_idx = padding_idx
+        self._scoring_mode = scoring_mode
+        # Register as buffers so .to(device) moves them
+        if max_tail_score is not None:
+            self.register_buffer("_max_tail_score", max_tail_score)
+        else:
+            self._max_tail_score = None
+        if max_head_score is not None:
+            self.register_buffer("_max_head_score", max_head_score)
+        else:
+            self._max_head_score = None
+
+    def on_step(
+        self,
+        body: Tensor,        # [B, tG, M, 3]
+        mask: Tensor,        # [B, tG]
+        rule_idx: Tensor,    # [B, tG]
+        d: int,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Score first atom of each collected grounding, keep top-k per query.
+
+        Branchless: no .item()/.any() calls, no dynamic-shape indexing.
+        All ops run unconditionally on the full [B, tG] tensors using
+        torch.where for conditional scoring. Safe to call from a Python
+        loop between compiled steps (no GPU→CPU sync).
+        """
+        B, tG, M, _ = body.shape
+        dev = body.device
+        kge = self._kge_ref[0]
+        c_no = self._constant_no
+        pad = self._padding_idx
+        mode = self._scoring_mode
+        top_k = self._top_k
+
+        # First body atom of each grounding — [B, tG, 3]
+        first = body[:, :, 0, :]
+        p = first[..., 0]                  # [B, tG]
+        a1 = first[..., 1]
+        a2 = first[..., 2]
+
+        # Classify atoms (all branchless tensor ops)
+        is_ground = mask & (a1 <= c_no) & (a2 <= c_no) & (p != pad)
+        is_partial = mask & ~is_ground & (p != pad) & (
+            ((a1 > 0) & (a1 <= c_no) & (a2 > c_no)) |
+            ((a1 > c_no) & (a2 > 0) & (a2 <= c_no)))
+
+        # Start with -inf for invalid, 0 for valid-but-unscored
+        scores = torch.where(mask, torch.zeros(1, device=dev),
+                             torch.full((1,), -1e9, device=dev))  # [B, tG]
+        scored = torch.zeros(B, tG, dtype=torch.bool, device=dev)
+
+        # --- Score ground atoms (unconditional — safe_* clamp handles empty) ---
+        if mode in ("ground_only", "both"):
+            safe_p = torch.where(is_ground, p, torch.zeros_like(p))
+            safe_a1 = torch.where(is_ground, a1, torch.zeros_like(a1))
+            safe_a2 = torch.where(is_ground, a2, torch.zeros_like(a2))
+            g_scores = kge_score_triples(
+                kge,
+                safe_a1.reshape(-1),
+                safe_p.reshape(-1),
+                safe_a2.reshape(-1),
+            ).view(B, tG)
+            scores = torch.where(is_ground, g_scores, scores)
+            scored = scored | is_ground
+
+        # --- Score partial atoms (unconditional — score_partial_atoms handles
+        #     empty via torch.where internally, returns 0 for non-partial) ---
+        if mode in ("partial_only", "both"):
+            if self._max_tail_score is not None and self._max_head_score is not None:
+                p_scores = score_partial_atoms(
+                    p.reshape(-1), a1.reshape(-1), a2.reshape(-1),
+                    c_no, self._max_tail_score, self._max_head_score,
+                ).view(B, tG)
+                scores = torch.where(is_partial, p_scores, scores)
+                scored = scored | (is_partial & (p_scores > 0.0))
+
+        # Unconditional entries: always kept regardless of score
+        if mode == "ground_only":
+            unconditional = mask & ~is_ground
+        elif mode == "partial_only":
+            unconditional = mask & ~is_partial
+        else:  # both
+            unconditional = mask & ~is_ground & ~is_partial
+
+        # --- Branchless top-k over ALL rows ---
+        # Set unscored entries to -inf so topk ignores them
+        topk_scores = torch.where(scored, scores,
+                                  torch.full((1,), -float('inf'), device=dev))
+        k = min(top_k, tG)
+        _, topk_idx = topk_scores.topk(k, dim=1)           # [B, k]
+
+        # Build keep mask: top-k scored + all unconditional
+        keep = torch.zeros(B, tG, dtype=torch.bool, device=dev)
+        keep.scatter_(1, topk_idx, True)
+        keep = keep | unconditional
+
+        new_mask = mask & keep
+        return body, new_mask, rule_idx
+
+    def __repr__(self) -> str:
+        return (f"KGEStepFilter(top_k={self._top_k}, "
+                f"scoring_mode='{self._scoring_mode}')")
