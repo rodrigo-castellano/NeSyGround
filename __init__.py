@@ -77,7 +77,10 @@ from grounder.filters import filter_prune_dead, filter_width
 
 
 # --- Types ---
-from grounder.types import GroundingResult, PackResult, ResolveResult, StepResult
+from grounder.types import (
+    GrounderOutput, GroundingResult, ProofEvidence, ProofState,
+    ResolvedChildren, PackedStates, SyncParams,
+)
 
 # --- Data loading ---
 from grounder.data_loader import KGDataset
@@ -136,10 +139,13 @@ __all__ = [
     "filter_prune_dead",
     "filter_width",
     # Types
+    "GrounderOutput",
     "GroundingResult",
-    "PackResult",
-    "ResolveResult",
-    "StepResult",
+    "ProofEvidence",
+    "ProofState",
+    "ResolvedChildren",
+    "PackedStates",
+    "SyncParams",
     # Data loading
     "KGDataset",
     # Forward chaining

@@ -8,13 +8,14 @@ atom of each rule child against facts.
 
 from __future__ import annotations
 
-from typing import Optional, Tuple, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
 from grounder.resolution.mgu import resolve_facts as mgu_resolve_facts
 from grounder.resolution.mgu import resolve_rules as mgu_resolve_rules
+from grounder.types import ResolvedChildren
 
 if TYPE_CHECKING:
     from grounder.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
@@ -42,8 +43,7 @@ def resolve_rtf(
     track_grounding_body: bool = True,
     fact_hook: Optional[ResolutionFactHook] = None,
     rule_hook: Optional[ResolutionRuleHook] = None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
-           Tensor, Tensor]:
+) -> ResolvedChildren:
     """RTF resolution: rules first, then facts on first body atom.
 
     Returns 9-tensor tuple (same format as resolve_sld):
@@ -70,7 +70,7 @@ def resolve_rtf(
     fact_subs = torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev)
 
     if num_rules == 0:
-        return (
+        return ResolvedChildren(
             fact_goals, fact_gbody, fact_success,
             torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev),
             torch.zeros(B, S, 0, M_g, 3, dtype=torch.long, device=dev),
@@ -140,6 +140,6 @@ def resolve_rtf(
         rule_success_out = rule_hook.filter_rules(
             rule_goals, rule_success_out, queries)
 
-    return (fact_goals, fact_gbody, fact_success,
-            rule_goals, rule_gbody_out, rule_success_out, sub_ridx_out,
-            fact_subs, rule_subs_out)
+    return ResolvedChildren(fact_goals, fact_gbody, fact_success,
+                            rule_goals, rule_gbody_out, rule_success_out,
+                            sub_ridx_out, fact_subs, rule_subs_out)

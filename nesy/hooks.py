@@ -60,7 +60,7 @@ class StepHook(Protocol):
 
     def on_step(
         self,
-        body: Tensor,       # [B, tG, M, 3]
+        body: Tensor,       # [B, tG, G_body, 3]  (accumulated body atoms)
         mask: Tensor,       # [B, tG]
         rule_idx: Tensor,   # [B, tG]
         d: int,             # current depth
@@ -78,7 +78,7 @@ class GroundingHook(Protocol):
 
     def apply(
         self,
-        body: Tensor,       # [B, tG, M, 3]
+        body: Tensor,       # [B, tG, G_body, 3]  (accumulated body atoms)
         mask: Tensor,       # [B, tG]
         rule_idx: Tensor,   # [B, tG]
     ) -> Tuple[Tensor, Tensor, Tensor]:

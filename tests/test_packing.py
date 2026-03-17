@@ -74,7 +74,7 @@ class TestPackStates:
         grounding_body = torch.ones(B, S_in, M_work, 3, dtype=torch.long)
         body_count = torch.tensor([[2]], dtype=torch.long)  # 2 active body atoms
 
-        gbody, goals, ridx, valid, bcount, _, _, _ = pack_states(
+        packed = pack_states(
             fact_goals, fact_gbody, fact_success,
             rule_goals, rule_gbody, rule_success, sub_rule_idx,
             fact_subs, rule_subs,
@@ -82,9 +82,9 @@ class TestPackStates:
             S_out, PAD,
         )
 
-        assert valid.shape == (B, S_out)
-        assert valid[0, 0].item() is True
-        assert valid[0, 1].item() is False
+        assert packed.state_valid.shape == (B, S_out)
+        assert packed.state_valid[0, 0].item() is True
+        assert packed.state_valid[0, 1].item() is False
 
     def test_fact_and_rule_children(self):
         """Both fact and rule children should be packed together."""
@@ -110,7 +110,7 @@ class TestPackStates:
         grounding_body = torch.full((B, S_in, M_work, 3), PAD, dtype=torch.long)
         body_count = torch.tensor([[0]], dtype=torch.long)  # no body atoms yet
 
-        gbody, goals, ridx, valid, bcount, _, _, _ = pack_states(
+        packed = pack_states(
             fact_goals, fact_gbody, fact_success,
             rule_goals, rule_gbody, rule_success, sub_rule_idx,
             fact_subs, rule_subs,
@@ -118,10 +118,10 @@ class TestPackStates:
             S_out, PAD,
         )
 
-        assert valid.shape == (B, S_out)
+        assert packed.state_valid.shape == (B, S_out)
         # Fact child skipped at first resolution (body_count == 0),
         # rule child should be valid
-        n_valid = valid[0].sum().item()
+        n_valid = packed.state_valid[0].sum().item()
         assert n_valid >= 1, f"Expected at least 1 valid child, got {n_valid}"
 
     def test_output_capped_at_S_out(self):
@@ -146,7 +146,7 @@ class TestPackStates:
         grounding_body = torch.ones(B, S_in, M_work, 3, dtype=torch.long)
         body_count = torch.tensor([[1, 1]], dtype=torch.long)
 
-        gbody, goals, ridx, valid, bcount, _, _, _ = pack_states(
+        packed = pack_states(
             fact_goals, fact_gbody, fact_success,
             rule_goals, rule_gbody, rule_success, sub_rule_idx,
             fact_subs, rule_subs,
@@ -154,10 +154,10 @@ class TestPackStates:
             S_out, PAD,
         )
 
-        assert gbody.shape == (B, S_out, M_work, 3)
-        assert goals.shape == (B, S_out, G, 3)
-        assert valid.shape == (B, S_out)
-        assert valid[0].sum().item() <= S_out
+        assert packed.grounding_body.shape == (B, S_out, M_work, 3)
+        assert packed.proof_goals.shape == (B, S_out, G, 3)
+        assert packed.state_valid.shape == (B, S_out)
+        assert packed.state_valid[0].sum().item() <= S_out
 
     def test_no_valid_children(self):
         """No valid children should produce all-False validity."""
@@ -179,7 +179,7 @@ class TestPackStates:
         grounding_body = torch.ones(B, S_in, M_work, 3, dtype=torch.long)
         body_count = torch.tensor([[1]], dtype=torch.long)
 
-        gbody, goals, ridx, valid, bcount, _, _, _ = pack_states(
+        packed = pack_states(
             fact_goals, fact_gbody, fact_success,
             rule_goals, rule_gbody, rule_success, sub_rule_idx,
             fact_subs, rule_subs,
@@ -187,4 +187,4 @@ class TestPackStates:
             S_out, PAD,
         )
 
-        assert valid.sum().item() == 0
+        assert packed.state_valid.sum().item() == 0

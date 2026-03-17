@@ -32,14 +32,14 @@ class TestFPBatchFilter:
         queries = torch.tensor([[2, 1, 4]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
-        assert result.count[0].item() >= 1
+        assert result.evidence.count[0].item() >= 1
 
     def test_fp_batch_filters_unprovable(self):
         grounder = self._make_grounder('fp_batch')
         queries = torch.tensor([[2, 3, 4]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
-        assert result.count[0].item() == 0
+        assert result.evidence.count[0].item() == 0
 
     def test_no_filter_returns_more(self):
         """Filter='none' should return >= filter='fp_batch' results."""
@@ -49,8 +49,8 @@ class TestFPBatchFilter:
         query_mask = torch.tensor([True])
         result_none = grounder_none(queries, query_mask)
         result_fp_batch = grounder_fp_batch(queries, query_mask)
-        none_count = result_none.count[0].item()
-        assert none_count >= result_fp_batch.count[0].item()
+        none_count = result_none.evidence.count[0].item()
+        assert none_count >= result_fp_batch.evidence.count[0].item()
 
 
 class TestHashAtoms:
@@ -95,7 +95,7 @@ class TestFilterPruneDead:
         queries = torch.tensor([[2, 1, 2]], dtype=torch.long)  # derived(a,b)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
-        assert result.count[0].item() >= 1
+        assert result.evidence.count[0].item() >= 1
 
     def test_rule_head_not_killed(self):
         """Body atom whose pred is a rule head should not be killed."""
@@ -105,7 +105,7 @@ class TestFilterPruneDead:
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         # Should find at least one grounding
-        assert result.count[0].item() >= 1
+        assert result.evidence.count[0].item() >= 1
 
     def test_disabled_by_default(self):
         """With step_prune_dead=False, filter should be a no-op."""
@@ -116,8 +116,8 @@ class TestFilterPruneDead:
         result_off = grounder_off(queries, query_mask)
         result_on = grounder_on(queries, query_mask)
         # Both should find groundings (the KB is simple enough)
-        assert result_off.count[0].item() >= 1
-        assert result_on.count[0].item() >= 1
+        assert result_off.evidence.count[0].item() >= 1
+        assert result_on.evidence.count[0].item() >= 1
 
 
 class TestFilterWidth:
@@ -147,7 +147,7 @@ class TestFilterWidth:
         queries = torch.tensor([[2, 1, 2]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
-        assert result.count[0].item() >= 1
+        assert result.evidence.count[0].item() >= 1
 
     def test_width0_only_fact_groundings(self):
         """Width=0 should only keep groundings where all body atoms are facts."""
@@ -157,7 +157,7 @@ class TestFilterWidth:
         result = grounder(queries, query_mask)
         # With width=0, only all-fact body groundings survive.
         # This is very restrictive — may find 0 or few.
-        count = result.count[0].item()
+        count = result.evidence.count[0].item()
         assert count >= 0  # sanity check (doesn't crash)
 
 
@@ -275,9 +275,9 @@ class TestFPBatchMultiHop:
         query_mask = torch.tensor([True, True])
         result = grounder(queries, query_mask)
         # ancestor(2,3) provable via R1 + parent(2,3)
-        assert result.count[1].item() >= 1
+        assert result.evidence.count[1].item() >= 1
         # ancestor(1,3) provable via R2 + parent(1,2) + ancestor(2,3) [cross-query]
-        assert result.count[0].item() >= 1
+        assert result.evidence.count[0].item() >= 1
 
     def test_single_query_no_cross(self):
         """Single query ancestor(1,3) without ancestor(2,3) in batch."""
@@ -291,7 +291,7 @@ class TestFPBatchMultiHop:
         # the batch, so this depends on whether ancestor(2,3) was collected.
         # With sufficient depth, it should be collected and proved.
         # Not asserting count here — just verify no crash.
-        assert result.count[0].item() >= 0
+        assert result.evidence.count[0].item() >= 0
 
 
 class TestFPBatchCircular:
@@ -326,8 +326,8 @@ class TestFPBatchCircular:
         query_mask = torch.tensor([True, True])
         result = grounder(queries, query_mask)
         # Neither should be proved (circular, no base facts for pred 1 or 2)
-        assert result.count[0].item() == 0
-        assert result.count[1].item() == 0
+        assert result.evidence.count[0].item() == 0
+        assert result.evidence.count[1].item() == 0
 
 
 class TestFPGlobalSLD:
@@ -352,4 +352,4 @@ class TestFPGlobalSLD:
         queries = torch.tensor([[2, 1, 2]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
-        assert result.count[0].item() >= 1
+        assert result.evidence.count[0].item() >= 1

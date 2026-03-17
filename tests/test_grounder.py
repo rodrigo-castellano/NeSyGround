@@ -44,16 +44,16 @@ class TestGrandparentChain:
     def test_finds_grounding(self, grounder):
         queries = torch.tensor([[2, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([True])
-        result = grounder(queries, query_mask)
-        assert result.count[0].item() >= 1
+        output = grounder(queries, query_mask)
+        assert output.evidence.count[0].item() >= 1
 
     def test_grounding_body_is_correct(self, grounder):
         queries = torch.tensor([[2, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([True])
-        result = grounder(queries, query_mask)
-        valid_idx = result.mask[0].nonzero(as_tuple=True)[0]
+        output = grounder(queries, query_mask)
+        valid_idx = output.evidence.mask[0].nonzero(as_tuple=True)[0]
         assert len(valid_idx) > 0
-        body = result.body[0, valid_idx[0]]
+        body = output.evidence.body[0, valid_idx[0]]
         body_list = body.tolist()
         assert [1, 1, 2] in body_list
         assert [1, 2, 3] in body_list
@@ -61,14 +61,14 @@ class TestGrandparentChain:
     def test_no_grounding_for_invalid_query(self, grounder):
         queries = torch.tensor([[2, 3, 24]], dtype=torch.long)
         query_mask = torch.tensor([True])
-        result = grounder(queries, query_mask)
-        assert result.count[0].item() == 0
+        output = grounder(queries, query_mask)
+        assert output.evidence.count[0].item() == 0
 
     def test_masked_query_not_processed(self, grounder):
         queries = torch.tensor([[2, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([False])
-        result = grounder(queries, query_mask)
-        assert result.count[0].item() == 0
+        output = grounder(queries, query_mask)
+        assert output.evidence.count[0].item() == 0
 
 
 class TestSingleBodyRule:
@@ -89,15 +89,15 @@ class TestSingleBodyRule:
     def test_finds_grounding_depth2(self, grounder):
         queries = torch.tensor([[2, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([True])
-        result = grounder(queries, query_mask)
-        assert result.count[0].item() >= 1
+        output = grounder(queries, query_mask)
+        assert output.evidence.count[0].item() >= 1
 
     def test_body_matches_fact(self, grounder):
         queries = torch.tensor([[2, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([True])
-        result = grounder(queries, query_mask)
-        valid_idx = result.mask[0].nonzero(as_tuple=True)[0]
-        body = result.body[0, valid_idx[0]]
+        output = grounder(queries, query_mask)
+        valid_idx = output.evidence.mask[0].nonzero(as_tuple=True)[0]
+        body = output.evidence.body[0, valid_idx[0]]
         assert [1, 1, 2] in body.tolist()
 
 
@@ -114,9 +114,9 @@ class TestBatchQueries:
                                   predicate_no=3)
         queries = torch.tensor([[2, 1, 24], [2, 2, 24]], dtype=torch.long)
         query_mask = torch.tensor([True, True])
-        result = grounder(queries, query_mask)
-        assert result.count[0].item() >= 1
-        assert result.count[1].item() >= 1
+        output = grounder(queries, query_mask)
+        assert output.evidence.count[0].item() >= 1
+        assert output.evidence.count[1].item() >= 1
 
 
 class TestMultipleRules:
@@ -132,8 +132,8 @@ class TestMultipleRules:
                                   predicate_no=4)
         queries = torch.tensor([[3, 1, 24]], dtype=torch.long)
         query_mask = torch.tensor([True])
-        result = grounder(queries, query_mask)
-        assert result.count[0].item() == 2
+        output = grounder(queries, query_mask)
+        assert output.evidence.count[0].item() == 2
 
 
 class TestDepth2BodyAccumulation:
@@ -185,8 +185,8 @@ class TestDepth2BodyAccumulation:
         """Q(1,3) should be provable via the 2-rule chain."""
         queries = torch.tensor([[3, 1, 3]], dtype=torch.long)
         query_mask = torch.tensor([True])
-        result = grounder(queries, query_mask)
-        assert result.count[0].item() >= 1
+        output = grounder(queries, query_mask)
+        assert output.evidence.count[0].item() >= 1
 
     def test_body_accumulates_across_depths(self, grounder):
         """grounding_body must contain body atoms from BOTH rule applications.
@@ -196,12 +196,12 @@ class TestDepth2BodyAccumulation:
         """
         queries = torch.tensor([[3, 1, 3]], dtype=torch.long)
         query_mask = torch.tensor([True])
-        result = grounder(queries, query_mask)
+        output = grounder(queries, query_mask)
 
-        valid_idx = result.mask[0].nonzero(as_tuple=True)[0]
+        valid_idx = output.evidence.mask[0].nonzero(as_tuple=True)[0]
         assert len(valid_idx) > 0, "Expected at least one valid grounding"
 
-        body = result.body[0, valid_idx[0]]
+        body = output.evidence.body[0, valid_idx[0]]
         body_list = body.tolist()
 
         # Body atoms from Rule 1 (depth 0 application)

@@ -236,7 +236,7 @@ class TestFamily:
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
         print(f"Family query pred={head_pred}, entity={entity}: "
-              f"found {result.count[0].item()} groundings")
+              f"found {result.evidence.count[0].item()} groundings")
         # We don't assert >0 since not every (pred, entity) combo has groundings
 
     def test_batch_queries(self):
@@ -252,7 +252,7 @@ class TestFamily:
         ], dtype=torch.long)
         query_mask = torch.ones(B, dtype=torch.bool)
         result = grounder(queries, query_mask)
-        total = result.count.sum().item()
+        total = result.evidence.count.sum().item()
         print(f"Family batch of {B}: total groundings = {total}")
 
     def test_depth_increases_groundings(self):
@@ -275,8 +275,8 @@ class TestFamily:
 
         r1 = grounder_d1(queries_t, mask)
         r2 = grounder_d2(queries_t, mask)
-        c1 = r1.count.sum().item()
-        c2 = r2.count.sum().item()
+        c1 = r1.evidence.count.sum().item()
+        c2 = r2.evidence.count.sum().item()
         print(f"Family depth comparison: depth=2 → {c1}, depth=3 → {c2}")
         assert c2 >= c1, f"Depth 3 should find >= depth 2 groundings ({c2} < {c1})"
 
@@ -311,7 +311,7 @@ class TestWN18RR:
         queries_t = torch.tensor(queries, dtype=torch.long)
         mask = torch.ones(len(queries), dtype=torch.bool)
         result = grounder(queries_t, mask)
-        total = result.count.sum().item()
+        total = result.evidence.count.sum().item()
         print(f"WN18RR batch of {len(queries)}: total groundings = {total}")
 
 
@@ -345,5 +345,5 @@ class TestFB15K237:
         queries_t = torch.tensor(queries, dtype=torch.long)
         mask = torch.ones(len(queries), dtype=torch.bool)
         result = grounder(queries_t, mask)
-        total = result.count.sum().item()
+        total = result.evidence.count.sum().item()
         print(f"FB15K-237 batch of {len(queries)}: total groundings = {total}")

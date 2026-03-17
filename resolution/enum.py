@@ -13,12 +13,13 @@ Public API:
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
 
 from grounder.rule_index import RuleIndexEnum
+from grounder.types import ResolvedChildren
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -191,8 +192,7 @@ def resolve_enum_step(
     enum_direction_b: Optional[Tensor] = None,
     check_arg_source_b: Optional[Tensor] = None,
     track_grounding_body: bool = True,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
-           Tensor, Tensor]:
+) -> ResolvedChildren:
     """Adapter: resolve_enum output -> common 9-tensor format used by _pack.
 
     1. Determine width for this step.
@@ -362,9 +362,9 @@ def resolve_enum_step(
     rule_subs = torch.full(
         (B, S, K_enum, 2, 2), pad, dtype=torch.long, device=dev)
 
-    return (fact_goals, fact_gbody, fact_success,
-            rule_goals, rule_gbody, success_flat, ridx_flat,
-            fact_subs, rule_subs)
+    return ResolvedChildren(fact_goals, fact_gbody, fact_success,
+                            rule_goals, rule_gbody, success_flat,
+                            ridx_flat, fact_subs, rule_subs)
 
 
 def resolve_enum(

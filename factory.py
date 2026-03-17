@@ -16,7 +16,7 @@ Examples:
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -41,7 +41,7 @@ _PATTERN = re.compile(
 )
 
 
-def parse_grounder_type(grounder_type: str) -> dict:
+def parse_grounder_type(grounder_type: str) -> Dict[str, Any]:
     """Parse a grounder type string into a config dict.
 
     Returns dict with keys: resolution, filter, depth, width, is_lazy, is_full.

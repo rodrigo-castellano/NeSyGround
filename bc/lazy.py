@@ -18,7 +18,7 @@ from torch import Tensor
 
 from grounder.kb import KB
 from grounder.bc.bc import BCGrounder
-from grounder.types import GroundingResult
+from grounder.types import GrounderOutput
 
 
 class LazyGrounder(nn.Module):
@@ -136,7 +136,7 @@ class LazyGrounder(nn.Module):
 
     def forward(
         self, queries: Tensor, query_mask: Tensor,
-    ) -> GroundingResult:
+    ) -> GrounderOutput:
         return self._inner(queries, query_mask)
 
     def __repr__(self) -> str:

@@ -10,14 +10,14 @@ Canonical loop (same code path for all resolutions):
   states = init_states(queries, query_mask)
   for d in range(D):
       states = step(states, d)   # SELECT → RESOLVE → PACK → POSTPROCESS
-  return filter_terminal(states)
+  return GrounderOutput(state, evidence)
 
 Resolution is the only pluggable phase — _select, _pack, _postprocess are shared.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional, Tuple  # Callable used by _standardize_fn
+from typing import Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -27,13 +27,18 @@ from grounder.base import Grounder
 from grounder.kb import KB
 from grounder.primitives import apply_substitutions
 from grounder.resolution.standardization import StandardizationConfig
+
+if TYPE_CHECKING:
+    from grounder.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
 from grounder.bc.common import (
     compact_atoms,
     collect_groundings,
     pack_states,
     prune_ground_facts,
 )
-from grounder.types import GroundingResult
+from grounder.types import (
+    GrounderOutput, ProofEvidence, ProofState, ResolvedChildren, SyncParams,
+)
 from grounder.filters import check_in_provable
 from grounder.filters.search import filter_width, filter_prune_dead
 from grounder.resolution.sld import resolve_sld
@@ -65,8 +70,8 @@ class BCGrounder(Grounder):
         max_total_groundings: int = 64,
         compile_mode: Optional[str] = None,
         hooks: Optional[List] = None,
-        fact_hook=None,
-        rule_hook=None,
+        fact_hook: Optional[ResolutionFactHook] = None,
+        rule_hook: Optional[ResolutionRuleHook] = None,
         # MGU params
         max_goals: Optional[int] = None,
         max_states: Optional[int] = None,
@@ -289,7 +294,7 @@ class BCGrounder(Grounder):
     @torch.no_grad()
     def forward(
         self, queries: Tensor, query_mask: Tensor, **init_kwargs,
-    ) -> GroundingResult:
+    ) -> GrounderOutput:
         states = self.init_states(queries, query_mask, **init_kwargs)
         for d in range(self.depth):
             states = self.step(states, d)
@@ -300,23 +305,28 @@ class BCGrounder(Grounder):
                 states["collected_body"] = cb
                 states["collected_mask"] = cm
                 states["collected_ridx"] = cr
-        result = self.filter_terminal(states)
-        # filter='none' returns raw states dict — wrap in GroundingResult
+        evidence = self.filter_terminal(states)
+        # filter='none' returns raw states dict — wrap in ProofEvidence
         # outside the compiled region (dataclass init breaks fullgraph).
-        if isinstance(result, dict):
-            result = GroundingResult(
-                body=result["collected_body"],
-                mask=result["collected_mask"],
-                count=result["collected_mask"].sum(dim=1),
-                rule_idx=result["collected_ridx"],
-                body_count=result["collected_bcount"],
+        if isinstance(evidence, dict):
+            evidence = ProofEvidence(
+                body=evidence["collected_body"],
+                mask=evidence["collected_mask"],
+                count=evidence["collected_mask"].sum(dim=1),
+                rule_idx=evidence["collected_ridx"],
+                body_count=evidence["collected_bcount"],
             )
         for hook in self.hooks:
-            body, mask, ridx = hook.apply(result.body, result.mask, result.rule_idx)
-            result = GroundingResult(
+            body, mask, ridx = hook.apply(evidence.body, evidence.mask, evidence.rule_idx)
+            evidence = ProofEvidence(
                 body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
-                body_count=result.body_count)
-        return result
+                body_count=evidence.body_count)
+        state = ProofState(
+            proof_goals=states["proof_goals"],
+            state_valid=states["state_valid"],
+            top_ridx=states["top_ridx"],
+        )
+        return GrounderOutput(state=state, evidence=evidence)
 
 
     def init_states(
@@ -394,7 +404,7 @@ class BCGrounder(Grounder):
             states["excluded_queries"] = excluded_queries
         return states
 
-    def step(self, states: Dict, d: int) -> Dict:
+    def step(self, states: Dict[str, Tensor], d: int) -> Dict[str, Tensor]:
         """One proof step: SELECT → RESOLVE → PACK → POSTPROCESS."""
         if self.kb.num_rules == 0:
             return states
@@ -425,16 +435,16 @@ class BCGrounder(Grounder):
         # ── HOOKS (between RESOLVE and PACK) ──
         resolved = self._apply_hooks(resolved, states)
 
-        # ── PACK ──
-        states = self._pack(resolved, states)
+        # ── PACK → returns (states, sync) — no dict pollution ──
+        states, sync = self._pack(resolved, states)
 
         # ── POSTPROCESS ──
-        states = self._postprocess(states)
+        states = self._postprocess(states, sync)
 
         return states
 
-    def filter_terminal(self, states: Dict):
-        """Apply soundness filter on collected groundings -> GroundingResult.
+    def filter_terminal(self, states: Dict[str, Tensor]):
+        """Apply soundness filter on collected groundings -> ProofEvidence.
 
         When ``filter='none'``, returns the raw states dict (no collection).
         """
@@ -467,8 +477,8 @@ class BCGrounder(Grounder):
                 self.provable_hashes)
 
         count = mask.sum(dim=1)
-        bcount = states.get("collected_bcount")
-        return GroundingResult(
+        bcount = states["collected_bcount"]
+        return ProofEvidence(
             body=body, mask=mask,
             count=count, rule_idx=ridx,
             body_count=bcount,
@@ -479,7 +489,7 @@ class BCGrounder(Grounder):
     # ==================================================================
 
     def _select(
-        self, states: Dict,
+        self, states: Dict[str, Tensor],
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Extract first goal from each proof state."""
         proof_goals = states["proof_goals"]
@@ -501,12 +511,11 @@ class BCGrounder(Grounder):
         grounding_body: Tensor,    # [B, S, M, 3]
         state_valid: Tensor,       # [B, S]
         active_mask: Tensor,       # [B, S]
-        states: Dict,
+        states: Dict[str, Tensor],
         d: int,
         use_hooks: bool = True,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
-               Tensor, Tensor]:
-        """Dispatch to resolution strategy. Returns common 9-tensor format."""
+    ) -> ResolvedChildren:
+        """Dispatch to resolution strategy. Returns ResolvedChildren."""
         fh = self.fact_hook if use_hooks else None
         rh = self.rule_hook if use_hooks else None
 
@@ -570,9 +579,9 @@ class BCGrounder(Grounder):
 
     def _apply_hooks(
         self,
-        resolved: Tuple[Tensor, ...],
-        states: Dict,
-    ) -> Tuple[Tensor, ...]:
+        resolved: ResolvedChildren,
+        states: Dict[str, Tensor],
+    ) -> ResolvedChildren:
         """Apply resolution hooks. Subclasses override for RL filtering."""
         return resolved
 
@@ -582,8 +591,8 @@ class BCGrounder(Grounder):
 
     def _apply_search_filters(
         self,
-        resolved: Tuple[Tensor, ...],
-    ) -> Tuple[Tensor, ...]:
+        resolved: ResolvedChildren,
+    ) -> ResolvedChildren:
         """Per-step search filters. No gradients, zero overhead when disabled."""
         if not self._step_prune_dead and self._step_width is None:
             return resolved
@@ -615,8 +624,8 @@ class BCGrounder(Grounder):
                 width=self._step_width,
             )
 
-        return (fg, fgb, fs, rule_goals, rgb, rule_success, sri,
-                f_subs, r_subs)
+        return ResolvedChildren(fg, fgb, fs, rule_goals, rgb, rule_success,
+                                sri, f_subs, r_subs)
 
     # ==================================================================
     # Phase 3: PACK (shared)
@@ -624,14 +633,16 @@ class BCGrounder(Grounder):
 
     def _pack(
         self,
-        resolved: Tuple[Tensor, ...],
-        states: Dict,
-    ) -> Dict:
-        """Flatten S*K children, propagate grounding body, compact to S."""
+        resolved: ResolvedChildren,
+        states: Dict[str, Tensor],
+    ) -> Tuple[Dict, SyncParams]:
+        """Flatten S*K children, propagate grounding body, compact to S.
+
+        Returns (states, sync) — no dict pollution with underscore keys.
+        """
         S_in = states["top_ridx"].shape[1]
 
-        (new_gbody, new_goals, new_ridx, new_valid, new_bcount,
-         parent_map, winning_subs, has_new_body) = pack_states(
+        packed = pack_states(
             *resolved,
             states["top_ridx"], states["grounding_body"],
             states["body_count"],
@@ -640,39 +651,40 @@ class BCGrounder(Grounder):
             M_rule=self.kb.M,
         )
 
-        states["grounding_body"] = new_gbody
-        states["proof_goals"] = new_goals
-        states["top_ridx"] = new_ridx
-        states["state_valid"] = new_valid
-        # Store sync params for deferred sync (outside compiled step)
-        states["_parent_map"] = parent_map
-        states["_winning_subs"] = winning_subs
-        states["_has_new_body"] = has_new_body
-        states["_parent_bcount"] = new_bcount
+        states["grounding_body"] = packed.grounding_body
+        states["proof_goals"] = packed.proof_goals
+        states["top_ridx"] = packed.top_ridx
+        states["state_valid"] = packed.state_valid
+
+        sync = SyncParams(
+            parent_map=packed.parent_map,
+            winning_subs=packed.winning_subs,
+            has_new_body=packed.has_new_body,
+            parent_bcount=packed.body_count,
+        )
 
         states["next_var_indices"] = (
             states["next_var_indices"] + S_in * self.max_vars_per_rule)
-        return states
+        return states, sync
 
     def _sync_accumulated(
         self,
-        states: Dict,
-        parent_map: Tensor,      # [B, S_out]
-        winning_subs: Tensor,    # [B, S_out, 2, 2]
-        has_new_body: Tensor,    # [B, S_out]
-        parent_bcount: Tensor,   # [B, S_out] — body_count inherited from parent
-    ) -> Dict:
+        states: Dict[str, Tensor],
+        sync: SyncParams,
+    ) -> Dict[str, Tensor]:
         """Propagate accumulated_body: gather from parents, apply subs, append new atoms.
 
         All operations are static-shape and torch.compile(fullgraph=True) compatible.
 
         Args:
             states: Current states dict with accumulated_body and grounding_body.
-            parent_map: [B, S_out] parent state index for each output state.
-            winning_subs: [B, S_out, 2, 2] substitution pairs per output state.
-            has_new_body: [B, S_out] True for rule children with valid matches.
-            parent_bcount: [B, S_out] body_count inherited from parent.
+            sync: SyncParams with parent_map, winning_subs, has_new_body, parent_bcount.
         """
+        parent_map = sync.parent_map
+        winning_subs = sync.winning_subs
+        has_new_body = sync.has_new_body
+        parent_bcount = sync.parent_bcount
+
         if not self.track_grounding_body:
             states["body_count"] = parent_bcount
             return states
@@ -727,7 +739,7 @@ class BCGrounder(Grounder):
     # Phase 4: POSTPROCESS (shared)
     # ==================================================================
 
-    def _postprocess_goals(self, states: Dict) -> Dict:
+    def _postprocess_goals(self, states: Dict) -> Dict[str, Tensor]:
         """Prune ground facts and compact atoms (no grounding collection).
 
         This is the lightweight part of postprocessing that operates on
@@ -742,7 +754,7 @@ class BCGrounder(Grounder):
         states["proof_goals"] = compact_atoms(proof_goals, self.kb.padding_idx)
         return states
 
-    def _collect_groundings(self, states: Dict) -> Dict:
+    def _collect_groundings(self, states: Dict) -> Dict[str, Tensor]:
         """Collect completed groundings into output buffer.
 
         Uses accumulated_body (G_body-sized). Called outside the compiled
@@ -762,21 +774,21 @@ class BCGrounder(Grounder):
         states["collected_mask"] = cm
         states["collected_ridx"] = cr
         states["state_valid"] = sv
-        if c_bc is not None:
-            states["collected_bcount"] = c_bc
+        states["collected_bcount"] = c_bc
         return states
 
-    def _postprocess(self, states: Dict) -> Dict:
+    def _postprocess(self, states: Dict[str, Tensor], sync: SyncParams) -> Dict[str, Tensor]:
         """Full postprocess: prune goals + sync accumulated + collect groundings.
 
         Used by the non-compiled path. The compiled path splits this into
         _postprocess_goals (inside compiled) + _sync_and_collect (outside).
+
+        Args:
+            states: Current proof states dict.
+            sync: SyncParams from _pack (parent_map, winning_subs, etc.).
         """
         states = self._postprocess_goals(states)
-        # Sync accumulated_body using deferred params from _pack
-        states = self._sync_accumulated(
-            states, states["_parent_map"], states["_winning_subs"],
-            states["_has_new_body"], states["_parent_bcount"])
+        states = self._sync_accumulated(states, sync)
         return self._collect_groundings(states)
 
     # ==================================================================
@@ -817,7 +829,7 @@ class BCGrounder(Grounder):
     # Compiled step (optimization — same semantics as clean path)
     # ==================================================================
 
-    def _step_compiled(self, states: Dict) -> Dict:
+    def _step_compiled(self, states: Dict) -> Dict[str, Tensor]:
         """Compiled step: dict <-> raw tensors."""
         if self._clone_between_steps:
             states = {k: v.clone() if isinstance(v, Tensor) else v
@@ -880,8 +892,8 @@ class BCGrounder(Grounder):
         )
         resolved = self._apply_search_filters(resolved)
         resolved = self._apply_hooks(resolved, states)
-        states = self._pack(resolved, states)
-        states = self._postprocess(states)
+        states, sync = self._pack(resolved, states)
+        states = self._postprocess(states, sync)
 
         return (states["grounding_body"], states["accumulated_body"],
                 states["body_count"],
@@ -915,8 +927,8 @@ class BCGrounder(Grounder):
 
     def _empty_result(
         self, B: int, tG: int, G_body: int, dev: torch.device,
-    ) -> GroundingResult:
-        return GroundingResult(
+    ) -> ProofEvidence:
+        return ProofEvidence(
             body=torch.zeros(
                 B, tG, G_body, 3, dtype=torch.long, device=dev),
             mask=torch.zeros(

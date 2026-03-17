@@ -32,18 +32,18 @@ class TestRTFSmoke:
         queries = torch.tensor([[2, 1, 6]], dtype=torch.long)
         query_mask = torch.tensor([True])
         result = grounder(queries, query_mask)
-        assert result.body.shape[0] == 1
+        assert result.evidence.body.shape[0] == 1
 
     def test_rtf_batch(self):
         grounder = self._make_grounder()
         queries = torch.tensor([[2, 1, 6], [2, 2, 6]], dtype=torch.long)
         query_mask = torch.tensor([True, True])
         result = grounder(queries, query_mask)
-        assert result.body.shape[0] == 2
+        assert result.evidence.body.shape[0] == 2
 
     def test_rtf_masked_query(self):
         grounder = self._make_grounder()
         queries = torch.tensor([[2, 1, 6]], dtype=torch.long)
         query_mask = torch.tensor([False])
         result = grounder(queries, query_mask)
-        assert result.count[0].item() == 0
+        assert result.evidence.count[0].item() == 0

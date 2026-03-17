@@ -13,6 +13,7 @@ import torch
 from torch import Tensor
 
 from grounder.fact_index import fact_contains
+from grounder.types import PackedStates
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +77,7 @@ def pack_states(
     padding_idx: int,
     track_grounding_body: bool = True,
     M_rule: int = 0,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+) -> PackedStates:
     """Pack resolution children into compacted proof states.
 
     M-sized working buffer version: grounding_body is [B, S, M_work, 3] where
@@ -235,10 +236,10 @@ def pack_states(
     counts = all_valid.sum(dim=1).clamp(max=S_out)
     out_valid = torch.arange(S_out, device=dev).unsqueeze(0) < counts.unsqueeze(1)
 
-    return (out_gbody[:, :S_out], out_goals[:, :S_out],
-            out_ridx[:, :S_out], out_valid, out_bcount[:, :S_out],
-            out_parents[:, :S_out], out_subs[:, :S_out],
-            out_has_new[:, :S_out])
+    return PackedStates(out_gbody[:, :S_out], out_goals[:, :S_out],
+                        out_ridx[:, :S_out], out_valid, out_bcount[:, :S_out],
+                        out_parents[:, :S_out], out_subs[:, :S_out],
+                        out_has_new[:, :S_out])
 
 
 # ---------------------------------------------------------------------------
@@ -337,9 +338,9 @@ def collect_groundings(
     constant_no: int,
     pad_idx: int,
     effective_total_G: int,
-    body_count: Optional[Tensor] = None,       # [B, S]
-    collected_bcount: Optional[Tensor] = None,  # [B, tG]
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    body_count: Tensor,          # [B, S]
+    collected_bcount: Tensor,    # [B, tG]
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Collect completed groundings into output buffer (TS-specific).
 
     A state is terminal when all proof goals are padding (resolved).
@@ -357,15 +358,15 @@ def collect_groundings(
         constant_no: highest constant index
         pad_idx: padding value
         effective_total_G: max number of collected groundings (tG)
-        body_count: [B, S] number of valid body atoms per state (optional)
-        collected_bcount: [B, tG] accumulated body counts (optional)
+        body_count: [B, S] number of valid body atoms per state
+        collected_bcount: [B, tG] accumulated body counts
 
     Returns:
         out_body:    [B, tG, G_body, 3] updated collected bodies
         out_mask:    [B, tG] updated collected mask
         out_ridx:    [B, tG] updated collected rule indices
         state_valid: [B, S] updated (terminal states deactivated)
-        out_bcount:  [B, tG] updated collected body counts (None if inputs are None)
+        out_bcount:  [B, tG] updated collected body counts
     """
     B, S, G_body, _ = grounding_body.shape
     dev = grounding_body.device
@@ -393,9 +394,7 @@ def collect_groundings(
     cr = torch.cat([collected_ridx, ridx_new], dim=1)
 
     # Thread body_count through
-    has_bcount = body_count is not None and collected_bcount is not None
-    if has_bcount:
-        c_bc = torch.cat([collected_bcount, body_count], dim=1)  # [B, tG + S]
+    c_bc = torch.cat([collected_bcount, body_count], dim=1)  # [B, tG + S]
 
     cm = _dedup_groundings(cb, cr, cm, G_body)
 
@@ -412,22 +411,18 @@ def collect_groundings(
             cm.gather(1, ki), (0, p2))
         out_ridx = torch.nn.functional.pad(
             cr.gather(1, ki), (0, p2))
-        if has_bcount:
-            out_bcount = torch.nn.functional.pad(
-                c_bc.gather(1, ki), (0, p2))
+        out_bcount = torch.nn.functional.pad(
+            c_bc.gather(1, ki), (0, p2))
     else:
         out_body = cb.gather(
             1, ki.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, G_body, 3))
         out_mask = cm.gather(1, ki)
         out_ridx = cr.gather(1, ki)
-        if has_bcount:
-            out_bcount = c_bc.gather(1, ki)
+        out_bcount = c_bc.gather(1, ki)
 
     state_valid = state_valid & ~valid_grounding
 
-    if has_bcount:
-        return out_body, out_mask, out_ridx, state_valid, out_bcount
-    return out_body, out_mask, out_ridx, state_valid, None
+    return out_body, out_mask, out_ridx, state_valid, out_bcount
 
 
 def _dedup_groundings(

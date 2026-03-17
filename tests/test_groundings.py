@@ -91,8 +91,8 @@ def _run_groundings(
     )
 
     result = grounder(queries, query_mask)
-    per_query = result.count.cpu().long().tolist()
-    metrics = _stats_from_counts(result.count, n_queries)
+    per_query = result.evidence.count.cpu().long().tolist()
+    metrics = _stats_from_counts(result.evidence.count, n_queries)
     metrics["per_query_counts"] = per_query
     return metrics
 

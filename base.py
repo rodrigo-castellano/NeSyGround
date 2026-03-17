@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from grounder.kb import KB
-from grounder.types import GroundingResult
+from grounder.types import GrounderOutput
 
 
 class Grounder(nn.Module):
@@ -26,7 +26,7 @@ class Grounder(nn.Module):
         self.kb = kb
 
     @abstractmethod
-    def forward(self, queries: Tensor, query_mask: Tensor, **kwargs) -> GroundingResult:
+    def forward(self, queries: Tensor, query_mask: Tensor, **kwargs) -> GrounderOutput:
         """Ground queries against the KB.
 
         Args:
@@ -34,6 +34,6 @@ class Grounder(nn.Module):
             query_mask: [B] boolean mask (True = active query)
 
         Returns:
-            GroundingResult with collected groundings, masks, and counts.
+            GrounderOutput with state and evidence.
         """
         ...
