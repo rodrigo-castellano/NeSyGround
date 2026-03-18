@@ -13,7 +13,7 @@ Internal pipeline types (NamedTuples for torch.compile safety):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 from torch import Tensor
 
@@ -28,10 +28,13 @@ class ProofState:
     """Where we are: snapshot of the proof search after the last step.
 
     Used by RL for action selection (read proof_goals to pick next resolution).
+    next_var_indices is populated when standardization is configured — it
+    tracks the free variable counter for multi-step resolution.
     """
-    proof_goals: Tensor     # [B, S, G, 3]  — remaining goals per branch
-    state_valid: Tensor     # [B, S]         — which branches are alive
-    top_ridx:    Tensor     # [B, S]         — first rule applied per branch
+    proof_goals: Tensor              # [B, S, G, 3]  — remaining goals per branch
+    state_valid: Tensor              # [B, S]         — which branches are alive
+    top_ridx:    Tensor              # [B, S]         — first rule applied per branch
+    next_var_indices: Optional[Tensor] = None  # [B] — free variable counter
 
 
 @dataclass
@@ -57,7 +60,7 @@ class GrounderOutput:
     Reasoning (depth=D): reads output.evidence.body
     """
     state:    ProofState
-    evidence: ProofEvidence
+    evidence: Optional[ProofEvidence] = None
 
 
 # Backward compat alias — prefer ProofEvidence in new code.

@@ -213,7 +213,7 @@ def generate_depths_static(
             max_goals=max_goals,
             max_states=max_states if max_states is not None else hard_cap,
             compile_mode=compile_mode if dev.type == "cuda" else None,
-            track_grounding_body=False,
+            collect_evidence=False,
         )
 
         # Auto-calculate S if not provided

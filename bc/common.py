@@ -76,7 +76,7 @@ def pack_states(
     body_count: Tensor,        # [B, S]
     S_out: int,
     padding_idx: int,
-    track_grounding_body: bool = True,
+    collect_evidence: bool = True,
     M_rule: int = 0,
 ) -> PackedStates:
     """Pack resolution children into compacted proof states.
@@ -133,7 +133,7 @@ def pack_states(
         f_parents = torch.arange(S_in, device=dev).unsqueeze(1).expand(
             S_in, K_f).reshape(n_f)
         f_parents = f_parents.unsqueeze(0).expand(B, n_f)
-        if track_grounding_body:
+        if collect_evidence:
             # Skip facts when grounding_body not yet established
             uninit = (body_count == 0)
             f_valid = f_valid & ~uninit.unsqueeze(-1).expand(
@@ -157,7 +157,7 @@ def pack_states(
     first = (top_ridx == -1).unsqueeze(2).expand(
         B, S_in, K_r).reshape(B, n_r)              # [B, n_r] first resolution?
 
-    if track_grounding_body:
+    if collect_evidence:
         # Extract new body atoms from rule_goals (first M_rule slots are body).
         if M_rule <= 0:
             M_rule = M_work

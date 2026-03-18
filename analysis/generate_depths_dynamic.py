@@ -175,7 +175,7 @@ def generate_depths_dynamic(
         depth=1,
         max_goals=max_goals,
         compile_mode=None,  # we compile externally
-        track_grounding_body=False,  # skip proof body tracking
+        collect_evidence=False,  # skip proof body tracking
     )
     grounder = grounder.to(dev)
     grounder_type = resolution

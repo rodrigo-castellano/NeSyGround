@@ -191,7 +191,7 @@ def resolve_enum_step(
     enum_bound_binding_b: Optional[Tensor] = None,
     enum_direction_b: Optional[Tensor] = None,
     check_arg_source_b: Optional[Tensor] = None,
-    track_grounding_body: bool = True,
+    collect_evidence: bool = True,
 ) -> ResolvedChildren:
     """Adapter: resolve_enum output -> common 9-tensor format used by _pack.
 
@@ -338,7 +338,7 @@ def resolve_enum_step(
 
     # 8. Build rule_gbody: parent's grounding_body expanded to K_enum children
     G_body = grounding_body.shape[2]  # G_body >= M (accumulated body dim)
-    if track_grounding_body:
+    if collect_evidence:
         rule_gbody = grounding_body.unsqueeze(2).expand(
             -1, -1, K_enum, -1, -1)   # [B, S, K_enum, G_body, 3]
     else:

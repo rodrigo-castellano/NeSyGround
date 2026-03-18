@@ -76,7 +76,7 @@ class BCGrounder(nn.Module):
         max_states: Optional[int] = None,
         K_MAX: int = 550,
         max_derived_per_state: Optional[int] = None,
-        track_grounding_body: bool = True,
+        collect_evidence: bool = True,
         step_prune_dead: bool = False,
         max_groundings_per_rule: Optional[int] = None,
         # Enum params
@@ -103,7 +103,7 @@ class BCGrounder(nn.Module):
         self.fact_hook = fact_hook
         self.rule_hook = rule_hook
         self.step_hook = None  # Optional StepHook (nn.Module), set externally
-        self.track_grounding_body = track_grounding_body
+        self.collect_evidence = collect_evidence
         self.prune_facts = prune_facts
 
         # Per-step search filters
@@ -314,23 +314,31 @@ class BCGrounder(nn.Module):
         evidence = self.filter_terminal(states)
         # filter='none' returns raw states dict — wrap in ProofEvidence
         # outside the compiled region (dataclass init breaks fullgraph).
+        # Skip when grounding body is not tracked (e.g. RL adapter).
         if isinstance(evidence, dict):
-            evidence = ProofEvidence(
-                body=evidence["collected_body"],
-                mask=evidence["collected_mask"],
-                count=evidence["collected_mask"].sum(dim=1),
-                rule_idx=evidence["collected_ridx"],
-                body_count=evidence["collected_bcount"],
-            )
-        for hook in self.hooks:
-            body, mask, ridx = hook.apply(evidence.body, evidence.mask, evidence.rule_idx)
-            evidence = ProofEvidence(
-                body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
-                body_count=evidence.body_count)
+            if self.collect_evidence:
+                evidence = ProofEvidence(
+                    body=evidence["collected_body"],
+                    mask=evidence["collected_mask"],
+                    count=evidence["collected_mask"].sum(dim=1),
+                    rule_idx=evidence["collected_ridx"],
+                    body_count=evidence["collected_bcount"],
+                )
+            else:
+                evidence = None
+        if evidence is not None:
+            for hook in self.hooks:
+                body, mask, ridx = hook.apply(evidence.body, evidence.mask, evidence.rule_idx)
+                evidence = ProofEvidence(
+                    body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
+                    body_count=evidence.body_count)
         state = ProofState(
             proof_goals=states["proof_goals"],
             state_valid=states["state_valid"],
             top_ridx=states["top_ridx"],
+            next_var_indices=(
+                states["next_var_indices"]
+                if self._standardize_fn is not None else None),
         )
         return GrounderOutput(state=state, evidence=evidence)
 
@@ -362,9 +370,9 @@ class BCGrounder(nn.Module):
         # G_body: accumulated body capacity across all depths.
         # Each depth step adds up to M body atoms (one rule application).
         # Upper bound = depth * M (not G, which bounds open goals).
-        G_body = 1 if not self.track_grounding_body else self.depth * M
+        G_body = 1 if not self.collect_evidence else self.depth * M
         # M_work: working buffer for the current depth's body atoms.
-        M_work = 1 if not self.track_grounding_body else M
+        M_work = 1 if not self.collect_evidence else M
 
         proof_goals = torch.full(
             (B, 1, G, 3), pad, dtype=torch.long, device=dev)
@@ -535,7 +543,7 @@ class BCGrounder(nn.Module):
                 K_f=self.kb.K_f, K_r=self.kb.K_r,
                 max_vars_per_rule=self.max_vars_per_rule,
                 num_rules=self.kb.num_rules,
-                track_grounding_body=self.track_grounding_body,
+                collect_evidence=self.collect_evidence,
                 excluded_queries=states.get("excluded_queries"),
                 fact_hook=fh, rule_hook=rh,
             )
@@ -550,7 +558,7 @@ class BCGrounder(nn.Module):
                 max_vars_per_rule=self.max_vars_per_rule,
                 num_rules=self.kb.num_rules,
                 max_fact_pairs_body=self._max_fact_pairs_body,
-                track_grounding_body=self.track_grounding_body,
+                collect_evidence=self.collect_evidence,
                 fact_hook=fh, rule_hook=rh,
             )
         else:
@@ -576,7 +584,7 @@ class BCGrounder(nn.Module):
                 enum_bound_binding_b=getattr(self, "enum_bound_binding_b", None),
                 enum_direction_b=getattr(self, "enum_direction_b", None),
                 check_arg_source_b=getattr(self, "check_arg_source_b", None),
-                track_grounding_body=self.track_grounding_body,
+                collect_evidence=self.collect_evidence,
             )
 
     # ==================================================================
@@ -653,7 +661,7 @@ class BCGrounder(nn.Module):
             states["top_ridx"], states["grounding_body"],
             states["body_count"],
             self.S, self.kb.padding_idx,
-            track_grounding_body=self.track_grounding_body,
+            collect_evidence=self.collect_evidence,
             M_rule=self.kb.M,
         )
 
@@ -691,7 +699,7 @@ class BCGrounder(nn.Module):
         has_new_body = sync.has_new_body
         parent_bcount = sync.parent_bcount
 
-        if not self.track_grounding_body:
+        if not self.collect_evidence:
             states["body_count"] = parent_bcount
             return states
 
@@ -746,12 +754,15 @@ class BCGrounder(nn.Module):
     # ==================================================================
 
     def _postprocess_goals(self, states: Dict) -> Dict[str, Tensor]:
-        """Optionally prune ground facts, then compact atoms.
+        """Optionally prune ground facts, compact atoms, and standardize.
 
         When ``prune_facts=True``, known ground facts are removed from
         proof_goals between steps (compressed depth semantics).
         When ``prune_facts=False`` (default), only compaction is applied
         (standard SLD semantics where every resolution costs 1 depth).
+
+        When ``collect_evidence=False`` and standardization is configured,
+        output variables are standardized (proof_goals are the final output).
 
         Safe for torch.compile — ``self.prune_facts`` is a static Python bool.
         """
@@ -766,6 +777,20 @@ class BCGrounder(nn.Module):
         else:
             states["proof_goals"] = compact_atoms(
                 states["proof_goals"], self.kb.padding_idx)
+
+        # Standardize output variables when proof_goals are the final output
+        if not self.collect_evidence and self._standardize_fn is not None:
+            counts = states["state_valid"].long().sum(dim=1)
+            nv = states.get("initial_next_var", states["next_var_indices"])
+            inp = states.get("initial_goals", states["proof_goals"].new_zeros(0))
+            std, std_nv = self.standardize_output(
+                states["proof_goals"], counts, nv, inp)
+            # Clone to detach from CUDA graph output buffers — prevents
+            # "overwritten by a subsequent run" errors when these tensors
+            # are consumed by the next compiled step.
+            states["proof_goals"] = std.clone()
+            states["next_var_indices"] = std_nv.clone()
+
         return states
 
     def _collect_groundings(self, states: Dict) -> Dict[str, Tensor]:
@@ -797,13 +822,18 @@ class BCGrounder(nn.Module):
         Used by the non-compiled path. The compiled path splits this into
         _postprocess_goals (inside compiled) + _sync_and_collect (outside).
 
+        When ``collect_evidence=False``, skips grounding collection (proof_goals
+        are the final output, not evidence).
+
         Args:
             states: Current proof states dict.
             sync: SyncParams from _pack (parent_map, winning_subs, etc.).
         """
         states = self._postprocess_goals(states)
         states = self._sync_accumulated(states, sync)
-        return self._collect_groundings(states)
+        if self.collect_evidence:
+            states = self._collect_groundings(states)
+        return states
 
     # ==================================================================
     # Output variable standardization (optional)
