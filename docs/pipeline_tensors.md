@@ -18,6 +18,48 @@ initialization, resolution, packing, collection, and final output.
 | tG | total groundings | max collected groundings per query | `effective_total_G` |
 | pad | padding index | `kb.padding_idx` | 0 |
 
+## Typed API
+
+```
+forward(queries, query_mask) -> GrounderOutput
+    .state    : ProofState    — where the proof search is (for RL)
+    .evidence : ProofEvidence — accumulated body atoms (for reasoning)
+```
+
+### Output types
+
+```python
+@dataclass
+class ProofState:
+    proof_goals: Tensor   # [B, S, G, 3]
+    state_valid: Tensor   # [B, S]
+    top_ridx:    Tensor   # [B, S]
+
+@dataclass
+class ProofEvidence:
+    body:       Tensor    # [B, tG, G_body, 3]
+    mask:       Tensor    # [B, tG]
+    count:      Tensor    # [B]
+    rule_idx:   Tensor    # [B, tG]
+    body_count: Tensor    # [B, tG]
+```
+
+### Internal pipeline types (NamedTuples)
+
+```python
+class ResolvedChildren(NamedTuple):  # output of RESOLVE
+    fact_goals, fact_gbody, fact_success,
+    rule_goals, rule_gbody, rule_success, sub_rule_idx,
+    fact_subs, rule_subs
+
+class PackedStates(NamedTuple):      # output of PACK
+    grounding_body, proof_goals, top_ridx, state_valid,
+    body_count, parent_map, winning_subs, has_new_body
+
+class SyncParams(NamedTuple):        # PACK → SYNC data flow
+    parent_map, winning_subs, has_new_body, parent_bcount
+```
+
 ## Key design: M-working / G_body-accumulator split
 
 The pipeline uses two separate body tensors to keep the hot path fast:
@@ -42,35 +84,44 @@ init_states          →  proof_goals      [B, 1, G, 3]
                         collected_body   [B, tG, G_body, 3]  (pad-filled)
                         collected_mask   [B, tG]              (False)
                         collected_ridx   [B, tG]
+                        collected_bcount [B, tG]
 
 for d in range(depth):
     step():
         SELECT    →  queries     [B, S, 3]          first goal of each state
                      remaining   [B, S, G, 3]        goals after removing first
 
-        RESOLVE   →  9-tuple:
+        RESOLVE   →  ResolvedChildren (9 tensors):
                      fact_goals   [B, S, K_f, G, 3]      fact children proof states
                      fact_gbody   [B, S, K_f, M, 3]      parent's M-sized body (passthrough)
                      fact_success [B, S, K_f]             valid fact matches
                      fact_subs    [B, S, K_f, 2, 2]       MGU subs from fact unification
-                     rule_goals   [B, S, K_r, G, 3]      rule children proof states
+                     rule_goals   [B, S, K_r, G, 3]      rule children (body + remaining, pre-assembled)
                      rule_gbody   [B, S, K_r, M, 3]      parent's M-sized body with subs
                      rule_success [B, S, K_r]             valid rule matches
                      sub_ridx     [B, S, K_r]             matched rule index
                      rule_subs    [B, S, K_r, 2, 2]       MGU subs from rule unification
 
-        PACK      →  proof_goals     [B, S, G, 3]       (M-sized grounding_body)
+        FILTERS   →  ResolvedChildren (rule_success modified)
+
+        PACK      →  states + SyncParams (no dict pollution):
+                     proof_goals     [B, S, G, 3]       (M-sized grounding_body)
                      grounding_body  [B, S, M, 3]        (current depth's body)
-                     parent_map      [B, S]               (compaction index)
-                     winning_subs    [B, S, 2, 2]         (subs for each winner)
-                     has_new_body    [B, S]               (True for rule children)
+                     SyncParams:
+                       parent_map    [B, S]               (compaction index)
+                       winning_subs  [B, S, 2, 2]         (subs for each winner)
+                       has_new_body  [B, S]               (True for rule children)
+                       parent_bcount [B, S]               (inherited body count)
+
+        PRUNE_GOALS → compact proof_goals (remove proved facts)
 
         SYNC      →  accumulated_body [B, S, G_body, 3]  (reindex + subs + append M)
                      body_count       [B, S]              (updated)
 
-        POSTPROCESS → collect terminal groundings from accumulated_body into collected_*
+        COLLECT   →  collect terminal groundings from accumulated_body into collected_*
 
-filter_terminal   →  GroundingResult(body, mask, count, rule_idx, body_count)
+filter_terminal   →  ProofEvidence(body, mask, count, rule_idx, body_count)
+                     wrapped in GrounderOutput(state=ProofState, evidence=ProofEvidence)
 ```
 
 ### Tensor meanings
@@ -93,7 +144,7 @@ filter_terminal   →  GroundingResult(body, mask, count, rule_idx, body_count)
 | **fact_gbody** | `[B, S, K_f, M, 3]` | Parent's M-sized `grounding_body` passed through (facts don't introduce new body atoms). |
 | **fact_success** | `[B, S, K_f]` | Which fact children produced a valid unification match. |
 | **fact_subs** | `[B, S, K_f, 2, 2]` | MGU substitution pairs from fact unification. Propagated to SYNC for applying to `accumulated_body`. |
-| **rule_goals** | `[B, S, K_r, G, 3]` | Child proof states from rule head unification. Slots `0..body_len-1` hold the new subgoals, rest hold remaining parent goals. |
+| **rule_goals** | `[B, S, K_r, G, 3]` | Child proof states from rule head unification. Pre-assembled: slots `0..Bmax-1` hold substituted body atoms, `Bmax..G-1` hold remaining parent goals with subs applied. |
 | **rule_gbody** | `[B, S, K_r, M, 3]` | Parent's M-sized `grounding_body` with MGU substitutions applied. |
 | **rule_success** | `[B, S, K_r]` | Which rule children produced a valid head unification match. |
 | **sub_ridx** | `[B, S, K_r]` | Index of the matched rule for each rule child. |
@@ -101,11 +152,11 @@ filter_terminal   →  GroundingResult(body, mask, count, rule_idx, body_count)
 | **parent_map** | `[B, S_out]` | Compaction index from pack_states: maps each output state to its parent state in S_in. Used by SYNC to gather-reindex `accumulated_body`. |
 | **winning_subs** | `[B, S_out, 2, 2]` | The winning substitution pairs after compaction. Used by SYNC to apply MGU subs to `accumulated_body`. |
 | **has_new_body** | `[B, S_out]` | True for output states that came from rule matches (have new body atoms to append). False for fact matches. |
-| **GroundingResult.body** | `[B, tG, G_body, 3]` | Final accumulated body atoms from all rule applications, after soundness filtering. |
-| **GroundingResult.mask** | `[B, tG]` | Final boolean mask: `True` for groundings that passed soundness checks. |
-| **GroundingResult.count** | `[B]` | Number of valid groundings per query. |
-| **GroundingResult.rule_idx** | `[B, tG]` | Rule index for each valid grounding. |
-| **GroundingResult.body_count** | `[B, tG]` | Number of valid body atoms per grounding. Used by downstream consumers to build atom-level masks. |
+| **ProofEvidence.body** | `[B, tG, G_body, 3]` | Final accumulated body atoms from all rule applications, after soundness filtering. |
+| **ProofEvidence.mask** | `[B, tG]` | Final boolean mask: `True` for groundings that passed soundness checks. |
+| **ProofEvidence.count** | `[B]` | Number of valid groundings per query. |
+| **ProofEvidence.rule_idx** | `[B, tG]` | Rule index for each valid grounding. |
+| **ProofEvidence.body_count** | `[B, tG]` | Number of valid body atoms per grounding. Used by downstream consumers to build atom-level masks. |
 
 ## Phase 1: init_states
 
@@ -133,19 +184,22 @@ Output: queries      [B, S, 3]       ← proof_goals[:, :, 0, :]
         active_mask  [B, S]          ← queries[:,:,0] != pad
 ```
 
-## Phase 3: RESOLVE
+## Phase 3: RESOLVE → ResolvedChildren
 
 Resolution produces children for each (batch, state) pair.
-Returns a **9-tuple** (7 original tensors + fact_subs + rule_subs):
+Returns a `ResolvedChildren` named tuple (9 tensors):
 
 ### SLD resolution
+
+`resolve_rules` in mgu.py returns pre-assembled `rule_goals` with body at `[:Bmax]`
+and remaining goals at `[Bmax:]`. No separate assembly step in sld.py.
 
 ```
 fact_goals    [B, S, K_f, G, 3]      # children from fact unification
 fact_gbody    [B, S, K_f, M, 3]      # parent's M-sized grounding_body (passthrough)
 fact_success  [B, S, K_f]            # which fact children are valid
 
-rule_goals    [B, S, K_r, G, 3]      # children from rule head unification
+rule_goals    [B, S, K_r, G, 3]      # pre-assembled: body + remaining
 rule_gbody    [B, S, K_r, M, 3]      # parent's M-sized grounding_body with MGU subs
 rule_success  [B, S, K_r]            # which rule children are valid
 sub_rule_idx  [B, S, K_r]            # which rule was matched
@@ -153,6 +207,11 @@ sub_rule_idx  [B, S, K_r]            # which rule was matched
 fact_subs     [B, S, K_f, 2, 2]      # MGU subs from fact unification
 rule_subs     [B, S, K_r, 2, 2]      # MGU subs from rule head unification
 ```
+
+### Enum resolution
+
+Returns same `ResolvedChildren` format with K_f=0 (no fact children).
+`rule_subs` is all-padding (enum has no MGU).
 
 ### What mgu_resolve_rules returns for gbody
 
@@ -163,14 +222,18 @@ When `grounding_body` is passed (track=True):
 When `grounding_body=None` (track=False):
 - Returns `[B, S, K_r, 0, 3]` — empty
 
-## Phase 4: PACK
+## Phase 4: PACK → (states, SyncParams)
 
 `pack_states()` flattens K children into the S budget.
+Returns `PackedStates` named tuple. `_pack()` extracts `SyncParams` for the SYNC phase
+(no dict pollution — sync metadata flows as an explicit value, not via `states["_parent_map"]`).
+
 Works entirely with M-sized grounding_body (fast).
+When K_f=0 (enum), the fact concatenation is skipped entirely (OPT-5).
 
 **Inputs:**
 ```
-9-tuple from resolve   (fact/rule goals, gbody [M], success, subs, ridx)
+ResolvedChildren   (fact/rule goals, gbody [M], success, subs, ridx)
 top_ridx        [B, S]       parent's rule index
 grounding_body  [B, S, M, 3] parent's M-sized working body
 body_count      [B, S]       atoms already accumulated
@@ -181,45 +244,57 @@ body_count      [B, S]       atoms already accumulated
 For rule children: capture current rule's body atoms from `rule_goals[:,:,:,:M,:]`.
 For fact children: set to padding (no new body atoms this depth).
 
-**Additional outputs for SYNC:**
-```
-parent_map    [B, S_out]       which parent each output state came from
-winning_subs  [B, S_out, 2, 2] MGU subs for each winning child
-has_new_body  [B, S_out]       True for rule children, False for fact children
-```
-
-**Output:**
+**Output: PackedStates**
 ```
 grounding_body  [B, S_out, M, 3]       (current depth's body atoms)
 proof_goals     [B, S_out, G, 3]
 top_ridx        [B, S_out]
 state_valid     [B, S_out]
+body_count      [B, S_out]
 parent_map      [B, S_out]
 winning_subs    [B, S_out, 2, 2]
 has_new_body    [B, S_out]
 ```
 
-## Phase 4b: SYNC (accumulated_body update)
+**Extracted SyncParams:**
+```
+parent_map      [B, S_out]
+winning_subs    [B, S_out, 2, 2]
+has_new_body    [B, S_out]
+parent_bcount   [B, S_out]
+```
 
-After PACK reorders states, SYNC propagates and updates `accumulated_body`:
+## Phase 4b: PRUNE_GOALS
+
+Removes proved ground facts from `proof_goals` and left-aligns remaining atoms:
+
+```python
+proof_goals = prune_ground_facts(proof_goals, state_valid, fact_hashes, ...)
+proof_goals = compact_atoms(proof_goals, pad)
+```
+
+## Phase 4c: SYNC (accumulated_body update)
+
+After PACK reorders states, SYNC propagates and updates `accumulated_body`
+using the explicit `SyncParams`:
 
 ```python
 # a. Gather accumulated_body from parents (reindex to new state order)
-acc = accumulated_body.gather(1, parent_map)      # [B, S_out, G_body, 3]
+acc = accumulated_body.gather(1, sync.parent_map)  # [B, S_out, G_body, 3]
 
 # b. Apply winning substitutions (bind variables from this depth)
-acc = apply_substitutions(acc, winning_subs)       # 2 torch.where ops
+acc = apply_substitutions(acc, sync.winning_subs)   # 2 torch.where ops
 
 # c. Append new M body atoms at body_count offset
-acc.scatter_(2, write_pos, new_atoms)              # where has_new_body
+acc.scatter_(2, write_pos, new_atoms)               # where sync.has_new_body
 
 # d. Update body_count
-body_count = parent_bcount + new_lens              # where has_new_body
+body_count = sync.parent_bcount + new_lens           # where sync.has_new_body
 ```
 
 All operations are static-shape and `torch.compile(fullgraph=True)` compatible.
 
-## Phase 5: POSTPROCESS (collect_groundings)
+## Phase 5: COLLECT (collect_groundings)
 
 After each step, terminal states (all goals resolved to ground facts) are
 collected from `accumulated_body` into the `collected_*` buffers:
@@ -231,17 +306,24 @@ collected_ridx   [B, tG]             ← rule index of terminal states
 collected_bcount [B, tG]             ← body_count of terminal states
 ```
 
-## Phase 6: filter_terminal → GroundingResult
+## Phase 6: filter_terminal → GrounderOutput
 
 After all depths, soundness filtering produces the final output:
 
 ```python
-GroundingResult(
-    body       = [B, tG, G_body, 3],  # accumulated body atoms from all rule applications
-    mask       = [B, tG],              # which groundings are valid
-    count      = [B],                  # number of valid groundings per query
-    rule_idx   = [B, tG],              # which rule produced each grounding
-    body_count = [B, tG],              # valid body atoms per grounding
+GrounderOutput(
+    state = ProofState(
+        proof_goals = [B, S, G, 3],
+        state_valid = [B, S],
+        top_ridx    = [B, S],
+    ),
+    evidence = ProofEvidence(
+        body       = [B, tG, G_body, 3],  # accumulated body atoms from all rule applications
+        mask       = [B, tG],              # which groundings are valid
+        count      = [B],                  # number of valid groundings per query
+        rule_idx   = [B, tG],              # which rule produced each grounding
+        body_count = [B, tG],              # valid body atoms per grounding
+    ),
 )
 ```
 
@@ -275,6 +357,41 @@ For depth=4, M=2: M=2 vs G_body=8. The hot path is 4x smaller.
 The SYNC adds a lightweight gather-reindex (reads S_out entries, not n_r)
 plus 2 `torch.where` ops and a small scatter — all much cheaper than the
 clone+scatter on the full n_r × G_body tensor.
+
+## Per-phase profiling (fb15k237, B=192)
+
+### SLD d4 (S=256, K_f=34, K_r=30, G=6, G_body=8)
+
+```
+Phase              ms/step      %
+─────────────────  ─────────  ──────
+RESOLVE             13.4 ms   65.8%  ████████████████████████████████
+PACK                 3.4 ms   16.7%  ████████
+PRUNE_GOALS          1.5 ms    7.6%  ███
+FILTERS              1.1 ms    5.5%  ██
+COLLECT              0.5 ms    2.7%  █
+SYNC                 0.2 ms    1.1%
+SELECT               0.1 ms    0.5%
+                    ─────────
+TOTAL               20.4 ms × 4 depths = 81.7 ms
+Peak memory: 1840 MB
+```
+
+### ENUM w1.d2 (S=64, K_enum=64, G=256, G_body=4)
+
+```
+Phase              ms/step      %
+─────────────────  ─────────  ──────
+RESOLVE             24.8 ms   75.8%  ████████████████████████████████████
+PACK                 4.1 ms   12.4%  █████
+PRUNE_GOALS          3.1 ms    9.5%  ████
+COLLECT              0.5 ms    1.5%
+SELECT               0.2 ms    0.6%
+SYNC                 0.1 ms    0.3%
+                    ─────────
+TOTAL               32.8 ms × 2 depths = 65.5 ms
+Peak memory: 9841 MB
+```
 
 ## Memory impact
 
