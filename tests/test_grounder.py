@@ -20,7 +20,8 @@ def _make_grounder(facts, heads, bodies, rule_lens, *,
             padding_idx=99, device=DEVICE,
             fact_index_type='arg_key')
     defaults = dict(resolution='sld', filter='fp_batch',
-                    max_goals=4, depth=2, max_total_groundings=16)
+                    max_goals=4, depth=2, max_total_groundings=16,
+                    prune_facts=True)
     defaults.update(bc_kwargs)
     return BCGrounder(kb, **defaults)
 

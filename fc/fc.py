@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.rule_index import RulePattern
+from grounder.data.rule_index import RulePattern
 
 
 # ══════════════════════════════════════════════════════════════════════

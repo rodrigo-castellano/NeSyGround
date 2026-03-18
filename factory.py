@@ -10,7 +10,6 @@ Examples:
     rtf.d2              Rule-Then-Fact, depth 2
     enum.fp_batch.w1.d2 Enum resolution, fp_batch, width 1, depth 2
     enum.full           Enum, all entities, depth 1
-    lazy.enum.fp_batch.w0.d1  Lazy-filtered enum
 """
 
 from __future__ import annotations
@@ -22,9 +21,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.kb import KB
+from grounder.data.kb import KB
 from grounder.bc.bc import BCGrounder
-from grounder.bc.lazy import LazyGrounder
 
 
 # ======================================================================
@@ -32,8 +30,7 @@ from grounder.bc.lazy import LazyGrounder
 # ======================================================================
 
 _PATTERN = re.compile(
-    r"^(?P<lazy>lazy\.)?"
-    r"(?P<resolution>sld|rtf|enum)"
+    r"^(?P<resolution>sld|rtf|enum)"
     r"(\.(?P<filter>fp_batch|fp_global|prune|provset|none))?"
     r"(?P<pd>\.pd)?"
     r"(\.full|\.w(?P<width>\d+))?"
@@ -44,13 +41,12 @@ _PATTERN = re.compile(
 def parse_grounder_type(grounder_type: str) -> Dict[str, Any]:
     """Parse a grounder type string into a config dict.
 
-    Returns dict with keys: resolution, filter, depth, width, is_lazy, is_full.
+    Returns dict with keys: resolution, filter, depth, width, is_full.
 
     Examples:
         'sld.fp_batch.d2'         → {resolution:'sld', filter:'fp_batch', depth:2, ...}
         'enum.fp_batch.w1.d2'     → {resolution:'enum', filter:'fp_batch', depth:2, width:1}
         'enum.full'               → {resolution:'enum', filter:'fp_batch', depth:1, is_full:True}
-        'lazy.enum.fp_batch.w0.d1'→ {resolution:'enum', filter:'fp_batch', depth:1, width:0, is_lazy:True}
     """
     m = _PATTERN.match(grounder_type)
     if not m:
@@ -78,7 +74,6 @@ def parse_grounder_type(grounder_type: str) -> Dict[str, Any]:
         "filter": filter_mode,
         "depth": int(m.group("depth")) if m.group("depth") else 1,
         "width": int(m.group("width")) if m.group("width") else 1,
-        "is_lazy": bool(m.group("lazy")),
         "is_full": is_full,
         "step_prune_dead": bool(m.group("pd")),
     }
@@ -111,13 +106,13 @@ def create_grounder(
 ) -> nn.Module:
     """Create a grounder from a type string.
 
-    Builds a KB from the data params, then instantiates the right grounder.
+    Builds a KB from the data params, then instantiates BCGrounder.
 
     Args:
         grounder_type: e.g. 'sld.fp_batch.d2', 'enum.fp_batch.w1.d2', 'rtf.d4'.
 
     Returns:
-        Grounder module instance (BCGrounder or LazyGrounder).
+        BCGrounder instance.
     """
     cfg = parse_grounder_type(grounder_type)
 
@@ -152,8 +147,5 @@ def create_grounder(
     # Width: always pass to BCGrounder (for SLD/RTF it activates the hook)
     if "width" not in bc_kwargs:
         bc_kwargs["width"] = cfg["width"]
-
-    if cfg["is_lazy"]:
-        return LazyGrounder(kb, **bc_kwargs)
 
     return BCGrounder(kb, **bc_kwargs)

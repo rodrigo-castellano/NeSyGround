@@ -10,14 +10,14 @@ Search filters (per-step):
 
 Shared utilities:
   _hash.py             — hash_atoms
-  check_in_provable    — binary search membership in sorted hash tensor
+  check_in_fp_global   — binary search membership in sorted hash tensor
 """
 
-from grounder.filters.soundness import check_in_provable
+from grounder.filters.soundness import check_in_fp_global
 from grounder.filters.search import filter_width, filter_prune_dead
 
 __all__ = [
-    "check_in_provable",
+    "check_in_fp_global",
     "filter_width",
     "filter_prune_dead",
 ]

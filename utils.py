@@ -3,36 +3,34 @@
 from __future__ import annotations
 
 import time
-from typing import Callable
+from typing import Callable, Tuple
 
 import torch
 
 
-def timed_warmup(warmup_fn: Callable[[], None]) -> float:
-    """Run warmup, detect cold inductor cache, re-run if needed.
+def timed_warmup(warmup_fn: Callable[[], None]) -> Tuple[float, float]:
+    """Run warmup twice, return (cold_s, warm_s).
 
-    Returns the warm warmup time in seconds.
+    Run 1 (cold): warms all caches — inductor FX graphs, triton kernel
+    compilation, CUDA graph capture (reduce-overhead mode).
 
-    Uses ``torch._dynamo.utils.counters`` to detect cache misses.
-    If the first run has cache misses (cold inductor cache), re-runs
-    to get a warm measurement.
+    Run 2 (warm): measures steady-state performance with all caches hot.
+
+    Returns:
+        (cold_s, warm_s) — cold start time and warm replay time in seconds.
     """
-    from torch._dynamo.utils import counters
-
-    counters.clear()
+    # Run 1: cold — populates all caches
     t0 = time.perf_counter()
     warmup_fn()
-    torch.cuda.synchronize()
-    first_s = time.perf_counter() - t0
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    cold_s = time.perf_counter() - t0
 
-    misses = counters.get("inductor", {}).get("fxgraph_cache_miss", 0)
-    if misses == 0:
-        return first_s  # cache was warm
-
-    # Cold cache — first run populated it, measure warm
-    print(f"  Cold inductor cache ({misses} misses, {first_s:.1f}s). Re-measuring warm...")
-    counters.clear()
+    # Run 2: warm — all caches hot
     t0 = time.perf_counter()
     warmup_fn()
-    torch.cuda.synchronize()
-    return time.perf_counter() - t0
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    warm_s = time.perf_counter() - t0
+
+    return cold_s, warm_s

@@ -2,7 +2,7 @@
 
 import torch
 import pytest
-from grounder.primitives import apply_substitutions, unify_one_to_one
+from grounder.resolution.primitives import apply_substitutions, unify_one_to_one
 
 PAD = 99
 C_NO = 5  # constants 0..5, vars start at 6

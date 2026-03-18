@@ -23,9 +23,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.base import Grounder
-from grounder.kb import KB
-from grounder.primitives import apply_substitutions
+from grounder.data.kb import KB
+from grounder.resolution.primitives import apply_substitutions
 from grounder.resolution.standardization import StandardizationConfig
 
 if TYPE_CHECKING:
@@ -39,14 +38,14 @@ from grounder.bc.common import (
 from grounder.types import (
     GrounderOutput, ProofEvidence, ProofState, ResolvedChildren, SyncParams,
 )
-from grounder.filters import check_in_provable
+from grounder.filters import check_in_fp_global
 from grounder.filters.search import filter_width, filter_prune_dead
 from grounder.resolution.sld import resolve_sld
 from grounder.resolution.rtf import resolve_rtf
 from grounder.resolution.enum import resolve_enum_step
 
 
-class BCGrounder(Grounder):
+class BCGrounder(nn.Module):
     """Unified backward-chaining grounder BC_{w,d}.
 
     Configurable with orthogonal choices:
@@ -86,8 +85,14 @@ class BCGrounder(Grounder):
         fc_depth: int = 10,
         # Output variable standardization (for consumers of ungrounded states)
         standardization: Optional[StandardizationConfig] = None,
+        # Per-step ground-fact pruning: remove known facts from proof goals
+        # between resolution steps. Disabled by default (standard SLD semantics
+        # where every resolution step costs 1 depth). Enable for "compressed"
+        # depth semantics where ground-fact goals are free.
+        prune_facts: bool = False,
     ) -> None:
-        super().__init__(kb)
+        super().__init__()
+        self.kb = kb
 
         self.depth = depth
         self.width = width
@@ -99,6 +104,7 @@ class BCGrounder(Grounder):
         self.rule_hook = rule_hook
         self.step_hook = None  # Optional StepHook (nn.Module), set externally
         self.track_grounding_body = track_grounding_body
+        self.prune_facts = prune_facts
 
         # Per-step search filters
         self._step_width = width if resolution in ("sld", "rtf") and width is not None else None
@@ -232,14 +238,14 @@ class BCGrounder(Grounder):
                 p_lens = fi._p_offsets[1:] - fi._p_offsets[:-1]
                 self.register_buffer("_step_p_lens", p_lens)
 
-        # Provable set (for fp_global filter)
-        self._has_provable_set = False
+        # fp_global set I_D (for fp_global filter)
+        self._has_fp_global = False
         if self.filter_mode == "fp_global":
             if self.resolution == "enum":
-                self._build_provable_set(self.kb.device_)
+                self._build_fp_global_set(self.kb.device_)
             else:
                 # SLD/RTF: build a temporary RuleIndexEnum for FC patterns
-                from grounder.rule_index import RuleIndexEnum
+                from grounder.data.rule_index import RuleIndexEnum
                 P = self.kb.predicate_no + 1
                 E = self.kb.constant_no + 1
                 enum_ri = RuleIndexEnum(
@@ -251,12 +257,12 @@ class BCGrounder(Grounder):
                     padding_idx=self.kb.padding_idx,
                     device=self.kb.device_,
                 )
-                self._build_provable_set(
+                self._build_fp_global_set(
                     self.kb.device_, compiled_rules=enum_ri.patterns,
                     P=P, E=E,
                 )
 
-    def _build_provable_set(
+    def _build_fp_global_set(
         self, device: torch.device,
         compiled_rules=None, P: int = 0, E: int = 0,
     ) -> None:
@@ -271,7 +277,7 @@ class BCGrounder(Grounder):
         if method in ("join", "spmm"):
             method = "dynamic"
         fc_depth = getattr(self, 'fc_depth', 10)
-        provable_tensor, n_provable = run_forward_chaining(
+        fp_global_tensor, n_fp_global = run_forward_chaining(
             compiled_rules=compiled_rules,
             facts_idx=self.kb.fact_index.facts_idx,
             num_entities=E,
@@ -279,13 +285,13 @@ class BCGrounder(Grounder):
             depth=fc_depth,
             device=str(device),
         )
-        self.register_buffer("provable_hashes", provable_tensor)
+        self.register_buffer("fp_global_hashes", fp_global_tensor)
         self.register_buffer(
-            "num_provable",
-            torch.tensor(n_provable, dtype=torch.long, device=device))
-        self._has_provable_set = n_provable > 0
-        self._P_provable = P
-        self._E_provable = E
+            "num_fp_global",
+            torch.tensor(n_fp_global, dtype=torch.long, device=device))
+        self._has_fp_global = n_fp_global > 0
+        self._P_fp_global = P
+        self._E_fp_global = E
 
     # ==================================================================
     # Canonical loop
@@ -474,7 +480,7 @@ class BCGrounder(Grounder):
             mask = apply_fp_global(
                 body, mask, self.kb.fact_index,
                 self.kb.fact_index.pack_base, self.kb.padding_idx,
-                self.provable_hashes)
+                self.fp_global_hashes)
 
         count = mask.sum(dim=1)
         bcount = states["collected_bcount"]
@@ -740,18 +746,26 @@ class BCGrounder(Grounder):
     # ==================================================================
 
     def _postprocess_goals(self, states: Dict) -> Dict[str, Tensor]:
-        """Prune ground facts and compact atoms (no grounding collection).
+        """Optionally prune ground facts, then compact atoms.
 
-        This is the lightweight part of postprocessing that operates on
-        proof_goals only (M-sized). Safe for the compiled step.
+        When ``prune_facts=True``, known ground facts are removed from
+        proof_goals between steps (compressed depth semantics).
+        When ``prune_facts=False`` (default), only compaction is applied
+        (standard SLD semantics where every resolution costs 1 depth).
+
+        Safe for torch.compile — ``self.prune_facts`` is a static Python bool.
         """
-        proof_goals, _, _ = prune_ground_facts(
-            states["proof_goals"], states["state_valid"],
-            self.kb.fact_index.fact_hashes, self.kb.fact_index.pack_base,
-            self.kb.constant_no, self.kb.padding_idx,
-            excluded_queries=states.get("excluded_queries"),
-        )
-        states["proof_goals"] = compact_atoms(proof_goals, self.kb.padding_idx)
+        if self.prune_facts:
+            proof_goals, _, _ = prune_ground_facts(
+                states["proof_goals"], states["state_valid"],
+                self.kb.fact_index.fact_hashes, self.kb.fact_index.pack_base,
+                self.kb.constant_no, self.kb.padding_idx,
+                excluded_queries=states.get("excluded_queries"),
+            )
+            states["proof_goals"] = compact_atoms(proof_goals, self.kb.padding_idx)
+        else:
+            states["proof_goals"] = compact_atoms(
+                states["proof_goals"], self.kb.padding_idx)
         return states
 
     def _collect_groundings(self, states: Dict) -> Dict[str, Tensor]:
@@ -909,13 +923,13 @@ class BCGrounder(Grounder):
     # ==================================================================
 
     def check_known(self, atoms: Tensor) -> Tensor:
-        """Check if atoms are known facts or in provable set."""
+        """Check if atoms are known facts or in fp_global set (I_D)."""
         is_fact = self.kb.fact_index.exists(atoms)
-        if hasattr(self, "_has_provable_set") and self._has_provable_set:
-            E = getattr(self, '_E_provable', getattr(self, '_E', self.kb.constant_no + 1))
+        if hasattr(self, "_has_fp_global") and self._has_fp_global:
+            E = getattr(self, '_E_fp_global', getattr(self, '_E', self.kb.constant_no + 1))
             h = atoms[..., 0] * (E * E) + atoms[..., 1] * E + atoms[..., 2]
-            in_provable = check_in_provable(h, self.provable_hashes)
-            return is_fact | in_provable
+            in_fp_global = check_in_fp_global(h, self.fp_global_hashes)
+            return is_fact | in_fp_global
         return is_fact
 
     def is_provable(self, atoms: Tensor) -> Tensor:

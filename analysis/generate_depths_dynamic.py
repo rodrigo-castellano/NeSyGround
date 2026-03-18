@@ -23,7 +23,7 @@ from torch import Tensor
 # Suppress CUDA graph dynamic shape warnings (expected with variable frontier)
 torch._inductor.config.triton.cudagraph_dynamic_shape_warn_limit = None  # type: ignore[attr-defined]
 
-from grounder.data_loader import KGDataset
+from grounder.data.loader import KGDataset
 from grounder.bc.bc import BCGrounder
 from grounder.bc.common import compact_atoms, prune_ground_facts
 from grounder.analysis._dedup import (

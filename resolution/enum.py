@@ -18,7 +18,7 @@ from typing import Dict, Optional, Tuple
 import torch
 from torch import Tensor
 
-from grounder.rule_index import RuleIndexEnum
+from grounder.data.rule_index import RuleIndexEnum
 from grounder.types import ResolvedChildren
 
 

@@ -22,7 +22,7 @@ import tempfile
 import time
 from typing import Dict, List, Set, Tuple
 
-from grounder.data_loader import KGDataset
+from grounder.data.loader import KGDataset
 
 
 class PrologProver:

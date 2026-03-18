@@ -16,8 +16,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.rule_index import compile_rules
-from grounder.filters import check_in_provable
+from grounder.data.rule_index import compile_rules
+from grounder.filters import check_in_fp_global
 from grounder.fc.fc import run_forward_chaining
 
 
@@ -89,15 +89,15 @@ class SoftScorer(nn.Module):
         else:
             self._provability_mlp = None
 
-        # Compute provable set via forward chaining
+        # Compute fp_global set (I_D) via forward chaining
         compiled = compile_rules(
             rules_heads_idx, rules_bodies_idx, rule_lens, constant_no)
-        provable, n = run_forward_chaining(
+        fp_global, n = run_forward_chaining(
             compiled_rules=compiled, facts_idx=facts_idx,
             num_entities=num_entities, num_predicates=predicate_no,
             depth=10, device="cpu")
-        self.register_buffer("_provable_hashes", provable.to(device))
-        self._has_provable = n > 0
+        self.register_buffer("_fp_global_hashes", fp_global.to(device))
+        self._has_fp_global = n > 0
 
     def apply(
         self,
@@ -114,14 +114,14 @@ class SoftScorer(nn.Module):
         # Fact + provability check
         flat = body.reshape(-1, 3)
         is_fact = self._fact_index.exists(flat).view(B, tG_in, M)
-        if self._has_provable:
+        if self._has_fp_global:
             E = self._E
             h = flat[:, 0] * (E * E) + flat[:, 1] * E + flat[:, 2]
-            is_provable = check_in_provable(
-                h, self._provable_hashes).view(B, tG_in, M)
+            in_fp_global = check_in_fp_global(
+                h, self._fp_global_hashes).view(B, tG_in, M)
         else:
-            is_provable = torch.zeros_like(is_fact)
-        is_known = is_fact | is_provable
+            in_fp_global = torch.zeros_like(is_fact)
+        is_known = is_fact | in_fp_global
 
         # Soft scores for unknown atoms
         if self._is_neural:

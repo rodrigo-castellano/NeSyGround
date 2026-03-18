@@ -24,7 +24,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import Tensor
 
-from grounder.data_loader import KGDataset
+from grounder.data.loader import KGDataset
 from grounder.bc.bc import BCGrounder
 from grounder.analysis._report import DepthStats, write_report
 

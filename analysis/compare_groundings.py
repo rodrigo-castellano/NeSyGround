@@ -20,7 +20,7 @@ from typing import Dict, List, Optional, Set, Tuple
 import torch
 from torch import Tensor
 
-from grounder.data_loader import KGDataset
+from grounder.data.loader import KGDataset
 
 
 # ---------------------------------------------------------------------------

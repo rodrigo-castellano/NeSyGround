@@ -2,7 +2,7 @@
 
 import torch
 import pytest
-from grounder.fact_index import (
+from grounder.data.fact_index import (
     ArgKeyFactIndex,
     InvertedFactIndex,
     BlockSparseFactIndex,
@@ -67,7 +67,7 @@ class TestArgKeyFactIndex:
         # Query with predicate 5 (doesn't exist) — targeted_lookup may return
         # clamped indices but unification will fail on predicate mismatch.
         # Check that no unification succeeds:
-        from grounder.primitives import unify_one_to_one
+        from grounder.resolution.primitives import unify_one_to_one
         queries = torch.tensor([[5, 1, 6]])
         item_idx, valid = idx.targeted_lookup(queries, max_results=4)
         if valid.any():

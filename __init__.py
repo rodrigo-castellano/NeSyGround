@@ -25,8 +25,7 @@ configured at construction time via three orthogonal axes:
     ``GroundingHook``        post-processes final groundings.
 
 There is no class hierarchy of subclasses — just one ``BCGrounder`` that
-composes the desired behaviour from the options above.  ``LazyGrounder``
-wraps ``BCGrounder`` with predicate-level filtering for large KBs.
+composes the desired behaviour from the options above.
 
 Usage::
 
@@ -42,10 +41,10 @@ Usage::
 """
 
 # --- Primitives ---
-from grounder.primitives import apply_substitutions, unify_one_to_one
+from grounder.resolution.primitives import apply_substitutions, unify_one_to_one
 
 # --- Fact indexing ---
-from grounder.fact_index import (
+from grounder.data.fact_index import (
     ArgKeyFactIndex,
     BlockSparseFactIndex,
     FactIndex,
@@ -55,15 +54,15 @@ from grounder.fact_index import (
 )
 
 # --- Rule indexing + compilation ---
-from grounder.rule_index import RuleIndex, RuleIndexEnum, RulePattern, compile_rules
+from grounder.data.rule_index import RuleIndex, RuleIndexEnum, RulePattern, compile_rules
 
 # --- Packing + post-processing ---
 from grounder.bc.common import (
     compact_atoms,
     collect_groundings,
     pack_states,
-    prune_ground_facts,
 )
+from grounder.filters.search.prune_facts import prune_ground_facts
 
 # --- Standardization ---
 from grounder.resolution.standardization import (
@@ -83,7 +82,7 @@ from grounder.types import (
 )
 
 # --- Data loading ---
-from grounder.data_loader import KGDataset
+from grounder.data.loader import KGDataset
 
 
 # --- Forward chaining ---
@@ -93,10 +92,8 @@ from grounder.fc.fc import run_forward_chaining
 from grounder.factory import create_grounder
 
 # --- KB + Grounders ---
-from grounder.kb import KB
-from grounder.base import Grounder
+from grounder.data.kb import KB
 from grounder.bc.bc import BCGrounder
-from grounder.bc.lazy import LazyGrounder
 
 # --- NeSy hooks ---
 from grounder.nesy.hooks import (
@@ -155,8 +152,6 @@ __all__ = [
     # Grounders
     "BCGrounder",
     "KB",
-    "Grounder",
-    "LazyGrounder",
     # NeSy hooks
     "GroundingHook",
     "ResolutionFactHook",

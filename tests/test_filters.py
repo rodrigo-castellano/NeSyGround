@@ -58,7 +58,7 @@ class TestHashAtoms:
 
     def test_hash_consistency(self):
         from grounder.filters._hash import hash_atoms
-        from grounder.fact_index import pack_triples_64
+        from grounder.data.fact_index import pack_triples_64
         atoms = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.long)
         base = 100
         h1 = hash_atoms(atoms, base)
@@ -263,6 +263,7 @@ class TestFPBatchMultiHop:
             kb, resolution='sld', filter='fp_batch',
             max_goals=8, depth=3, max_total_groundings=64,
             max_derived_per_state=20,
+            prune_facts=True,
         )
 
     def test_multihop_batch(self):

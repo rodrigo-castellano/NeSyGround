@@ -15,8 +15,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from grounder.fact_index import ArgKeyFactIndex
-from grounder.primitives import apply_substitutions, unify_one_to_one
+from grounder.data.fact_index import ArgKeyFactIndex
+from grounder.resolution.primitives import apply_substitutions, unify_one_to_one
 
 
 def resolve_facts(

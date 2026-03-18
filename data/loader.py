@@ -4,7 +4,7 @@ Loads a dataset directory containing triples, rules, and optional facts,
 builds vocabularies and converts to tensors suitable for BCGrounder.
 
 Usage:
-    from grounder.data_loader import KGDataset
+    from grounder.data.loader import KGDataset
     from grounder import BCGrounder
     ds = KGDataset('kge_experiments/data/family', device='cuda')
     kb = ds.make_kb()
@@ -290,7 +290,7 @@ class KGDataset:
 
     def make_kb(self, **kwargs) -> "KB":
         """Create a KB from this dataset's tensors."""
-        from grounder.kb import KB
+        from grounder.data.kb import KB
         return KB(
             self.facts_idx,
             self.rules_heads_idx,

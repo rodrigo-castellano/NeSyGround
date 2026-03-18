@@ -56,7 +56,7 @@ def _run_groundings(
     dataset: str, grounder_type: str, depth: int, data_root: Path,
 ) -> dict[str, Any]:
     """Run grounder on test queries, return metrics with per_query_counts."""
-    from grounder.data_loader import KGDataset
+    from grounder.data.loader import KGDataset
     from grounder import BCGrounder
 
     ds = KGDataset(str(data_root / dataset), device=str(DEVICE))

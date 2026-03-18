@@ -15,8 +15,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.fact_index import FactIndex
-from grounder.rule_index import RuleIndex
+from grounder.data.fact_index import FactIndex
+from grounder.data.rule_index import RuleIndex
 
 
 class KB(nn.Module):
