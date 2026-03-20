@@ -172,6 +172,7 @@ def generate_depths_static(
     device: str = "cuda",
     output_dir: Optional[str] = None,
     grounder: Optional[BCGrounder] = None,
+    prune_facts: bool = False,
 ) -> Tensor:
     """Generate depth annotations using BCGrounder.forward().
 
@@ -188,6 +189,7 @@ def generate_depths_static(
         device: Target device
         output_dir: Output directory (default: dataset directory)
         grounder: Optional pre-built BCGrounder (skips creating a new one)
+        prune_facts: Remove known ground facts between depth steps
 
     Returns:
         [N] int tensor of minimum proof depths (-1 if not provable)
@@ -213,18 +215,14 @@ def generate_depths_static(
             max_goals=max_goals,
             max_states=max_states if max_states is not None else hard_cap,
             compile_mode=compile_mode if dev.type == "cuda" else None,
-            collect_evidence=False,
+            prune_facts=prune_facts,
         )
 
-        # Auto-calculate S if not provided
+        # Warn if S is capped
         K = grounder.K
-        if max_states is None:
-            auto_S = min(K ** max_depth, hard_cap)
-            if K ** max_depth > hard_cap:
-                print(f"WARNING: K^depth = {K}^{max_depth} = {K**max_depth} > hard_cap={hard_cap}. "
-                      f"Some proofs may be missed due to state overflow.")
-            grounder.S = auto_S
-            grounder._build_compiled_fns()
+        if max_states is None and K ** max_depth > hard_cap:
+            print(f"WARNING: K^depth = {K}^{max_depth} = {K**max_depth} > hard_cap={hard_cap}. "
+                  f"Some proofs may be missed due to state overflow.")
 
         grounder = grounder.to(dev)
 
@@ -322,6 +320,8 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--facts_file", type=str, default="facts.txt")
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--prune-facts", action="store_true", default=False,
+                        help="Remove known ground facts between depth steps")
     args = parser.parse_args()
 
     dataset = KGDataset(args.data_dir, facts_file=args.facts_file, device=args.device)
@@ -339,6 +339,7 @@ def main() -> None:
             compile_mode=args.compile_mode,
             device=args.device,
             output_dir=args.output_dir,
+            prune_facts=args.prune_facts,
         )
 
 

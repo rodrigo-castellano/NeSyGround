@@ -20,6 +20,8 @@ from grounder.nesy.scoring import (
     kge_score_triples,
     kge_score_all_tails,
     kge_score_all_heads,
+    kge_score_k_tails,
+    kge_score_k_heads,
     precompute_partial_scores,
     score_partial_atoms,
 )
@@ -57,6 +59,8 @@ __all__ = [
     "kge_score_triples",
     "kge_score_all_tails",
     "kge_score_all_heads",
+    "kge_score_k_tails",
+    "kge_score_k_heads",
     "precompute_partial_scores",
     "score_partial_atoms",
     # Hook implementations
