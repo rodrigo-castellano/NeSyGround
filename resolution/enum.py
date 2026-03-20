@@ -40,6 +40,8 @@ def init_enum(
     max_total_groundings: int,
     max_states: Optional[int],
     device: torch.device,
+    cartesian_product: bool = False,
+    all_anchors: bool = False,
 ) -> Dict:
     """Build all enum metadata from a RuleIndex.
 
@@ -67,6 +69,7 @@ def init_enum(
         predicate_no=P - 1 if P > 0 else None,
         padding_idx=rule_index.padding_idx,
         device=device,
+        all_anchors=all_anchors,
     )
 
     # Head predicate mask
@@ -90,8 +93,9 @@ def init_enum(
     }
 
     # Dual anchoring (direction B)
+    # Skip when all_anchors — every body atom is already tried as anchor.
     any_dual = False
-    if width is not None and width > 0:
+    if width is not None and width > 0 and not all_anchors:
         R = max(num_rules, 1)
         Mb = enum_ri.max_body
 
@@ -137,13 +141,15 @@ def init_enum(
 
     # Budgets
     R_eff = enum_ri.R_eff
-    K_enum = min(R_eff * max_groundings_per_query, max_total_groundings)
+    G_use = E if cartesian_product else max_groundings_per_query
+    K_enum = min(R_eff * G_use, max_total_groundings)
     S = max_states if max_states is not None else max_total_groundings
-    effective_total_G = min(max_total_groundings,
-                            R_eff * max_groundings_per_query)
+    effective_total_G = min(max_total_groundings, R_eff * G_use)
 
     print(f"  BCGrounder(enum): {num_rules} rules, R_eff={R_eff}, "
-          f"width={width}, S={S}, K_enum={K_enum}, tG={effective_total_G}")
+          f"width={width}, S={S}, K_enum={K_enum}, tG={effective_total_G}"
+          + (f", cartesian_product=True, E={E}" if cartesian_product else "")
+          + (f", all_anchors=True" if all_anchors else ""))
 
     return {
         "buffers": buffers,
@@ -154,7 +160,8 @@ def init_enum(
         "S": S,
         "effective_total_G": effective_total_G,
         "any_dual": any_dual,
-        "enum_G": max_groundings_per_query,
+        "enum_G": G_use,
+        "cartesian_product": cartesian_product,
     }
 
 
@@ -192,6 +199,9 @@ def resolve_enum_step(
     enum_direction_b: Optional[Tensor] = None,
     check_arg_source_b: Optional[Tensor] = None,
     collect_evidence: bool = True,
+    cartesian_product: bool = False,
+    E: int = 0,
+    w_last_depth: int = 0,
 ) -> ResolvedChildren:
     """Adapter: resolve_enum output -> common 9-tensor format used by _pack.
 
@@ -242,10 +252,11 @@ def resolve_enum_step(
     pad = padding_idx
     dev = queries.device
 
-    # 1. Width: last step may use stricter width
+    # 1. Width: last step uses w_last_depth (default 0 = all body atoms
+    #    must be facts) so proof_goals become empty and collection works.
     width_d = width
     if d == depth - 1 and width is not None:
-        width_d = 0  # last step: all body atoms must be facts
+        width_d = w_last_depth
 
     # 2. Flatten [B, S, 3] -> [N, 3]
     N = B * S
@@ -272,6 +283,8 @@ def resolve_enum_step(
         enum_direction_b=enum_direction_b,
         check_arg_source_b=check_arg_source_b,
         any_dual=any_dual,
+        cartesian_product=cartesian_product,
+        E=E,
     )
 
     # 4. Unpack tuple and handle direction B
@@ -388,6 +401,8 @@ def resolve_enum(
     enum_direction_b: Optional[Tensor] = None,
     check_arg_source_b: Optional[Tensor] = None,
     any_dual: bool = False,
+    cartesian_product: bool = False,
+    E: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
            Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Parametrized compiled enumeration with optional dual anchoring.
@@ -419,13 +434,18 @@ def resolve_enum(
     num_body_q = num_body_atoms[active_idx]         # [B, Re]
 
     # ── Direction A: enumerate + fill + filter ──
-    G_use = min(G, fact_index._max_facts_per_query)
+    if cartesian_product:
+        G_use = E
+    else:
+        G_use = min(G, fact_index._max_facts_per_query)
     cands_a, cmask_a = _enumerate_dir(
         B, Re, G_use, qs, qo,
         enum_pred_a[active_idx],
         enum_bound_binding_a[active_idx],
         enum_direction_a[active_idx],
         fact_index,
+        cartesian_product=cartesian_product,
+        E=E,
     )
     G_use = cands_a.size(2)
 
@@ -449,7 +469,7 @@ def resolve_enum(
     )
 
     # ── Direction B (dual anchoring) ──
-    if any_dual:
+    if any_dual and not cartesian_product:
         has_dual_q = has_dual[active_idx]
         G_b = G // 2
         G_use_b = min(G_b, fact_index._max_facts_per_query)
@@ -572,13 +592,26 @@ def _enumerate_dir(
     enum_bound_q: Tensor,    # [B, Re]
     enum_dir_q: Tensor,      # [B, Re]
     fact_index,
+    cartesian_product: bool = False,
+    E: int = 0,
 ) -> Tuple[Tensor, Tensor]:
     """Enumerate candidates for one direction across clustered rules.
+
+    When ``cartesian_product=True``, returns all entity indices ``[0..E-1]``
+    as candidates for every (query, rule) pair instead of fact-anchored lookup.
 
     Returns:
         candidates: [B, Re, G_actual]
         cand_mask:  [B, Re, G_actual]
     """
+    if cartesian_product:
+        dev = query_subjs.device
+        # All entities as candidates for every (query, rule) pair
+        candidates = torch.arange(E, device=dev).unsqueeze(0).unsqueeze(0).expand(
+            B * Re, 1, -1).reshape(B, Re, E)
+        cand_mask = torch.ones(B, Re, E, dtype=torch.bool, device=dev)
+        return candidates, cand_mask
+
     source = torch.stack([query_subjs, query_objs], dim=1)  # [B, 2]
     enum_bound_vals = source.gather(1, enum_bound_q)         # [B, Re]
 

@@ -83,6 +83,11 @@ class BCGrounder(nn.Module):
         max_groundings_per_query: int = 32,
         fc_method: str = "join",
         fc_depth: int = 10,
+        # Testing/validation enum params (not compile-compatible)
+        cartesian_product: bool = False,
+        all_anchors: bool = False,
+        w_last_depth: int = 0,
+        collect_mode: str = "terminal",
         # Output variable standardization (for consumers of ungrounded states)
         standardization: Optional[StandardizationConfig] = None,
         # Per-step ground-fact pruning: remove known facts from proof goals
@@ -105,6 +110,10 @@ class BCGrounder(nn.Module):
         self.step_hook = None  # Optional StepHook (nn.Module), set externally
         self.collect_evidence = collect_evidence
         self.prune_facts = prune_facts
+        self._cartesian_product = cartesian_product
+        self._all_anchors = all_anchors
+        self._w_last_depth = w_last_depth
+        self._collect_mode = collect_mode
 
         # Per-step search filters
         self._step_width = width if resolution in ("sld", "rtf") and width is not None else None
@@ -183,6 +192,8 @@ class BCGrounder(nn.Module):
                 max_total_groundings=kwargs["max_total_groundings"],
                 max_states=kwargs["max_states"],
                 device=self.kb.device_,
+                cartesian_product=self._cartesian_product,
+                all_anchors=self._all_anchors,
             )
             for name, tensor in meta["buffers"].items():
                 self.register_buffer(name, tensor)
@@ -195,6 +206,7 @@ class BCGrounder(nn.Module):
             self.effective_total_G = meta["effective_total_G"]
             self.any_dual = meta["any_dual"]
             self._enum_G = meta["enum_G"]
+            self._enum_cartesian = meta.get("cartesian_product", False)
             self.fc_method = kwargs["fc_method"]
             self.fc_depth = kwargs["fc_depth"]
             self.max_vars_per_rule = 3  # unused for enum, but keeps state uniform
@@ -268,7 +280,9 @@ class BCGrounder(nn.Module):
     ) -> None:
         from grounder.fc.fc import run_forward_chaining
         if compiled_rules is None:
-            compiled_rules = self._enum_ri.patterns
+            # Use original patterns (not expanded all_anchors variants)
+            compiled_rules = getattr(
+                self._enum_ri, '_original_patterns', self._enum_ri.patterns)
         if P == 0:
             P = self._P
         if E == 0:
@@ -585,6 +599,9 @@ class BCGrounder(nn.Module):
                 enum_direction_b=getattr(self, "enum_direction_b", None),
                 check_arg_source_b=getattr(self, "check_arg_source_b", None),
                 collect_evidence=self.collect_evidence,
+                cartesian_product=self._enum_cartesian,
+                E=self._E,
+                w_last_depth=self._w_last_depth,
             )
 
     # ==================================================================
@@ -807,6 +824,7 @@ class BCGrounder(nn.Module):
             self.kb.constant_no, self.kb.padding_idx, self.effective_total_G,
             body_count=states["body_count"],
             collected_bcount=states["collected_bcount"],
+            collect_mode=self._collect_mode,
         )
 
         states["collected_body"] = cb

@@ -245,6 +245,10 @@ class RulePattern:
              "arg1_var": body[j, 2].item()}
             for j in range(body_len)]
 
+        # Save original order before reordering (needed by _reorder_body_with_anchor)
+        self._orig_body_patterns = list(self.body_patterns)
+        self._orig_body_pred_indices = list(self.body_pred_indices)
+
         self._reorder_body()
 
     def _binding(self, val: int) -> int:
@@ -297,10 +301,110 @@ class RulePattern:
         self.body_patterns = [self.body_patterns[i] for i in order]
         self.body_pred_indices = [self.body_pred_indices[i] for i in order]
 
+    def _reorder_body_with_anchor(
+        self, forced_first: int,
+    ) -> Tuple[List, List, List]:
+        """Variant of _reorder_body that forces a specific body atom first.
+
+        Operates on the original (pre-reorder) body patterns.
+
+        Args:
+            forced_first: Index into the original body atom list to place first.
+
+        Returns:
+            (body_patterns, body_pred_indices, enum_meta) — new lists,
+            ``self`` is not mutated.
+        """
+        known = {BINDING_HEAD_VAR0, BINDING_HEAD_VAR1}
+        remaining = list(range(self.num_body))
+        order: List[int] = []
+        meta: List[dict] = []
+
+        # ── Force the specified atom first ──
+        bp = self._orig_body_patterns[forced_first]
+        b0, b1 = bp["arg0_binding"], bp["arg1_binding"]
+        if b0 in known and b1 in known:
+            m = {"introduces_fv": -1, "enum_bound_src": 0,
+                 "enum_direction": 0, "enum_pred": bp["pred_idx"]}
+        elif b0 in known:
+            m = {"introduces_fv": b1 - BINDING_FREE_VAR_OFFSET,
+                 "enum_bound_src": b0, "enum_direction": 0,
+                 "enum_pred": bp["pred_idx"]}
+            known.add(b1)
+        elif b1 in known:
+            m = {"introduces_fv": b0 - BINDING_FREE_VAR_OFFSET,
+                 "enum_bound_src": b1, "enum_direction": 1,
+                 "enum_pred": bp["pred_idx"]}
+            known.add(b0)
+        else:
+            m = {"introduces_fv": -1, "enum_bound_src": 0,
+                 "enum_direction": 0, "enum_pred": bp["pred_idx"]}
+        order.append(forced_first)
+        meta.append(m)
+        remaining.remove(forced_first)
+
+        # ── Greedy for the rest (same logic as _reorder_body) ──
+        while remaining:
+            found = False
+            for idx in remaining:
+                bp = self._orig_body_patterns[idx]
+                b0, b1 = bp["arg0_binding"], bp["arg1_binding"]
+                if b0 in known or b1 in known:
+                    if b0 in known and b1 in known:
+                        m = {"introduces_fv": -1, "enum_bound_src": 0,
+                             "enum_direction": 0, "enum_pred": bp["pred_idx"]}
+                    elif b0 in known:
+                        m = {"introduces_fv": b1 - BINDING_FREE_VAR_OFFSET,
+                             "enum_bound_src": b0, "enum_direction": 0,
+                             "enum_pred": bp["pred_idx"]}
+                        known.add(b1)
+                    else:
+                        m = {"introduces_fv": b0 - BINDING_FREE_VAR_OFFSET,
+                             "enum_bound_src": b1, "enum_direction": 1,
+                             "enum_pred": bp["pred_idx"]}
+                        known.add(b0)
+                    order.append(idx)
+                    meta.append(m)
+                    remaining.remove(idx)
+                    found = True
+                    break
+            if not found:
+                for idx in remaining:
+                    order.append(idx)
+                    meta.append({"introduces_fv": -1, "enum_bound_src": 0,
+                                 "enum_direction": 0,
+                                 "enum_pred": self._orig_body_patterns[idx]["pred_idx"]})
+                break
+
+        return (
+            [self._orig_body_patterns[i] for i in order],
+            [self._orig_body_pred_indices[i] for i in order],
+            meta,
+        )
+
 
 # ======================================================================
 # RuleIndexEnum — adds binding analysis + enum metadata tensors
 # ======================================================================
+
+class _PatternVariant:
+    """Lightweight anchor variant of a RulePattern (duck-typed)."""
+
+    __slots__ = ('rule_idx', 'head_pred_idx', 'num_body', 'num_free',
+                 'body_patterns', 'body_pred_indices', 'enum_meta')
+
+    def __init__(
+        self, base: RulePattern,
+        body_patterns: List, body_pred_indices: List, enum_meta: List,
+    ) -> None:
+        self.rule_idx = base.rule_idx
+        self.head_pred_idx = base.head_pred_idx
+        self.num_body = base.num_body
+        self.num_free = base.num_free
+        self.body_patterns = body_patterns
+        self.body_pred_indices = body_pred_indices
+        self.enum_meta = enum_meta
+
 
 class RuleIndexEnum(RuleIndex):
     """Rule index with binding analysis and enum metadata.
@@ -320,6 +424,7 @@ class RuleIndexEnum(RuleIndex):
         predicate_no: Optional[int] = None,
         padding_idx: int = 0,
         device: torch.device,
+        all_anchors: bool = False,
         **kwargs,
     ) -> None:
         super().__init__(
@@ -330,16 +435,30 @@ class RuleIndexEnum(RuleIndex):
         R = self.rules_heads_sorted.size(0)
 
         # Per-rule binding analysis
-        self.patterns: List[RulePattern] = [
+        base_patterns: List[RulePattern] = [
             RulePattern(i, self.rules_heads_sorted[i],
                         self.rules_bodies_sorted[i],
                         int(self.rule_lens_sorted[i].item()), constant_no)
             for i in range(R)]
 
+        # Expand patterns when all_anchors=True: one variant per body atom
+        if all_anchors:
+            self.patterns = []
+            for p in base_patterns:
+                for j in range(p.num_body):
+                    bp, bpi, em = p._reorder_body_with_anchor(j)
+                    self.patterns.append(_PatternVariant(p, bp, bpi, em))
+            # Keep originals for FC / fp_global
+            self._original_patterns = base_patterns
+        else:
+            self.patterns = base_patterns
+
+        Rp = len(self.patterns)  # expanded pattern count
+
         self.max_body: int = max(
             (p.num_body for p in self.patterns), default=1)
         M = self.max_body
-        Rt = max(R, 1)
+        Rt = max(Rp, 1)
 
         # Tensorize rule metadata
         head_preds = torch.zeros(Rt, dtype=torch.long, device=device)
@@ -375,17 +494,49 @@ class RuleIndexEnum(RuleIndex):
         self.register_buffer("enum_dir", enum_dir)
         self.register_buffer("arg_source", arg_source)
 
-        # Predicate → rule clustering (derived from base segment offsets)
+        # Predicate → rule clustering
         P = num_predicates
-        R_eff = self._max_rule_pairs
-        all_preds = torch.arange(P, device=device).clamp(
-            0, self._seg_offsets.shape[0] - 2)
-        seg_starts = self._seg_offsets[all_preds]          # [P]
-        seg_counts = self._seg_offsets[all_preds + 1] - seg_starts  # [P]
-        pos = torch.arange(R_eff, device=device).unsqueeze(0)  # [1, R_eff]
-        pred_rule_indices = (seg_starts.unsqueeze(1) + pos).clamp(
-            0, max(R - 1, 0))
-        pred_rule_mask = pos < seg_counts.unsqueeze(1)
+        if all_anchors:
+            # Rebuild clustering for expanded pattern set
+            expanded_head_preds = head_preds[:Rp]
+            uniq, cnts = torch.unique(expanded_head_preds, sorted=True,
+                                      return_counts=True)
+            R_eff = int(cnts.max().item()) if cnts.numel() > 0 else 1
+            self._max_rule_pairs = R_eff
+
+            # Sort expanded patterns by head predicate for CSR-style indexing
+            sort_order = torch.argsort(expanded_head_preds, stable=True)
+            # Build per-predicate start/count
+            sorted_hp = expanded_head_preds[sort_order]
+            uniq_s, cnts_s = torch.unique_consecutive(
+                sorted_hp, return_counts=True)
+            seg_offsets_exp = torch.zeros(P + 1, dtype=torch.long,
+                                         device=device)
+            cum = cnts_s.cumsum(0)
+            mask = uniq_s < P
+            seg_offsets_exp[uniq_s[mask] + 1] = cum[mask]
+            seg_offsets_exp = seg_offsets_exp.cummax(0).values
+
+            all_preds_t = torch.arange(P, device=device).clamp(
+                0, seg_offsets_exp.shape[0] - 2)
+            seg_starts = seg_offsets_exp[all_preds_t]
+            seg_counts = seg_offsets_exp[all_preds_t + 1] - seg_starts
+            pos = torch.arange(R_eff, device=device).unsqueeze(0)
+            # Map back through sort_order to expanded pattern indices
+            pred_rule_indices = (seg_starts.unsqueeze(1) + pos).clamp(
+                0, max(Rp - 1, 0))
+            pred_rule_indices = sort_order[pred_rule_indices]
+            pred_rule_mask = pos < seg_counts.unsqueeze(1)
+        else:
+            R_eff = self._max_rule_pairs
+            all_preds_t = torch.arange(P, device=device).clamp(
+                0, self._seg_offsets.shape[0] - 2)
+            seg_starts = self._seg_offsets[all_preds_t]          # [P]
+            seg_counts = self._seg_offsets[all_preds_t + 1] - seg_starts  # [P]
+            pos = torch.arange(R_eff, device=device).unsqueeze(0)  # [1, R_eff]
+            pred_rule_indices = (seg_starts.unsqueeze(1) + pos).clamp(
+                0, max(R - 1, 0))
+            pred_rule_mask = pos < seg_counts.unsqueeze(1)
 
         self.register_buffer("pred_rule_indices", pred_rule_indices)
         self.register_buffer("pred_rule_mask", pred_rule_mask)

@@ -271,12 +271,9 @@ def collect_groundings(
     effective_total_G: int,
     body_count: Tensor,          # [B, S]
     collected_bcount: Tensor,    # [B, tG]
+    collect_mode: str = "terminal",
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Collect completed groundings into output buffer (TS-specific).
-
-    A state is terminal when all proof goals are padding (resolved).
-    Ground facts are already removed by prune_ground_facts_exists,
-    and atoms are left-aligned by compact_atoms.
 
     Args:
         grounding_body: [B, S, G_body, 3] current grounding bodies (accumulated)
@@ -291,6 +288,8 @@ def collect_groundings(
         effective_total_G: max number of collected groundings (tG)
         body_count: [B, S] number of valid body atoms per state
         collected_bcount: [B, tG] accumulated body counts
+        collect_mode: 'terminal' (all goals padding) or 'grounded' (goals
+            may contain grounded unknowns — for the u-variant / nesy scoring).
 
     Returns:
         out_body:    [B, tG, G_body, 3] updated collected bodies
@@ -306,14 +305,22 @@ def collect_groundings(
 
     is_padding = (proof_goals[:, :, :, 0] == pad_idx)  # [B, S, G]
 
-    # Terminal = all goals are padding (all resolved)
-    all_goals_done = is_padding.all(dim=2)
-
     body_args = grounding_body[:, :, :, 1:3]
     body_active = (grounding_body[:, :, :, 0] != pad_idx)   # [B, S, G_body]
     is_ground = ((body_args < E) | ~body_active.unsqueeze(-1)).all(dim=-1).all(dim=-1)
 
-    valid_grounding = all_goals_done & is_ground & state_valid
+    if collect_mode == "grounded":
+        # Accept states where all goals are either padding or grounded
+        # (no variables). Remaining grounded goals are open unknowns
+        # for downstream nesy scoring.
+        goal_args = proof_goals[:, :, :, 1:3]             # [B, S, G, 2]
+        goal_grounded = (goal_args < E).all(dim=-1)        # [B, S, G]
+        all_goals_ok = (is_padding | goal_grounded).all(dim=2)
+    else:
+        # Terminal: all goals must be padding (fully resolved)
+        all_goals_ok = is_padding.all(dim=2)
+
+    valid_grounding = all_goals_ok & is_ground & state_valid
 
     n_new = S
     body_new = grounding_body
