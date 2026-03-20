@@ -3,7 +3,10 @@ name = "nesyground"
 version = "0.1.0"
 description = "NeSyGround: Compiled CUDA-graph-safe FOL grounding for neuro-symbolic reasoning"
 requires-python = ">=3.10"
-dependencies = ["torch>=2.0"]
+dependencies = [
+    "torch>=2.0",
+    "torch-kge-kernels @ git+https://github.com/rodrigo-castellano/torch-kge-kernels.git@f05255ddb118a415c4f92c5f2f4da0a15d487114",
+]
 license = "MIT"
 readme = "README.md"
 

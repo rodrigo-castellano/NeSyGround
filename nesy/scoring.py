@@ -1,379 +1,207 @@
-"""Unified KGE scoring primitives.
-
-Three core functions that work with any KGE model implementing either:
-
-* **torch-ns interface** (``experiments/model.py``)::
-
-      model.score_atoms(preds, subjs, objs) -> Tensor
-
-* **kge_module interface** (``kge_module/core/architectures.py``)::
-
-      model.score_triples(h, r, t) -> Tensor
-      model.score_all_tails_batch(h, r) -> Tensor   # [B, E]
-      model.score_all_heads_batch(r, t) -> Tensor   # [B, E]
-
-The primitives auto-detect the available methods and dispatch accordingly.
-
-Scoring variants:
-  kge_score_triples()      — score explicit (h, r, t) triples
-  kge_score_all_tails()    — score all entities as tails, with optional filter/domain
-  kge_score_all_heads()    — score all entities as heads, with optional filter/domain
-  kge_score_k_tails()      — score K sampled tail corruptions via Sampler
-  kge_score_k_heads()      — score K sampled head corruptions via Sampler
-
-Also provides precomputed partial scoring:
-  precompute_partial_scores() — build [P, E] lookup tables (once at init)
-  score_partial_atoms() — pure tensor indexing (CUDA graph safe)
-"""
+"""Shared grounder adapter around the torch-kge-kernels scoring kernels."""
 
 from __future__ import annotations
 
-from typing import Optional, Set, Dict, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from kge_kernels.partial import precompute_partial_scores as _precompute_partial_scores
+from kge_kernels.partial import score_partial_atoms
+from kge_kernels.scoring import score as _score
+from kge_kernels.types import KGEBackend
 
-def kge_score_triples(
-    model: nn.Module,
-    h: Tensor,       # [N] head entity indices
-    r: Tensor,       # [N] relation indices
-    t: Tensor,       # [N] tail entity indices
-) -> Tensor:         # [N] scores (sigmoid-normalized)
-    """Score ground triples.
 
-    Uses ``model.score_triples(h, r, t)`` if available,
-    otherwise falls back to ``model.score_atoms(preds=r, subjs=h, objs=t)``.
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    actual = model.module if isinstance(model, nn.DataParallel) else model
+    if hasattr(actual, "_orig_mod"):
+        actual = actual._orig_mod
+    return actual
 
-    Returns sigmoid-normalized scores.
-    """
-    if hasattr(model, 'score_triples'):
-        raw = model.score_triples(h, r, t)
+
+def _num_entities(model: nn.Module) -> int:
+    actual = _unwrap_model(model)
+    if hasattr(actual, "num_constants"):
+        return int(actual.num_constants)
+    if hasattr(actual, "num_entities"):
+        return int(actual.num_entities)
+    raise AttributeError("Model adapter requires num_constants or num_entities for fallback batched scoring")
+
+
+def _score_triples_sigmoid(model: nn.Module, h: Tensor, r: Tensor, t: Tensor) -> Tensor:
+    actual = _unwrap_model(model)
+    if hasattr(actual, "score_triples"):
+        raw = actual.score_triples(h, r, t)
+    elif hasattr(actual, "score_atoms"):
+        raw = actual.score_atoms(r, h, t)
     else:
-        raw = model.score_atoms(r, h, t)
+        raise AttributeError("Model adapter requires score_triples(...) or score_atoms(preds, subjs, objs)")
     return torch.sigmoid(raw)
+
+
+def _score_all_tails_sigmoid(model: nn.Module, h: Tensor, r: Tensor) -> Tensor:
+    actual = _unwrap_model(model)
+    if hasattr(actual, "score_all_tails_batch"):
+        return torch.sigmoid(actual.score_all_tails_batch(h, r))
+
+    batch_size = h.shape[0]
+    num_entities = _num_entities(actual)
+    device = h.device
+    all_tails = torch.arange(num_entities, device=device).unsqueeze(0).expand(batch_size, -1)
+    h_exp = h.unsqueeze(1).expand_as(all_tails).reshape(-1)
+    if r.dim() == 0:
+        r_exp = r.expand(batch_size * num_entities)
+    else:
+        r_exp = r.unsqueeze(1).expand_as(all_tails).reshape(-1)
+    t_exp = all_tails.reshape(-1)
+    return _score_triples_sigmoid(actual, h_exp, r_exp, t_exp).view(batch_size, num_entities)
+
+
+def _score_all_heads_sigmoid(model: nn.Module, r: Tensor, t: Tensor) -> Tensor:
+    actual = _unwrap_model(model)
+    if hasattr(actual, "score_all_heads_batch"):
+        return torch.sigmoid(actual.score_all_heads_batch(r, t))
+
+    batch_size = t.shape[0]
+    num_entities = _num_entities(actual)
+    device = t.device
+    all_heads = torch.arange(num_entities, device=device).unsqueeze(0).expand(batch_size, -1)
+    h_exp = all_heads.reshape(-1)
+    if r.dim() == 0:
+        r_exp = r.expand(batch_size * num_entities)
+    else:
+        r_exp = r.unsqueeze(1).expand_as(all_heads).reshape(-1)
+    t_exp = t.unsqueeze(1).expand_as(all_heads).reshape(-1)
+    return _score_triples_sigmoid(actual, h_exp, r_exp, t_exp).view(batch_size, num_entities)
+
+
+def _build_backend(model: nn.Module) -> KGEBackend:
+    return KGEBackend(
+        score_triples=lambda h, r, t: _score_triples_sigmoid(model, h, r, t),
+        score_all_tails=lambda h, r: _score_all_tails_sigmoid(model, h, r),
+        score_all_heads=lambda r, t: _score_all_heads_sigmoid(model, r, t),
+    )
+
+
+def _stack_rht(r: Tensor, h: Tensor, t: Tensor) -> Tensor:
+    if r.dim() == 0:
+        r = r.expand(h.shape[0])
+    return torch.stack([r, h, t], dim=1)
+
+
+def _apply_masks(
+    scores: Tensor,
+    idx1: Tensor,
+    idx2: Tensor,
+    filter_map: Optional[Dict[Tuple[int, int], Set[int]]],
+    true_entities: Optional[Tensor],
+    domain: Optional[Set[int]],
+) -> None:
+    batch_size, num_entities = scores.shape
+    device = scores.device
+
+    if domain is not None:
+        domain_mask = torch.zeros(num_entities, dtype=torch.bool, device=device)
+        domain_mask[torch.tensor(sorted(domain), dtype=torch.long, device=device)] = True
+        scores[:, ~domain_mask] = float("-inf")
+
+    if filter_map is not None and true_entities is not None:
+        idx1_list = idx1.tolist() if idx1.dim() > 0 else [int(idx1.item())] * batch_size
+        idx2_list = idx2.tolist() if idx2.dim() > 0 else [int(idx2.item())] * batch_size
+        for row in range(batch_size):
+            key = (int(idx1_list[row]), int(idx2_list[row]))
+            known = filter_map.get(key)
+            if known:
+                true_ent = int(true_entities[row].item())
+                filtered = [ent for ent in known if ent != true_ent]
+                if filtered:
+                    scores[row, torch.tensor(filtered, dtype=torch.long, device=device)] = float("-inf")
+
+
+def kge_score_triples(model: nn.Module, h: Tensor, r: Tensor, t: Tensor) -> Tensor:
+    triples = _stack_rht(r, h, t)
+    return _score(_build_backend(model), triples, mode="triples").scores
 
 
 def kge_score_all_tails(
     model: nn.Module,
-    h: Tensor,       # [B] head entity indices
-    r: Tensor,       # [B] or scalar — relation indices
+    h: Tensor,
+    r: Tensor,
     *,
     filter_map: Optional[Dict[Tuple[int, int], Set[int]]] = None,
-    true_tails: Optional[Tensor] = None,   # [B] true tail indices (kept unmasked)
+    true_tails: Optional[Tensor] = None,
     domain: Optional[Set[int]] = None,
-) -> Tensor:         # [B, num_entities] scores
-    """Score all possible tails for given (h, r) pairs.
-
-    Uses ``model.score_all_tails_batch(h, r)`` if available,
-    otherwise expands (h, r) against every entity and calls score_triples/score_atoms.
-
-    Optional filtering:
-        filter_map: Dict[(h, r) -> Set[t]] of known facts to mask to -inf
-                    (except true_tails which are preserved).
-        true_tails: [B] true tail indices — excluded from filter masking.
-        domain: Set of valid tail entity indices; non-domain entities get -inf.
-    """
-    if hasattr(model, 'score_all_tails_batch'):
-        scores = torch.sigmoid(model.score_all_tails_batch(h, r))
-    else:
-        B = h.shape[0]
-        E: int = model.num_constants
-        dev = h.device
-        h_exp = h.unsqueeze(1).expand(B, E).reshape(-1)
-        r_exp = r.unsqueeze(1).expand(B, E).reshape(-1) if r.dim() > 0 else r.expand(B * E)
-        t_all = torch.arange(E, device=dev).unsqueeze(0).expand(B, E).reshape(-1)
-        scores = kge_score_triples(model, h_exp, r_exp, t_all).view(B, E)
-
-    _apply_masks(scores, h, r, filter_map, true_tails, domain, role='tail')
+) -> Tensor:
+    anchor_t = true_tails if true_tails is not None else torch.zeros_like(h)
+    triples = _stack_rht(r, h, anchor_t)
+    scores = _score(_build_backend(model), triples, mode="tail").scores
+    _apply_masks(scores, h, r, filter_map, true_tails, domain)
     return scores
 
 
 def kge_score_all_heads(
     model: nn.Module,
-    r: Tensor,       # [B] or scalar — relation indices
-    t: Tensor,       # [B] tail entity indices
+    r: Tensor,
+    t: Tensor,
     *,
     filter_map: Optional[Dict[Tuple[int, int], Set[int]]] = None,
-    true_heads: Optional[Tensor] = None,   # [B] true head indices (kept unmasked)
+    true_heads: Optional[Tensor] = None,
     domain: Optional[Set[int]] = None,
-) -> Tensor:         # [B, num_entities] scores
-    """Score all possible heads for given (r, t) pairs.
-
-    Uses ``model.score_all_heads_batch(r, t)`` if available,
-    otherwise expands (r, t) against every entity and calls score_triples/score_atoms.
-
-    Optional filtering:
-        filter_map: Dict[(r, t) -> Set[h]] of known facts to mask to -inf
-                    (except true_heads which are preserved).
-        true_heads: [B] true head indices — excluded from filter masking.
-        domain: Set of valid head entity indices; non-domain entities get -inf.
-    """
-    if hasattr(model, 'score_all_heads_batch'):
-        scores = torch.sigmoid(model.score_all_heads_batch(r, t))
-    else:
-        B = t.shape[0]
-        E: int = model.num_constants
-        dev = t.device
-        t_exp = t.unsqueeze(1).expand(B, E).reshape(-1)
-        r_exp = r.unsqueeze(1).expand(B, E).reshape(-1) if r.dim() > 0 else r.expand(B * E)
-        h_all = torch.arange(E, device=dev).unsqueeze(0).expand(B, E).reshape(-1)
-        scores = kge_score_triples(model, h_all, r_exp, t_exp).view(B, E)
-
-    _apply_masks(scores, r, t, filter_map, true_heads, domain, role='head')
+) -> Tensor:
+    anchor_h = true_heads if true_heads is not None else torch.zeros_like(t)
+    triples = _stack_rht(r, anchor_h, t)
+    scores = _score(_build_backend(model), triples, mode="head").scores
+    _apply_masks(scores, r, t, filter_map, true_heads, domain)
     return scores
-
-
-def _apply_masks(
-    scores: Tensor,          # [B, E] — modified in-place
-    idx1: Tensor,            # [B] first index for filter key
-    idx2: Tensor,            # [B] or scalar — second index for filter key
-    filter_map: Optional[Dict[Tuple[int, int], Set[int]]],
-    true_entities: Optional[Tensor],
-    domain: Optional[Set[int]],
-    role: str,
-) -> None:
-    """Apply domain and known-fact masks in-place."""
-    B, E = scores.shape
-    device = scores.device
-
-    if domain is not None:
-        domain_mask = torch.zeros(E, dtype=torch.bool, device=device)
-        domain_mask[torch.tensor(sorted(domain), dtype=torch.long, device=device)] = True
-        scores[:, ~domain_mask] = float("-inf")
-
-    if filter_map is not None and true_entities is not None:
-        idx1_list = idx1.tolist() if idx1.dim() > 0 else [idx1.item()] * B
-        idx2_list = idx2.tolist() if idx2.dim() > 0 else [idx2.item()] * B
-        for i in range(B):
-            if role == 'tail':
-                key = (int(idx1_list[i]), int(idx2_list[i]))  # (h, r)
-            else:
-                key = (int(idx1_list[i]), int(idx2_list[i]))  # (r, t)
-            known = filter_map.get(key)
-            if known:
-                true_ent = true_entities[i].item()
-                indices = torch.tensor(
-                    [e for e in known if e != true_ent],
-                    dtype=torch.long, device=device,
-                )
-                if indices.numel() > 0:
-                    scores[i, indices] = float("-inf")
 
 
 def kge_score_k_tails(
     model: nn.Module,
-    h: Tensor,       # [B] head entity indices
-    r: Tensor,       # [B] relation indices
-    t: Tensor,       # [B] true tail indices
-    sampler: object,  # nn.sampler.Sampler instance
+    h: Tensor,
+    r: Tensor,
+    t: Tensor,
+    sampler: object,
     num_corruptions: int,
 ) -> Tuple[Tensor, Tensor]:
-    """Score K sampled tail corruptions via Sampler + kge_score_triples.
-
-    Returns:
-        scores: [B, 1 + K] scores — position 0 is the true triple.
-        is_valid: [B, K] bool mask for valid corruptions.
-    """
-    device = h.device
-    B = h.shape[0]
-    # Build query triples in (r, h, t) format for the Sampler
-    queries = torch.stack([r, h, t], dim=1)  # [B, 3]
-    neg = sampler.corrupt(queries, num_negatives=num_corruptions, mode='tail')  # [B, K, 3] in (r,h,t)
-    K = neg.shape[1]
-
-    # Score positive
-    pos_scores = kge_score_triples(model, h, r, t)  # [B]
-
-    # Score negatives: neg is (r, h, t) format
-    neg_h = neg[:, :, 1].reshape(-1)  # [B*K]
-    neg_r = neg[:, :, 0].reshape(-1)  # [B*K]
-    neg_t = neg[:, :, 2].reshape(-1)  # [B*K]
-    neg_scores = kge_score_triples(model, neg_h, neg_r, neg_t).view(B, K)
-
-    is_valid = neg.sum(dim=-1) > 0  # [B, K] — zero triples are padding
-    neg_scores[~is_valid] = float("-inf")
-
-    scores = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)  # [B, 1+K]
-    return scores, is_valid
+    triples = _stack_rht(r, h, t)
+    out = _score(_build_backend(model), triples, mode="tail", num_corruptions=num_corruptions, sampler=sampler)
+    assert out.valid_mask is not None
+    return out.scores, out.valid_mask
 
 
 def kge_score_k_heads(
     model: nn.Module,
-    h: Tensor,       # [B] true head indices
-    r: Tensor,       # [B] relation indices
-    t: Tensor,       # [B] tail entity indices
-    sampler: object,  # nn.sampler.Sampler instance
+    h: Tensor,
+    r: Tensor,
+    t: Tensor,
+    sampler: object,
     num_corruptions: int,
 ) -> Tuple[Tensor, Tensor]:
-    """Score K sampled head corruptions via Sampler + kge_score_triples.
-
-    Returns:
-        scores: [B, 1 + K] scores — position 0 is the true triple.
-        is_valid: [B, K] bool mask for valid corruptions.
-    """
-    device = h.device
-    B = h.shape[0]
-    # Build query triples in (r, h, t) format for the Sampler
-    queries = torch.stack([r, h, t], dim=1)  # [B, 3]
-    neg = sampler.corrupt(queries, num_negatives=num_corruptions, mode='head')  # [B, K, 3] in (r,h,t)
-    K = neg.shape[1]
-
-    # Score positive
-    pos_scores = kge_score_triples(model, h, r, t)  # [B]
-
-    # Score negatives: neg is (r, h, t) format
-    neg_h = neg[:, :, 1].reshape(-1)  # [B*K]
-    neg_r = neg[:, :, 0].reshape(-1)  # [B*K]
-    neg_t = neg[:, :, 2].reshape(-1)  # [B*K]
-    neg_scores = kge_score_triples(model, neg_h, neg_r, neg_t).view(B, K)
-
-    is_valid = neg.sum(dim=-1) > 0  # [B, K] — zero triples are padding
-    neg_scores[~is_valid] = float("-inf")
-
-    scores = torch.cat([pos_scores.unsqueeze(1), neg_scores], dim=1)  # [B, 1+K]
-    return scores, is_valid
+    triples = _stack_rht(r, h, t)
+    out = _score(_build_backend(model), triples, mode="head", num_corruptions=num_corruptions, sampler=sampler)
+    assert out.valid_mask is not None
+    return out.scores, out.valid_mask
 
 
-# ======================================================================
-# Precomputed partial scoring
-# ======================================================================
-
-@torch.no_grad()
 def precompute_partial_scores(
     kge_model: nn.Module,
-    pred_remap: Tensor,    # [P_im] → KGE relation id (-1 if unmapped)
-    const_remap: Tensor,   # [E_im] → KGE entity id (-1 if unmapped)
-    batch_chunk: int = 0,  # 0 = auto based on GPU memory
+    pred_remap: Tensor,
+    const_remap: Tensor,
+    batch_chunk: int = 64,
     entity_chunk: int = 2048,
 ) -> Tuple[Tensor, Tensor]:
-    """Precompute max_tail_score[P, E] and max_head_score[P, E].
-
-    For each (pred, entity) pair:
-      max_tail_score[p, h] = max_t sigmoid(score(h, p, t)) — best tail for pred(h, ?)
-      max_head_score[p, t] = max_h sigmoid(score(h, p, t)) — best head for pred(?, t)
-
-    Uses kge_score_all_tails / kge_score_all_heads with chunking.
-    One call per unique relation. ~1-10s depending on dataset.
-
-    Memory: 2 * P * E * 4 bytes (family=284KB, fb15k237=28MB, yago=37MB).
-
-    Returns:
-        max_tail_score: [P_im, E_im] float tensor
-        max_head_score: [P_im, E_im] float tensor
-    """
-    device = const_remap.device
-    P_im = pred_remap.shape[0]
-    E_im = const_remap.shape[0]
-
-    max_tail_score = torch.zeros(P_im, E_im, dtype=torch.float32, device=device)
-    max_head_score = torch.zeros(P_im, E_im, dtype=torch.float32, device=device)
-
-    valid_preds = (pred_remap >= 0).nonzero(as_tuple=True)[0]
-    valid_ents = (const_remap >= 0).nonzero(as_tuple=True)[0]
-    n_ents = valid_ents.shape[0]
-
-    if n_ents == 0 or valid_preds.shape[0] == 0:
-        return max_tail_score, max_head_score
-
-    # Auto batch chunk: target ~2 GB peak
-    if batch_chunk <= 0:
-        dim = 512
-        if hasattr(kge_model, 'ent_re'):
-            dim = kge_model.ent_re.weight.shape[1]
-        elif hasattr(kge_model, 'embedding_dim'):
-            dim = kge_model.embedding_dim
-        bytes_per_elem = entity_chunk * dim * 4 * 2
-        batch_chunk = max(8, min(512, int(2e9 / bytes_per_elem)))
-
-    kge_ents = const_remap[valid_ents]  # [n_ents] KGE entity ids
-
-    for im_pred in valid_preds:
-        kge_rel = pred_remap[im_pred]
-
-        # max_tail_score: for each entity as head, max over all tails
-        tail_scores = _partial_score_chunked(
-            kge_model, kge_ents, kge_rel, role=0, batch_chunk=batch_chunk)
-        max_tail_score[im_pred, valid_ents] = tail_scores
-
-        # max_head_score: for each entity as tail, max over all heads
-        head_scores = _partial_score_chunked(
-            kge_model, kge_ents, kge_rel, role=1, batch_chunk=batch_chunk)
-        max_head_score[im_pred, valid_ents] = head_scores
-
-    return max_tail_score, max_head_score
+    del entity_chunk
+    return _precompute_partial_scores(_build_backend(kge_model), pred_remap, const_remap, batch_chunk=batch_chunk)
 
 
-def _partial_score_chunked(
-    kge_model: nn.Module,
-    kge_ents: Tensor,    # [E] KGE entity ids
-    kge_rel: Tensor,     # scalar KGE relation id
-    role: int,           # 0 = entities as heads, 1 = entities as tails
-    batch_chunk: int = 64,
-) -> Tensor:
-    """Compute max-over-completions for each entity, chunked to avoid OOM."""
-    E = kge_ents.shape[0]
-    device = kge_ents.device
-    result = torch.empty(E, dtype=torch.float32, device=device)
-
-    for start in range(0, E, batch_chunk):
-        end = min(start + batch_chunk, E)
-        chunk = kge_ents[start:end]
-        B = chunk.shape[0]
-        rel_exp = kge_rel.expand(B)
-        if role == 0:
-            raw = kge_score_all_tails(kge_model, chunk, rel_exp)  # [B, E_kge]
-        else:
-            raw = kge_score_all_heads(kge_model, rel_exp, chunk)  # [B, E_kge]
-        result[start:end] = raw.max(dim=1).values
-
-    return result
-
-
-def score_partial_atoms(
-    preds: Tensor,              # [N] predicate indices (IM space)
-    args1: Tensor,              # [N] first arg indices (IM space)
-    args2: Tensor,              # [N] second arg indices (IM space)
-    constant_no: int,
-    max_tail_score: Tensor,     # [P, E]
-    max_head_score: Tensor,     # [P, E]
-) -> Tensor:                    # [N] scores
-    """Score partial atoms via precomputed lookup. Pure tensor indexing.
-
-    pred(const, ?): score = max_tail_score[pred, const]
-    pred(?, const): score = max_head_score[pred, const]
-    pred(?, ?): score = 0
-
-    Branchless — no .any()/.item(), no dynamic-shape indexing.
-    Safe for CUDA graphs and torch.compile.
-    """
-    N = preds.shape[0]
-    device = preds.device
-    scores = torch.zeros(N, dtype=torch.float32, device=device)
-    if N == 0:
-        return scores
-
-    a1 = args1.long()
-    a2 = args2.long()
-    p = preds.long()
-    C = constant_no
-    P, E = max_tail_score.shape
-
-    # Clamp indices to valid range so lookups never OOB.
-    # Wrong entries are zeroed out by torch.where below.
-    safe_p = p.clamp(0, P - 1)
-    safe_a1 = a1.clamp(0, E - 1)
-    safe_a2 = a2.clamp(0, E - 1)
-
-    # pred(const, ?): head is ground, tail is variable
-    tail_var = (a1 > 0) & (a1 <= C) & (a2 > C)
-    tail_scores = max_tail_score[safe_p, safe_a1]           # [N]
-    scores = torch.where(tail_var, tail_scores, scores)
-
-    # pred(?, const): head is variable, tail is ground
-    head_var = (a1 > C) & (a2 > 0) & (a2 <= C)
-    head_scores = max_head_score[safe_p, safe_a2]           # [N]
-    scores = torch.where(head_var, head_scores, scores)
-
-    return scores
+__all__ = [
+    "kge_score_all_heads",
+    "kge_score_all_tails",
+    "kge_score_k_heads",
+    "kge_score_k_tails",
+    "kge_score_triples",
+    "precompute_partial_scores",
+    "score_partial_atoms",
+]
