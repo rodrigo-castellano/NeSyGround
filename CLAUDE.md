@@ -1,100 +1,129 @@
-# CLAUDE.md — NeSyGround (grounder)
+# CLAUDE.md
 
-This file provides guidance to Claude Code when working with the grounder library.
+This file defines repository-wide guidance for the `grounder` repository.
+
+## Scope
+
+- Applies to this `grounder` repository.
+- If this repository is checked out inside another project, also follow that parent repository's local instructions.
+- Keep the same section order in future nested `CLAUDE.md` files so local docs stay predictable.
 
 ## Project Overview
 
-NeSyGround is a compiled CUDA-graph-safe FOL grounding library for neuro-symbolic reasoning. It provides backward-chaining Prolog unification with fixed-shape tensors and `torch.compile` compatibility.
+NeSyGround is a compiled, fixed-shape grounding library for neuro-symbolic reasoning. It provides backward-chaining resolution, filtering, KB indexing, and optional neural/KGE hooks in a form that stays compatible with `torch.compile` and CUDA-graph-friendly execution.
 
-## Environment
+## Architecture
+
+Current package ownership:
+
+- `grounder/data/`: dataset loading, KB construction, fact/rule indexing
+- `grounder/bc/`: backward-chaining execution
+- `grounder/fc/`: forward-chaining execution
+- `grounder/resolution/`: unification primitives, SLD, RTF, enumeration, standardization
+- `grounder/filters/`: search and soundness filters plus hooks
+- `grounder/nesy/`: neural/KGE scoring helpers and hooks
+- `grounder/factory.py`: grounder construction entry point
+- `grounder/types.py`, `grounder/utils.py`: shared types and utilities
+- `grounder/analysis/`: comparison, gold-standard, and depth-generation scripts
+- `grounder/tests/`: unit and regression tests
+- `grounder/docs/`: package documentation
+
+## Running Experiments
+
+This repository is primarily a library, not a training entry point.
+
+Use it in three ways:
+
+- run focused grounder tests from this directory
+- run grounder analysis scripts such as:
 
 ```bash
-conda activate gpu
+cd /path/to/grounder
+python -m grounder.analysis.compare_groundings --help
 ```
 
-## Testing — Verification After Every Change
+Do not add standalone training scripts to `grounder/` unless they are genuinely grounder-specific analysis tools.
 
-**Every change to the grounder lib requires ALL THREE levels of testing.**
+## Logging Experiments
 
-**Run all tests sequentially (never in parallel)** — speed regression tests compare against baselines, so concurrent GPU load would cause false failures.
+- For standalone work, save logs and persistent analysis artifacts under `analysis/`.
+- If this repository is embedded inside another project, keep experiment logs in that parent project's canonical logging location instead of inside `grounder/` source folders.
+- Prefer a dated folder such as `analysis/YYYYMMDD-description/` for each experiment or comparison batch.
+- Keep analysis outputs out of importable library modules.
+- Do not commit ad hoc `.log`, `.json`, or scratch output files into source directories.
 
-### 1. Grounder own tests (run first)
+## Testing
 
-From the grounder directory (`torch-ns/grounder/`):
+Local grounder tests:
 
 ```bash
-cd /home/castellanoontiv/probfol-llm-swarm/main/submodules/torch-ns/grounder
+cd /path/to/grounder
 PYTHONUNBUFFERED=1 python -m pytest tests/ -v
+PYTHONUNBUFFERED=1 python -m pytest tests/test_groundings.py -v
 ```
 
-### 2. torch-ns precommit tests (probfol-llm-swarm)
+Rules:
 
-From the torch-ns root:
+- Run timing-sensitive suites sequentially.
+- Run `tests/test_groundings.py` when grounding counts, resolution, filters, or dataset loading may have changed.
+- If this repository is mirrored into another checkout, sync the changed files there and rerun the relevant integration tests in that mirror as needed.
 
-```bash
-cd /home/castellanoontiv/probfol-llm-swarm/main/submodules/torch-ns
-PYTHONUNBUFFERED=1 python -u tests/run.py precommit
-```
+## Documentation
 
-This runs 3 regression tests: speed, groundings, MRR.
+- Update `grounder/README.md` for public API or usage changes.
+- Update the closest relevant doc in `grounder/docs/` when tensor flow, filters, indexing, or grounding semantics change.
+- If a new analysis script or output convention is introduced, document where its artifacts belong.
+- Keep mirrored copies of the grounder docs conceptually aligned when the code is meant to stay shared across repositories.
 
-### 3. DpRL-KGR parity tests
+## Adding or Changing Code
 
-**Before running**: sync the grounder lib to the DpRL repo (see Syncing below).
+- Each module should own one clear responsibility.
+- Before creating a new file, extend the module that already owns the behavior.
+- Create a new file only when no current module owns that functionality, or when extending the current one would mix unrelated responsibilities.
+- Do not create parallel implementations of the same resolution, filter, or indexing logic unless there is a clear algorithmic distinction.
 
-```bash
-cd /home/castellanoontiv/DpRL-KGR-swarm/main
-PYTHONUNBUFFERED=1 python -m pytest kge_experiments/tests/parity/test_run.py kge_experiments/tests/parity/test_speed_profile.py -v
-```
+Modification discipline:
 
-## Syncing the Grounder Between Repos
+- Prefer modifying one existing owner module over spreading one feature across many files.
+- Do not split one resolution, filter, or indexing responsibility across multiple scripts without a strong architectural reason.
+- Do not create files named `*_new`, `*_v2`, `*_copy`, `tmp_*`, or similar variants.
+- If similar logic already exists in multiple places, consolidate it instead of adding another copy.
+- Shared logic should live in one reusable module; callers should import it rather than duplicate it.
+- New files require a clear reason: missing responsibility, clean extraction of a coherent unit, or reuse by multiple callers.
+- If a new file is created by extraction, remove the superseded duplicated logic from the old location.
 
-The grounder lib is a submodule in two repos:
-- **probfol-llm-swarm**: `main/submodules/torch-ns/grounder/` (origin: grounders_KG.git)
-- **DpRL-KGR-swarm**: `main/grounder/` (origin: NeSyGround.git)
+Placement rules:
 
-After making changes in one, **copy the changed files** to the other before running its tests:
-
-```bash
-# Example: sync from probfol-llm-swarm → DpRL-KGR-swarm
-rsync -av --exclude='__pycache__' --exclude='.git' \
-  /home/castellanoontiv/probfol-llm-swarm/main/submodules/torch-ns/grounder/ \
-  /home/castellanoontiv/DpRL-KGR-swarm/main/grounder/
-```
-
-## Package Structure
-
-```
-grounder/
-├── __init__.py           # Public exports
-├── base.py               # Grounder base class (nn.Module)
-├── bc/                   # Backward chaining core
-├── fc/                   # Forward chaining
-├── resolution/           # Unification / resolution
-├── filters/              # Grounding filters
-├── nesy/                 # Neuro-symbolic scoring interface
-├── data_loader.py        # Dataset loading
-├── fact_index.py         # Fact indexing strategies
-├── rule_index.py         # Rule indexing
-├── factory.py            # Grounder factory
-├── primitives.py         # Core tensor primitives
-├── types.py              # Type definitions
-├── tests/                # Unit tests
-│   ├── test_grounder.py
-│   ├── test_primitives.py
-│   ├── test_fact_index.py
-│   ├── test_packing.py
-│   ├── test_filters.py
-│   ├── test_rtf.py
-│   └── test_datasets.py
-└── docs/                 # Documentation
-```
+- data loading, KB wiring, indexing: `grounder/data/`
+- resolution, substitutions, standardization, search expansion: `grounder/resolution/`
+- backward/forward execution loops: `grounder/bc/`, `grounder/fc/`
+- filter logic and hooks: `grounder/filters/`
+- neural or KGE-assisted scoring: `grounder/nesy/`
+- one-off comparison and reporting scripts: `grounder/analysis/`
 
 ## Coding Standards
 
-- **Static tensor shapes**: All tensors must have fixed shapes for CUDA graph capture
-- **No `.item()` in forward**: Breaks `torch.compile(fullgraph=True)`
-- **No dynamic control flow**: No Python data-dependent branching in compiled paths
-- **Compile per step, not per depth**: `torch.compile` must wrap the single-step function (one depth iteration), not the full multi-depth loop. The outer depth loop stays in plain Python. This avoids CUDA graph explosion at large depths — compiling the full unrolled loop creates a separate graph per depth, causing recompilation and OOM. One compiled step reused D times is both faster and memory-safe.
-- **Tensor shape annotations**: Document shapes as `[B, S, G, 3]` with comments
-- **Type hints**: All function signatures must include type hints
+- Keep tensors statically shaped wherever code is intended for compiled execution.
+- Avoid `.item()` and Python data-dependent branching inside compiled forward/step paths.
+- Compile a single step, not an entire multi-depth loop.
+- Add type hints to function signatures.
+- Document important tensor shapes with comments such as `[B, S, G, 3]`.
+- Prefer vectorized tensor code over Python loops in hot paths.
+- Keep comments concise and focused on non-obvious behavior.
+
+## Technical Rules
+
+- Never revert or restore files without explicit user permission.
+- Fix bugs forward; do not hide them with clamps or silent fallbacks.
+- If a path is meant to run in `torch.compile` / CUDA-graph-friendly mode, solve the root issue there instead of silently switching to a slower dynamic path.
+- Keep timing-sensitive tests and benchmarks sequential.
+- Use a git worktree when you need to compare with an older commit.
+- Keep mirrored grounder copies synchronized when the intent is shared behavior across repos.
+- Do not leave scratch artifacts inside package directories.
+- Prefer the smallest coherent change that keeps one owner per responsibility; avoid scattering one feature across multiple modules.
+
+## Verification Checklist
+
+- any `grounder/` code change: `cd grounder && python -m pytest tests/ -v`
+- grounding semantics or counts changed: `cd grounder && python -m pytest tests/test_groundings.py -v`
+- mirrored change intended: sync the other grounder copy or checkout and rerun its relevant tests
