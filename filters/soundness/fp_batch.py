@@ -94,9 +94,6 @@ def apply_fp_batch(
         atom_ok = is_fact | in_proved | ~body_active
         new_proved = atom_ok.all(dim=-1) & mask
 
-        # Early exit if converged
-        if (new_proved == proved).all():
-            break
         proved = new_proved
 
     return proved

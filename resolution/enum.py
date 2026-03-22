@@ -457,11 +457,21 @@ def resolve_enum(
         B, Re, G_use, M, qs, qo, cands_a,
         check_arg_source_a[active_idx], body_preds_q,
     )
+    # Resolve body atoms with unresolved free variables (binding >= 3)
+    # before the exists check. Without this, rules with 2+ free variables
+    # (e.g. neighborOf(X,Y), neighborOf(Y,K), locatedInCR(K,Z)) get
+    # garbage values for K and fail the exists check at width=0.
+    body_a = _resolve_free_vars(
+        body_a, check_arg_source_a[active_idx], fact_index, active_idx)
     exists_a = fact_index.exists(
         body_a.reshape(-1, 3)).view(B, Re, G_use, M)
 
     atom_idx = torch.arange(M, device=dev).view(1, 1, 1, M)
     body_active = atom_idx < num_body_q.view(B, Re, 1, 1)
+
+    # Ensure inactive body atoms have padding predicates so downstream
+    # prune_ground_facts recognizes them as padding (not spurious atoms).
+    body_a = body_a.masked_fill(~body_active.unsqueeze(-1), fact_index._padding_idx)
 
     mask_a = _apply_enum_filters(
         body_a, exists_a, body_active, active_mask, cmask_a,
@@ -488,6 +498,8 @@ def resolve_enum(
             B, Re, G_use_b, M, qs, qo, cands_b,
             check_arg_source_b[active_idx], body_preds_q,
         )
+        body_b = _resolve_free_vars(
+            body_b, check_arg_source_b[active_idx], fact_index, active_idx)
         exists_b = fact_index.exists(
             body_b.reshape(-1, 3)).view(B, Re, G_use_b, M)
         body_active_b = atom_idx < num_body_q.view(B, Re, 1, 1)
@@ -561,6 +573,8 @@ def resolve_enum_full(
         B, Re, E, M, qs, qo, candidates,
         check_arg_source_a[active_idx], body_preds_q,
     )
+    body_atoms = _resolve_free_vars(
+        body_atoms, check_arg_source_a[active_idx], fact_index, active_idx)
 
     # Query exclusion only (no width filtering for full enum)
     atom_idx = torch.arange(M, device=dev).view(1, 1, 1, M)
@@ -647,16 +661,114 @@ def _fill_body(
     source = torch.stack([q_s, q_o, candidates], dim=3)       # [B, Re, G_use, 3]
     source_exp = source.unsqueeze(3).expand(-1, -1, -1, M, -1)  # [B, Re, G_use, M, 3]
 
-    idx_0 = check_arg_source_q[:, :, :, 0].view(
+    # Clamp source indices to [0, 2]: values >= 3 are unresolved free variables
+    # which produce invalid body atoms (safely filtered out by exists-check).
+    idx_0 = check_arg_source_q[:, :, :, 0].clamp(max=2).view(
         B, Re, 1, M).expand(-1, -1, G_use, -1)
     arg0 = source_exp.gather(4, idx_0.unsqueeze(-1)).squeeze(-1)
 
-    idx_1 = check_arg_source_q[:, :, :, 1].view(
+    idx_1 = check_arg_source_q[:, :, :, 1].clamp(max=2).view(
         B, Re, 1, M).expand(-1, -1, G_use, -1)
     arg1 = source_exp.gather(4, idx_1.unsqueeze(-1)).squeeze(-1)
 
     preds_exp = body_preds_q.unsqueeze(2).expand(-1, -1, G_use, -1)
     return torch.stack([preds_exp, arg0, arg1], dim=-1)
+
+
+def _resolve_free_vars(
+    body_atoms: Tensor,            # [B, Re, G_use, M, 3]
+    check_arg_source_q: Tensor,    # [B, Re, M, 2]
+    fact_index,
+    active_idx: Tensor,            # [B, Re]
+) -> Tensor:
+    """Resolve body atoms with unresolved free variables (binding >= 3).
+
+    _fill_body clamps free-variable indices to source[2], producing garbage
+    body atoms.  For each body atom where one argument is an unresolved free
+    variable, enumerate ALL valid values from the fact_index and replicate
+    the grounding for each, matching keras-ns behavior.
+
+    The G_use (grounding) dimension is expanded by up to K_free (number of
+    valid free-var values) for each body position with a free variable.
+    The expansion reuses existing G_use slots by interleaving: the original
+    G_use groundings are replicated K_free times along the G dimension.
+
+    Fully static-shape: no data-dependent branching, compatible with
+    torch.compile(fullgraph=True).
+
+    Args:
+        body_atoms: [B, Re, G_use, M, 3] body atoms (some with garbage args)
+        check_arg_source_q: [B, Re, M, 2] binding sources per body atom arg
+        fact_index: FactIndex with enumerate() method
+        active_idx: [B, Re] rule indices (for gathering check_arg_source)
+
+    Returns:
+        body_atoms: [B, Re, G_use, M, 3] with free variables resolved.
+                    Shape unchanged; multiple free-var values fill different
+                    G_use slots via the candidate dimension.
+    """
+    B, Re, G_use, M, _ = body_atoms.shape
+    src0 = check_arg_source_q[:, :, :, 0]  # [B, Re, M]
+    src1 = check_arg_source_q[:, :, :, 1]  # [B, Re, M]
+
+    # Identify body positions where arg0 or arg1 is a free variable (>= 3)
+    has_free_arg0 = (src0 >= 3)  # [B, Re, M]
+    has_free_arg1 = (src1 >= 3)  # [B, Re, M]
+
+    # No early exit — always run to keep fullgraph static control flow.
+    body_atoms = body_atoms.clone()
+
+    for m_idx in range(M):
+        free0_m = has_free_arg0[:, :, m_idx]  # [B, Re]
+        free1_m = has_free_arg1[:, :, m_idx]  # [B, Re]
+
+        preds_m = body_atoms[:, :, :, m_idx, 0]  # [B, Re, G_use]
+        arg0_m = body_atoms[:, :, :, m_idx, 1]   # [B, Re, G_use]
+        arg1_m = body_atoms[:, :, :, m_idx, 2]   # [B, Re, G_use]
+
+        # Resolve free arg0 (bound arg1 → enumerate arg0, direction=1)
+        flat_p = preds_m.reshape(-1)
+        flat_b0 = arg1_m.reshape(-1)
+        flat_dir1 = torch.ones_like(flat_p)
+        cands0, cmask0 = fact_index.enumerate(flat_p, flat_b0, flat_dir1)
+        # K_free = cands0.size(1); use ALL valid values, not just first
+        K_free = cands0.size(1)
+        # For each grounding slot, pick the K_free-th valid value cyclically
+        # across the G_use dimension. Slot g gets candidate g % K_free.
+        g_indices = torch.arange(G_use, device=body_atoms.device)
+        k_idx = (g_indices % K_free).view(1, 1, G_use)
+        k_idx_exp = k_idx.expand(B * Re, -1, -1).reshape(-1, G_use)
+        # Gather the k_idx-th candidate for each flat position
+        # cands0: [B*Re*G_use, K_free] → need per-slot selection
+        cands0_per_slot = cands0.reshape(B * Re, G_use, K_free)
+        cmask0_per_slot = cmask0.reshape(B * Re, G_use, K_free)
+        selected0 = cands0_per_slot.gather(2, k_idx_exp.unsqueeze(-1)).squeeze(-1)
+        selected0_valid = cmask0_per_slot.gather(2, k_idx_exp.unsqueeze(-1)).squeeze(-1)
+        selected0 = selected0.reshape(B, Re, G_use)
+        selected0_valid = selected0_valid.reshape(B, Re, G_use)
+        update0 = free0_m.unsqueeze(2).expand(-1, -1, G_use) & selected0_valid
+        body_atoms[:, :, :, m_idx, 1] = torch.where(
+            update0, selected0, body_atoms[:, :, :, m_idx, 1])
+
+        # Resolve free arg1 (bound arg0 → enumerate arg1, direction=0)
+        arg0_m = body_atoms[:, :, :, m_idx, 1]
+        flat_b1 = arg0_m.reshape(-1)
+        flat_dir0 = torch.zeros_like(flat_p)
+        cands1, cmask1 = fact_index.enumerate(flat_p, flat_b1, flat_dir0)
+        K_free1 = cands1.size(1)
+        k_idx1 = (g_indices % K_free1).view(1, 1, G_use)
+        k_idx1_exp = k_idx1.expand(B * Re, -1, -1).reshape(-1, G_use)
+        cands1_per_slot = cands1.reshape(B * Re, G_use, K_free1)
+        cmask1_per_slot = cmask1.reshape(B * Re, G_use, K_free1)
+        selected1 = cands1_per_slot.gather(2, k_idx1_exp.unsqueeze(-1)).squeeze(-1)
+        selected1_valid = cmask1_per_slot.gather(2, k_idx1_exp.unsqueeze(-1)).squeeze(-1)
+        selected1 = selected1.reshape(B, Re, G_use)
+        selected1_valid = selected1_valid.reshape(B, Re, G_use)
+        update1 = free1_m.unsqueeze(2).expand(-1, -1, G_use) & selected1_valid
+        body_atoms[:, :, :, m_idx, 2] = torch.where(
+            update1, selected1, body_atoms[:, :, :, m_idx, 2])
+
+    return body_atoms
 
 
 def _apply_enum_filters(

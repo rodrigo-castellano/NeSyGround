@@ -319,7 +319,7 @@ class InvertedFactIndex(FactIndex):
     ) -> None:
         super().__init__(facts_idx, constant_no=constant_no,
                          padding_idx=padding_idx, device=device)
-        self._num_entities = constant_no
+        self._num_entities = constant_no + 1  # constant_no = max valid entity index
         self._num_predicates = predicate_no + 1
         self._max_facts_per_query = max_facts_per_query
         self._build_offset_tables(device)
@@ -530,13 +530,20 @@ class BlockSparseFactIndex(InvertedFactIndex):
         return cands, valid
 
     def exists(self, atoms: Tensor) -> Tensor:
+        """[N, 3] → [N] bool. Handles out-of-range indices (padding, variables)."""
         if not self._use_dense:
             return super().exists(atoms)
         K = self._K
-        block = self._ps_blocks[atoms[:, 0], atoms[:, 1]]
-        counts = self._ps_counts[atoms[:, 0], atoms[:, 1]]
+        P, E = self._num_predicates, self._num_entities
+        preds, subjs = atoms[:, 0], atoms[:, 1]
+        # Out-of-range indices (padding_idx, template variables) are not facts.
+        # Clamp to avoid OOB in dense block lookup; mask ensures correctness.
+        in_range = (preds < P) & (subjs < E)
+        block = self._ps_blocks[preds.clamp(max=P - 1), subjs.clamp(max=E - 1)]
+        counts = self._ps_counts[preds.clamp(max=P - 1), subjs.clamp(max=E - 1)]
         pos = torch.arange(K, device=atoms.device).unsqueeze(0)
-        return ((block == atoms[:, 2].unsqueeze(1)) & (pos < counts.unsqueeze(1))).any(1)
+        matched = ((block == atoms[:, 2].unsqueeze(1)) & (pos < counts.unsqueeze(1))).any(1)
+        return matched & in_range
 
     def __repr__(self) -> str:
         d = f"dense=True, K={self._K}" if self._use_dense else "dense=False"
