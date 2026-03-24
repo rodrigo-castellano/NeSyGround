@@ -48,7 +48,9 @@ def parse_grounder_type(grounder_type: str) -> Dict[str, Any]:
         'enum.fp_batch.w1.d2'     → {resolution:'enum', filter:'fp_batch', depth:2, width:1}
         'enum.full'               → {resolution:'enum', filter:'fp_batch', depth:1, is_full:True}
     """
-    m = _PATTERN.match(grounder_type)
+    # Strip known suffixes before regex matching
+    clean_type = grounder_type.replace(".flat", "")
+    m = _PATTERN.match(clean_type)
     if not m:
         raise ValueError(
             f"Unknown grounder type: {grounder_type!r}. "
@@ -58,6 +60,7 @@ def parse_grounder_type(grounder_type: str) -> Dict[str, Any]:
 
     resolution = m.group("resolution")
     is_full = ".full" in grounder_type
+    flat_intermediate = ".flat" in grounder_type
 
     if resolution == "enum":
         default_filter = "fp_batch"
@@ -76,6 +79,7 @@ def parse_grounder_type(grounder_type: str) -> Dict[str, Any]:
         "width": int(m.group("width")) if m.group("width") else 1,
         "is_full": is_full,
         "step_prune_dead": bool(m.group("pd")),
+        "flat_intermediate": flat_intermediate,
     }
 
 
@@ -101,7 +105,7 @@ def create_grounder(
     max_groundings: int = 32,
     max_total_groundings: int = 64,
     fc_method: str = "join",
-    max_goals: int = 256,
+    max_goals: Optional[int] = None,
     **kwargs,
 ) -> nn.Module:
     """Create a grounder from a type string.
@@ -141,6 +145,7 @@ def create_grounder(
             bc_kwargs["width"] = cfg["width"]
         bc_kwargs["max_groundings_per_query"] = max_groundings
         bc_kwargs["fc_method"] = fc_method
+        bc_kwargs["flat_intermediate"] = cfg["flat_intermediate"]
 
     bc_kwargs.update(kwargs)
 

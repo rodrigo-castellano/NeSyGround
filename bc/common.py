@@ -263,14 +263,14 @@ def collect_groundings(
     proof_goals: Tensor,        # [B, S, G, 3]
     state_valid: Tensor,        # [B, S]
     top_ridx: Tensor,           # [B, S]
-    collected_body: Tensor,     # [B, tG, G_body, 3]
-    collected_mask: Tensor,     # [B, tG]
-    collected_ridx: Tensor,     # [B, tG]
+    collected_body: Tensor,     # [B, C, G_body, 3]
+    collected_mask: Tensor,     # [B, C]
+    collected_ridx: Tensor,     # [B, C]
     constant_no: int,
     pad_idx: int,
-    effective_total_G: int,
+    C: int,
     body_count: Tensor,          # [B, S]
-    collected_bcount: Tensor,    # [B, tG]
+    collected_bcount: Tensor,    # [B, C]
     collect_mode: str = "terminal",
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Collect completed groundings into output buffer (TS-specific).
@@ -280,28 +280,28 @@ def collect_groundings(
         proof_goals: [B, S, G, 3] current proof goals (after pruning + compaction)
         state_valid: [B, S] active state mask
         top_ridx: [B, S] rule index per state
-        collected_body: [B, tG, G_body, 3] accumulated grounding bodies
-        collected_mask: [B, tG] accumulated validity mask
-        collected_ridx: [B, tG] accumulated rule indices
+        collected_body: [B, C, G_body, 3] accumulated grounding bodies
+        collected_mask: [B, C] accumulated validity mask
+        collected_ridx: [B, C] accumulated rule indices
         constant_no: highest constant index
         pad_idx: padding value
-        effective_total_G: max number of collected groundings (tG)
+        C: max number of collected groundings (C)
         body_count: [B, S] number of valid body atoms per state
-        collected_bcount: [B, tG] accumulated body counts
+        collected_bcount: [B, C] accumulated body counts
         collect_mode: 'terminal' (all goals padding) or 'grounded' (goals
             may contain grounded unknowns — for the u-variant / nesy scoring).
 
     Returns:
-        out_body:    [B, tG, G_body, 3] updated collected bodies
-        out_mask:    [B, tG] updated collected mask
-        out_ridx:    [B, tG] updated collected rule indices
+        out_body:    [B, C, G_body, 3] updated collected bodies
+        out_mask:    [B, C] updated collected mask
+        out_ridx:    [B, C] updated collected rule indices
         state_valid: [B, S] updated (terminal states deactivated)
-        out_bcount:  [B, tG] updated collected body counts
+        out_bcount:  [B, C] updated collected body counts
     """
     B, S, G_body, _ = grounding_body.shape
     dev = grounding_body.device
     E = constant_no + 1
-    tG = effective_total_G
+    # C is the collected groundings budget (parameter)
 
     is_padding = (proof_goals[:, :, :, 0] == pad_idx)  # [B, S, G]
 
@@ -326,22 +326,22 @@ def collect_groundings(
     body_new = grounding_body
     ridx_new = top_ridx
 
-    n_cat = tG + n_new
+    n_cat = C + n_new
     cb = torch.cat([collected_body, body_new], dim=1)
     cm = torch.cat([collected_mask, valid_grounding], dim=1)
     cr = torch.cat([collected_ridx, ridx_new], dim=1)
 
     # Thread body_count through
-    c_bc = torch.cat([collected_bcount, body_count], dim=1)  # [B, tG + S]
+    c_bc = torch.cat([collected_bcount, body_count], dim=1)  # [B, C + S]
 
     cm = _dedup_groundings(cb, cr, cm, G_body)
 
-    n_k = min(tG, n_cat)
+    n_k = min(C, n_cat)
     _, ki = cm.to(torch.int8).topk(
         n_k, dim=1, largest=True, sorted=False)
 
-    if n_k < tG:
-        p2 = tG - n_k
+    if n_k < C:
+        p2 = C - n_k
         out_body = torch.nn.functional.pad(
             cb.gather(1, ki.unsqueeze(-1).unsqueeze(-1).expand(
                 -1, -1, G_body, 3)), (0, 0, 0, 0, 0, p2))

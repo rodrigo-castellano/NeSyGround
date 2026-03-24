@@ -101,13 +101,42 @@ Placement rules:
 - neural or KGE-assisted scoring: `grounder/nesy/`
 - one-off comparison and reporting scripts: `grounder/analysis/`
 
+## Naming Convention
+
+Standard symbols for tensor dimensions and layout parameters. Use these
+consistently in code, comments, and documentation.
+
+| Symbol | Description | Formula / Source |
+|--------|------------|-----------------|
+| `D` | depth (proof steps) | user param |
+| `W` | width (unknown tolerance) | user param |
+| `B` | batch size | user param |
+| `N` | flattened queries | B * S |
+| `G` | goals per state | M + (M-1)*D |
+| `M` | body atoms per rule | from KB |
+| `A` | accumulated body capacity | D * M |
+| `S` | states per step | 256 default |
+| `C` | collected groundings budget | user param |
+| `K` | children per state | SLD: K_f+K_r, RTF: K_f*K_r, Enum: min(K_r*G_r, K_max) |
+| `K_f` | fact children (SLD/RTF) | from fact index |
+| `K_r` | rules per predicate | from rule index |
+| `G_r` | groundings per rule (enum) | user param |
+| `K_v` | candidates per free var (enum) | min(K_f, G_r) |
+| `V` | free vars per rule (enum) | from rules |
+| `K_max` | children cap | 550 default |
+| `pad` | padding index | from KB |
+
+Public API aliases (for backward compatibility with experiments/model.py):
+- `effective_total_G` = `C`
+- `max_body_capacity` = `A`
+
 ## Coding Standards
 
 - Keep tensors statically shaped wherever code is intended for compiled execution.
 - Avoid `.item()` and Python data-dependent branching inside compiled forward/step paths.
 - Compile a single step, not an entire multi-depth loop.
 - Add type hints to function signatures.
-- Document important tensor shapes with comments such as `[B, S, G, 3]`.
+- Document important tensor shapes with comments using the standard symbols above (e.g. `[B, S, G, 3]`).
 - Prefer vectorized tensor code over Python loops in hot paths.
 - Keep comments concise and focused on non-obvious behavior.
 

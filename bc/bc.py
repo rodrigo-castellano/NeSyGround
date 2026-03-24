@@ -86,6 +86,7 @@ class BCGrounder(nn.Module):
         # Testing/validation enum params (not compile-compatible)
         cartesian_product: bool = False,
         all_anchors: bool = False,
+        flat_intermediate: bool = False,
         w_last_depth: int = 0,
         collect_mode: str = "terminal",
         # Output variable standardization (for consumers of ungrounded states)
@@ -112,6 +113,7 @@ class BCGrounder(nn.Module):
         self.prune_facts = prune_facts
         self._cartesian_product = cartesian_product
         self._all_anchors = all_anchors
+        self._flat_intermediate_flag = flat_intermediate
         self._w_last_depth = w_last_depth
         self._collect_mode = collect_mode
 
@@ -130,15 +132,28 @@ class BCGrounder(nn.Module):
 
         self.standardization_mode = standardization.mode if standardization else None
 
-        # Max goals: shared for all resolutions.
-        # Must accommodate M body atoms for enum resolution.
-        if max_goals is None:
-            max_goals = 1 + depth * max(self.kb.M - 1, 1)
-        self.max_goals = max(max_goals, self.kb.M)
-        # Body capacity: depth * M (each depth adds up to M body atoms)
-        self.max_body_capacity = depth * self.kb.M
+        # ── Shared layout: G, A, S, C ──
+        # Standard symbols (see grounder/CLAUDE.md "Naming Convention").
+        M = self.kb.M
+        D = depth
 
-        # Init resolution + compilation
+        # G (max goals per state): M + (M-1)*D.
+        if max_goals is None:
+            max_goals = M + (M - 1) * D
+        self.max_goals = max(max_goals, M)
+
+        # A (accumulated body capacity: D * M).
+        self.A = D * M
+
+        # S (max states per depth step).  Default 256.
+        if max_states is None:
+            max_states = 256
+        self.S = max_states
+
+        # C (collected groundings budget).
+        self.C = max_total_groundings
+
+        # Init resolution-specific params + compilation
         self._init_resolution(
             max_states=max_states, K_MAX=K_MAX,
             max_derived_per_state=max_derived_per_state,
@@ -159,7 +174,13 @@ class BCGrounder(nn.Module):
     # ==================================================================
 
     def _init_resolution(self, **kwargs) -> None:
-        """Call resolution module's init, apply results, set up compilation."""
+        """Call resolution module's init, apply results, set up compilation.
+
+        Shared layout (G, S, C) is already set by __init__.
+        This method computes resolution-specific params:
+          SLD/RTF: K (= K_f + K_r or K_f * K_r), K_f capping, vars_per_rule
+          Enum: K_enum, G_use, K_per_fv, enum buffers
+        """
         if self.resolution in ("sld", "rtf"):
             from grounder.resolution.mgu import init_mgu
             cfg = init_mgu(
@@ -173,10 +194,12 @@ class BCGrounder(nn.Module):
                 max_groundings_per_rule=kwargs["max_groundings_per_rule"],
             )
             self.K = cfg["K"]
+            # init_mgu may cap K_f and recompute S/C — override shared values.
             self.S = cfg["S"]
             self.kb.K_f = cfg["K_f"]
             self.max_vars_per_rule = cfg["max_vars_per_rule"]
-            self.effective_total_G = cfg["effective_total_G"]
+            self.C = cfg["C"]
+            # (C may be overridden by resolution-specific init)
             self._max_fact_pairs_body = cfg["max_fact_pairs_body"]
 
         elif self.resolution == "enum":
@@ -194,19 +217,26 @@ class BCGrounder(nn.Module):
                 device=self.kb.device_,
                 cartesian_product=self._cartesian_product,
                 all_anchors=self._all_anchors,
+                flat_intermediate=self._flat_intermediate_flag,
             )
             for name, tensor in meta["buffers"].items():
                 self.register_buffer(name, tensor)
             self._enum_ri = meta["enum_rule_index"]
             self.max_body_atoms = self._enum_ri.max_body
             self._P, self._E = meta["P"], meta["E"]
-            self.R_eff = meta["R_eff"]
-            self._K_enum = meta["K_enum"]
+            self.K_r = meta["K_r"]
+            self.K = meta["K"]
+            # init_enum may recompute S/C — override shared values.
             self.S = meta["S"]
-            self.effective_total_G = meta["effective_total_G"]
+            self.C = meta["C"]
+            # (C may be overridden by resolution-specific init)
             self.any_dual = meta["any_dual"]
-            self._enum_G = meta["enum_G"]
+            self.G_r = meta["G_r"]
             self._enum_cartesian = meta.get("cartesian_product", False)
+            self.V = meta.get("V", 1)
+            self.K_v = meta.get("K_v", 64)
+            self._fv_any_valid = meta.get("fv_any_valid", None)
+            self._flat_intermediate = meta.get("flat_intermediate", False)
             self.fc_method = kwargs["fc_method"]
             self.fc_depth = kwargs["fc_depth"]
             self.max_vars_per_rule = 3  # unused for enum, but keeps state uniform
@@ -379,7 +409,7 @@ class BCGrounder(nn.Module):
         dev = queries.device
         pad = self.kb.padding_idx
         G = self.max_goals
-        tG = self.effective_total_G
+        C = self.C
         M = self.kb.M  # max body atoms in any single rule
         # G_body: accumulated body capacity across all depths.
         # Each depth step adds up to M body atoms (one rule application).
@@ -421,10 +451,10 @@ class BCGrounder(nn.Module):
             "state_valid": state_valid,
             "next_var_indices": next_var_indices,
             "initial_next_var": next_var_indices,
-            "collected_body": queries.new_zeros(B, tG, G_body, 3),
-            "collected_mask": torch.zeros(B, tG, dtype=torch.bool, device=dev),
-            "collected_ridx": queries.new_zeros(B, tG),
-            "collected_bcount": torch.zeros(B, tG, dtype=torch.long, device=dev),
+            "collected_body": queries.new_zeros(B, C, G_body, 3),
+            "collected_mask": torch.zeros(B, C, dtype=torch.bool, device=dev),
+            "collected_ridx": queries.new_zeros(B, C),
+            "collected_bcount": torch.zeros(B, C, dtype=torch.long, device=dev),
         }
         if initial_goals is not None:
             states["initial_goals"] = initial_goals
@@ -437,14 +467,16 @@ class BCGrounder(nn.Module):
         if self.kb.num_rules == 0:
             return states
 
-        # Compiled fast path (all depths; skip last enum step which needs width=0)
+        # Compiled fast path (all depths; skip last enum step which needs width=0,
+        # and skip flat intermediate steps which have data-dependent shapes).
         if self._compiled:
             last_enum_step = (
                 self.resolution == "enum"
                 and d == self.depth - 1
                 and self.width is not None
             )
-            if not last_enum_step:
+            flat_step = getattr(self, "_flat_intermediate", False)
+            if not last_enum_step and not flat_step:
                 return self._step_compiled(states)
 
         # ── SELECT ──
@@ -480,7 +512,7 @@ class BCGrounder(nn.Module):
             return states
 
         B = states["collected_body"].size(0)
-        tG = self.effective_total_G
+        C = self.C
         G_body = states["collected_body"].shape[2]  # G (accumulated body dim)
         dev = states["collected_body"].device
 
@@ -489,7 +521,7 @@ class BCGrounder(nn.Module):
         ridx = states["collected_ridx"]
 
         if self.kb.num_rules == 0:
-            return self._empty_result(B, tG, G_body, dev)
+            return self._empty_result(B, C, G_body, dev)
 
         if self.filter_mode == "fp_batch":
             from grounder.filters.soundness.fp_batch import apply_fp_batch
@@ -581,7 +613,7 @@ class BCGrounder(nn.Module):
                 fact_index=self.kb.fact_index,
                 d=d, depth=self.depth, width=self.width,
                 M=self.kb.M, padding_idx=self.kb.padding_idx,
-                enum_G=self._enum_G, K_enum=self._K_enum,
+                G_r=self.G_r, K=self.K,
                 any_dual=self.any_dual,
                 pred_rule_indices=self.pred_rule_indices,
                 pred_rule_mask=self.pred_rule_mask,
@@ -602,6 +634,16 @@ class BCGrounder(nn.Module):
                 cartesian_product=self._enum_cartesian,
                 E=self._E,
                 w_last_depth=self._w_last_depth,
+                fv_enum_pred=getattr(self, "fv_enum_pred", None),
+                fv_enum_bound_src=getattr(self, "fv_enum_bound_src", None),
+                fv_enum_direction=getattr(self, "fv_enum_direction", None),
+                fv_enum_valid=getattr(self, "fv_enum_valid", None),
+                V=self.V,
+                K_v=self.K_v,
+                fv_any_valid=self._fv_any_valid,
+                arg_source_dep=getattr(self, "arg_source_dep", None),
+                body_preds_dep=getattr(self, "body_preds_dep", None),
+                flat_intermediate=getattr(self, "_flat_intermediate", False),
             )
 
     # ==================================================================
@@ -821,7 +863,7 @@ class BCGrounder(nn.Module):
             states["state_valid"], states["top_ridx"],
             states["collected_body"], states["collected_mask"],
             states["collected_ridx"],
-            self.kb.constant_no, self.kb.padding_idx, self.effective_total_G,
+            self.kb.constant_no, self.kb.padding_idx, self.C,
             body_count=states["body_count"],
             collected_bcount=states["collected_bcount"],
             collect_mode=self._collect_mode,
@@ -988,19 +1030,19 @@ class BCGrounder(nn.Module):
     # ==================================================================
 
     def _empty_result(
-        self, B: int, tG: int, G_body: int, dev: torch.device,
+        self, B: int, C: int, G_body: int, dev: torch.device,
     ) -> ProofEvidence:
         return ProofEvidence(
             body=torch.zeros(
-                B, tG, G_body, 3, dtype=torch.long, device=dev),
+                B, C, G_body, 3, dtype=torch.long, device=dev),
             mask=torch.zeros(
-                B, tG, dtype=torch.bool, device=dev),
+                B, C, dtype=torch.bool, device=dev),
             count=torch.zeros(
                 B, dtype=torch.long, device=dev),
             rule_idx=torch.zeros(
-                B, tG, dtype=torch.long, device=dev),
+                B, C, dtype=torch.long, device=dev),
             body_count=torch.zeros(
-                B, tG, dtype=torch.long, device=dev),
+                B, C, dtype=torch.long, device=dev),
         )
 
     def __repr__(self) -> str:
@@ -1009,4 +1051,4 @@ class BCGrounder(nn.Module):
             f"filter={self.filter_mode!r}, "
             f"depth={self.depth}, width={self.width}, "
             f"num_rules={self.kb.num_rules}, "
-            f"S={self.S}, tG={self.effective_total_G})")
+            f"S={self.S}, C={self.C})")

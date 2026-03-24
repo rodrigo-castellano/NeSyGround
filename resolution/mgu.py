@@ -441,7 +441,7 @@ def init_mgu(
 ) -> dict:
     """Compute MGU parameters for SLD or RTF resolution.
 
-    Returns dict with: K, S, K_f, max_vars_per_rule, effective_total_G,
+    Returns dict with: K, S, K_f, max_vars_per_rule, C,
     max_fact_pairs_body.
     """
     K_uncapped = K_f * K_r if resolution == "rtf" else K_f + K_r
@@ -465,7 +465,7 @@ def init_mgu(
     elif K_f > K:
         K_f = K
 
-    S = max_states if max_states is not None else K
+    S = max_states if max_states is not None else 256
 
     if rule_index.rule_lens_sorted.numel() > 0:
         max_vars_per_rule = int(
@@ -474,15 +474,15 @@ def init_mgu(
         max_vars_per_rule = 3
 
     if max_groundings_per_rule is not None:
-        effective_total_G = min(
+        C = min(
             max_total_groundings,
             rule_index.R_eff * max(max_groundings_per_rule, 1))
     else:
-        effective_total_G = max_total_groundings
+        C = max_total_groundings
 
     return {
         "K": K, "S": S, "K_f": K_f,
         "max_vars_per_rule": max_vars_per_rule,
-        "effective_total_G": effective_total_G,
+        "C": C,
         "max_fact_pairs_body": K_f,
     }

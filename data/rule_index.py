@@ -106,6 +106,11 @@ class RuleIndex(nn.Module):
         return self._max_rule_pairs
 
     @property
+    def K_r(self) -> int:
+        """Rules per predicate (alias for R_eff)."""
+        return self._max_rule_pairs
+
+    @property
     def rules_heads(self) -> Tensor:
         return self.rules_heads_sorted
 
@@ -485,6 +490,73 @@ class RuleIndexEnum(RuleIndex):
                     enum_dir[i] = m["enum_direction"]
                     break
 
+        # Per-free-variable enumeration metadata
+        # enum_meta from _reorder_body() has introduces_fv, enum_bound_src,
+        # enum_direction, enum_pred for EACH body atom in dependency order.
+        # Extract into [Rt, max_free_vars] tensors for sequential enumeration.
+        max_fv = max((p.num_free for p in self.patterns), default=0)
+        self.max_free_vars: int = max(max_fv, 1)  # at least 1 for shape consistency
+        Fv = self.max_free_vars
+
+        fv_enum_pred = torch.zeros(Rt, Fv, dtype=torch.long, device=device)
+        fv_enum_bound_src = torch.zeros(Rt, Fv, dtype=torch.long, device=device)
+        fv_enum_direction = torch.zeros(Rt, Fv, dtype=torch.long, device=device)
+        fv_enum_valid = torch.zeros(Rt, Fv, dtype=torch.bool, device=device)
+
+        # arg_source_dep / body_preds_dep: ORIGINAL body order, dep-pos-based
+        # free var indices. Uses pre-reorder body patterns so body atoms stay
+        # in the original position (important for query exclusion). Only fv
+        # index references are remapped to dep-pos numbering.
+        arg_source_dep = torch.zeros_like(arg_source)
+        body_preds_dep = torch.zeros_like(body_preds)
+
+        # Store metadata in DEPENDENCY order: dep_pos 0 = first fv to enumerate,
+        # dep_pos 1 = second fv (may depend on dep_pos 0), etc.
+        # bound_src is remapped so that references to other free vars use
+        # dep_pos-based indices: BINDING_FREE_VAR_OFFSET + dep_pos.
+        # This ensures _enumerate_cartesian can iterate 0, 1, ... and each
+        # position only references earlier positions.
+        for i, p in enumerate(self.patterns):
+            dep_pos = 0
+            # Build fv_index → dep_pos mapping for bound_src remapping
+            fv_to_dep = {}
+            for m in p.enum_meta:
+                fv_idx = m["introduces_fv"]
+                if fv_idx >= 0:
+                    fv_to_dep[fv_idx] = dep_pos
+                    dep_pos += 1
+
+            dep_pos = 0
+            for m in p.enum_meta:
+                fv_idx = m["introduces_fv"]
+                if fv_idx >= 0 and dep_pos < Fv:
+                    fv_enum_pred[i, dep_pos] = m["enum_pred"]
+                    fv_enum_direction[i, dep_pos] = m["enum_direction"]
+                    fv_enum_valid[i, dep_pos] = True
+                    # Remap bound_src: head vars stay as-is (0, 1),
+                    # free var references remap to dep_pos-based indices
+                    bs = m["enum_bound_src"]
+                    if bs >= BINDING_FREE_VAR_OFFSET:
+                        orig_fv = bs - BINDING_FREE_VAR_OFFSET
+                        bs = BINDING_FREE_VAR_OFFSET + fv_to_dep[orig_fv]
+                    fv_enum_bound_src[i, dep_pos] = bs
+                    dep_pos += 1
+
+            # Build arg_source_dep/body_preds_dep from ORIGINAL body order
+            # (pre-reorder) with fv indices remapped to dep-pos.
+            orig_patterns = getattr(p, '_orig_body_patterns', p.body_patterns)
+            orig_preds = getattr(p, '_orig_body_pred_indices', p.body_pred_indices)
+            for j in range(min(len(orig_patterns), M)):
+                bp = orig_patterns[j]
+                body_preds_dep[i, j] = orig_preds[j]
+                for a, key in enumerate(("arg0_binding", "arg1_binding")):
+                    val = bp[key]
+                    if val >= BINDING_FREE_VAR_OFFSET:
+                        orig_fv = val - BINDING_FREE_VAR_OFFSET
+                        if orig_fv in fv_to_dep:
+                            val = BINDING_FREE_VAR_OFFSET + fv_to_dep[orig_fv]
+                    arg_source_dep[i, j, a] = val
+
         self.register_buffer("head_preds", head_preds)
         self.register_buffer("body_preds", body_preds)
         self.register_buffer("num_body_atoms", num_body)
@@ -493,6 +565,12 @@ class RuleIndexEnum(RuleIndex):
         self.register_buffer("enum_bound", enum_bound)
         self.register_buffer("enum_dir", enum_dir)
         self.register_buffer("arg_source", arg_source)
+        self.register_buffer("fv_enum_pred", fv_enum_pred)
+        self.register_buffer("fv_enum_bound_src", fv_enum_bound_src)
+        self.register_buffer("fv_enum_direction", fv_enum_direction)
+        self.register_buffer("fv_enum_valid", fv_enum_valid)
+        self.register_buffer("arg_source_dep", arg_source_dep)
+        self.register_buffer("body_preds_dep", body_preds_dep)
 
         # Predicate → rule clustering
         P = num_predicates
