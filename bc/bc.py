@@ -36,7 +36,8 @@ from grounder.bc.common import (
     prune_ground_facts,
 )
 from grounder.types import (
-    GrounderOutput, ProofEvidence, ProofState, ResolvedChildren, SyncParams,
+    FlatResolvedChildren, GrounderOutput, ProofEvidence, ProofState,
+    ResolvedChildren, SyncParams,
 )
 from grounder.filters import check_in_fp_global
 from grounder.filters.search import filter_width, filter_prune_dead
@@ -87,6 +88,8 @@ class BCGrounder(nn.Module):
         cartesian_product: bool = False,
         all_anchors: bool = False,
         flat_intermediate: bool = False,
+        pack_dedup: bool = True,
+        collect_rule_groundings: bool = False,
         w_last_depth: int = 0,
         collect_mode: str = "terminal",
         # Output variable standardization (for consumers of ungrounded states)
@@ -111,9 +114,20 @@ class BCGrounder(nn.Module):
         self.step_hook = None  # Optional StepHook (nn.Module), set externally
         self.collect_evidence = collect_evidence
         self.prune_facts = prune_facts
+        # Enum defaults: all_anchors + cartesian + collect_rule_groundings
+        # for keras-compatible per-rule-application grounding output.
+        if resolution == "enum":
+            if not all_anchors:
+                all_anchors = True
+            if not cartesian_product:
+                cartesian_product = True
+            if not collect_rule_groundings:
+                collect_rule_groundings = True
         self._cartesian_product = cartesian_product
         self._all_anchors = all_anchors
         self._flat_intermediate_flag = flat_intermediate
+        self._pack_dedup = pack_dedup
+        self._collect_rule_groundings = collect_rule_groundings
         self._w_last_depth = w_last_depth
         self._collect_mode = collect_mode
 
@@ -237,6 +251,13 @@ class BCGrounder(nn.Module):
             self.K_v = meta.get("K_v", 64)
             self._fv_any_valid = meta.get("fv_any_valid", None)
             self._flat_intermediate = meta.get("flat_intermediate", False)
+            # Variant→original rule mapping (for all_anchors)
+            if self._all_anchors:
+                v2o = []
+                for orig_r, blen in enumerate(self.kb.rule_index.rule_lens_sorted.tolist()):
+                    for _ in range(blen):
+                        v2o.append(orig_r)
+                self._variant_to_orig = v2o
             self.fc_method = kwargs["fc_method"]
             self.fc_depth = kwargs["fc_depth"]
             self.max_vars_per_rule = 3  # unused for enum, but keeps state uniform
@@ -247,12 +268,10 @@ class BCGrounder(nn.Module):
         # Compilation (all resolutions — shapes are static)
         self._compiled = False
         self._clone_between_steps = False
+        self._fn_steps_by_depth: Dict[int, Any] = {}
         if (self.compile_mode
                 and self.depth > 1
                 and self.kb.device_.type == "cuda"):
-            self._fn_step = torch.compile(
-                self._step_impl, fullgraph=True,
-                mode=self.compile_mode)
             self._clone_between_steps = (
                 self.compile_mode == "reduce-overhead")
             self._compiled = True
@@ -345,6 +364,8 @@ class BCGrounder(nn.Module):
     def forward(
         self, queries: Tensor, query_mask: Tensor, **init_kwargs,
     ) -> GrounderOutput:
+        if self._collect_rule_groundings:
+            self._r2g_buffer: Dict[int, set] = {}  # reset each forward
         states = self.init_states(queries, query_mask, **init_kwargs)
         for d in range(self.depth):
             states = self.step(states, d)
@@ -367,15 +388,35 @@ class BCGrounder(nn.Module):
                     count=evidence["collected_mask"].sum(dim=1),
                     rule_idx=evidence["collected_ridx"],
                     body_count=evidence["collected_bcount"],
+                    D=self.depth,
+                    M=self.kb.M,
+                    head=evidence.get("collected_head"),
                 )
             else:
                 evidence = None
         if evidence is not None:
             for hook in self.hooks:
-                body, mask, ridx = hook.apply(evidence.body, evidence.mask, evidence.rule_idx)
+                body, mask, ridx = hook.apply(
+                    evidence.body_flat, evidence.mask, evidence.rule_idx_top)
                 evidence = ProofEvidence(
                     body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
                     body_count=evidence.body_count)
+        # Build RuleGroundings from collected per-rule sets
+        rule_groundings = None
+        if self._collect_rule_groundings and hasattr(self, '_r2g_buffer') and self._r2g_buffer:
+            from grounder.bc.common import (
+                build_rule_grounding_tensors, prune_rule_groundings)
+            r2g = self._r2g_buffer
+            # Apply fp_batch-style pruning if soundness filter is enabled
+            if self.filter_mode == "fp_batch":
+                fact_set = set()
+                fi = self.kb.fact_index.facts_idx  # [F, 3]
+                for f in range(fi.shape[0]):
+                    fact_set.add(tuple(fi[f].tolist()))
+                r2g = prune_rule_groundings(r2g, fact_set, max_iterations=self.depth + 1)
+            rule_groundings = build_rule_grounding_tensors(
+                r2g, self.kb.num_rules, queries.device)
+
         state = ProofState(
             proof_goals=states["proof_goals"],
             state_valid=states["state_valid"],
@@ -384,7 +425,8 @@ class BCGrounder(nn.Module):
                 states["next_var_indices"]
                 if self._standardize_fn is not None else None),
         )
-        return GrounderOutput(state=state, evidence=evidence)
+        return GrounderOutput(state=state, evidence=evidence,
+                              rule_groundings=rule_groundings)
 
 
     def init_states(
@@ -410,11 +452,8 @@ class BCGrounder(nn.Module):
         pad = self.kb.padding_idx
         G = self.max_goals
         C = self.C
+        D = self.depth
         M = self.kb.M  # max body atoms in any single rule
-        # G_body: accumulated body capacity across all depths.
-        # Each depth step adds up to M body atoms (one rule application).
-        # Upper bound = depth * M (not G, which bounds open goals).
-        G_body = 1 if not self.collect_evidence else self.depth * M
         # M_work: working buffer for the current depth's body atoms.
         M_work = 1 if not self.collect_evidence else M
 
@@ -428,10 +467,16 @@ class BCGrounder(nn.Module):
         # M-sized working buffer (current depth's rule body atoms)
         grounding_body = torch.full(
             (B, 1, M_work, 3), pad, dtype=torch.long, device=dev)
-        # G_body-sized accumulator (all depths' body atoms)
+        # Structured accumulator: [B, S, D, M, 3] — one slot per depth
+        acc_D = 1 if not self.collect_evidence else D
+        acc_M = 1 if not self.collect_evidence else M
         accumulated_body = torch.full(
-            (B, 1, G_body, 3), pad, dtype=torch.long, device=dev)
-        body_count = torch.zeros(B, 1, dtype=torch.long, device=dev)
+            (B, 1, acc_D, acc_M, 3), pad, dtype=torch.long, device=dev)
+        body_count = torch.zeros(B, 1, acc_D, dtype=torch.long, device=dev)
+        ridx_per_depth = torch.full(
+            (B, 1, acc_D), -1, dtype=torch.long, device=dev)
+        head_per_depth = torch.full(
+            (B, 1, acc_D, 3), pad, dtype=torch.long, device=dev)
         top_ridx = torch.full((B, 1), -1, dtype=torch.long, device=dev)
         state_valid = query_mask.unsqueeze(1)
 
@@ -447,14 +492,20 @@ class BCGrounder(nn.Module):
             "grounding_body": grounding_body,
             "accumulated_body": accumulated_body,
             "body_count": body_count,
+            "ridx_per_depth": ridx_per_depth,
+            "head_per_depth": head_per_depth,
             "top_ridx": top_ridx,
             "state_valid": state_valid,
             "next_var_indices": next_var_indices,
             "initial_next_var": next_var_indices,
-            "collected_body": queries.new_zeros(B, C, G_body, 3),
+            "collected_body": queries.new_zeros(B, C, acc_D, acc_M, 3),
             "collected_mask": torch.zeros(B, C, dtype=torch.bool, device=dev),
-            "collected_ridx": queries.new_zeros(B, C),
-            "collected_bcount": torch.zeros(B, C, dtype=torch.long, device=dev),
+            "collected_ridx": queries.new_full((B, C, acc_D), -1,
+                                               dtype=torch.long),
+            "collected_bcount": torch.zeros(B, C, acc_D, dtype=torch.long,
+                                            device=dev),
+            "collected_head": torch.full((B, C, acc_D, 3), pad,
+                                         dtype=torch.long, device=dev),
         }
         if initial_goals is not None:
             states["initial_goals"] = initial_goals
@@ -477,7 +528,11 @@ class BCGrounder(nn.Module):
             )
             flat_step = getattr(self, "_flat_intermediate", False)
             if not last_enum_step and not flat_step:
-                return self._step_compiled(states)
+                return self._step_compiled(states, d)
+
+        # Capture the goal being resolved at this depth (= head atom)
+        if self.collect_evidence or self._collect_rule_groundings:
+            states["_selected_goal"] = states["proof_goals"][:, :, 0, :].clone()
 
         # ── SELECT ──
         goal_queries, remaining, active_mask = self._select(states)
@@ -495,11 +550,15 @@ class BCGrounder(nn.Module):
         # ── HOOKS (between RESOLVE and PACK) ──
         resolved = self._apply_hooks(resolved, states)
 
+        # ── COLLECT per-rule groundings (before dedup) ──
+        if self._collect_rule_groundings:
+            self._collect_r2g(resolved, states)
+
         # ── PACK → returns (states, sync) — no dict pollution ──
         states, sync = self._pack(resolved, states)
 
         # ── POSTPROCESS ──
-        states = self._postprocess(states, sync)
+        states = self._postprocess(states, sync, d)
 
         return states
 
@@ -513,35 +572,50 @@ class BCGrounder(nn.Module):
 
         B = states["collected_body"].size(0)
         C = self.C
-        G_body = states["collected_body"].shape[2]  # G (accumulated body dim)
         dev = states["collected_body"].device
 
-        body = states["collected_body"]
-        mask = states["collected_mask"]
-        ridx = states["collected_ridx"]
+        body = states["collected_body"]     # [B, C, D, M, 3]
+        mask = states["collected_mask"]     # [B, C]
+        ridx = states["collected_ridx"]     # [B, C, D]
 
         if self.kb.num_rules == 0:
+            D = body.shape[2]
+            M = body.shape[3]
+            G_body = D * M
             return self._empty_result(B, C, G_body, dev)
+
+        head = states.get("collected_head")  # [B, C, D, 3] or None
 
         if self.filter_mode == "fp_batch":
             from grounder.filters.soundness.fp_batch import apply_fp_batch
+            body_flat = body.reshape(B, C, -1, 3)
+            # Use per-grounding heads if available (grounded collection mode)
+            grounding_heads = None
+            if head is not None:
+                grounding_heads = head  # [B, C, D, 3]
             mask = apply_fp_batch(
-                body, mask, states["queries"], self.kb.fact_index,
-                self.kb.fact_index.pack_base, self.kb.padding_idx, self.depth)
+                body_flat, mask, states["queries"], self.kb.fact_index,
+                self.kb.fact_index.pack_base, self.kb.padding_idx, self.depth,
+                grounding_heads=grounding_heads)
 
         elif self.filter_mode == "fp_global":
             from grounder.filters.soundness.fp_global import apply_fp_global
+            body_flat = body.reshape(B, C, -1, 3)
             mask = apply_fp_global(
-                body, mask, self.kb.fact_index,
+                body_flat, mask, self.kb.fact_index,
                 self.kb.fact_index.pack_base, self.kb.padding_idx,
                 self.fp_global_hashes)
 
         count = mask.sum(dim=1)
-        bcount = states["collected_bcount"]
+        bcount = states["collected_bcount"]   # [B, C, D]
+        D_val = self.depth if self.collect_evidence else 0
+        M_val = self.kb.M if self.collect_evidence else 0
         return ProofEvidence(
             body=body, mask=mask,
             count=count, rule_idx=ridx,
             body_count=bcount,
+            D=D_val, M=M_val,
+            head=head,
         )
 
     # ==================================================================
@@ -706,23 +780,34 @@ class BCGrounder(nn.Module):
 
     def _pack(
         self,
-        resolved: ResolvedChildren,
+        resolved,
         states: Dict[str, Tensor],
     ) -> Tuple[Dict, SyncParams]:
         """Flatten S*K children, propagate grounding body, compact to S.
 
+        Dispatches to pack_states (dense) or pack_states_flat (flat K).
         Returns (states, sync) — no dict pollution with underscore keys.
         """
-        S_in = states["top_ridx"].shape[1]
-
-        packed = pack_states(
-            *resolved,
-            states["top_ridx"], states["grounding_body"],
-            states["body_count"],
-            self.S, self.kb.padding_idx,
-            collect_evidence=self.collect_evidence,
-            M_rule=self.kb.M,
-        )
+        if isinstance(resolved, FlatResolvedChildren):
+            from grounder.bc.common import pack_states_flat
+            packed = pack_states_flat(
+                resolved,
+                states["top_ridx"], states["grounding_body"],
+                states["body_count"],
+                self.kb.padding_idx,
+                collect_evidence=self.collect_evidence,
+                M_rule=self.kb.M,
+                dedup=self._pack_dedup,
+            )
+        else:
+            packed = pack_states(
+                *resolved,
+                states["top_ridx"], states["grounding_body"],
+                states["body_count"],
+                self.S, self.kb.padding_idx,
+                collect_evidence=self.collect_evidence,
+                M_rule=self.kb.M,
+            )
 
         states["grounding_body"] = packed.grounding_body
         states["proof_goals"] = packed.proof_goals
@@ -734,8 +819,10 @@ class BCGrounder(nn.Module):
             winning_subs=packed.winning_subs,
             has_new_body=packed.has_new_body,
             parent_bcount=packed.body_count,
+            current_ridx=packed.current_ridx,
         )
 
+        S_in = packed.proof_goals.shape[1]  # output S (may differ from input)
         states["next_var_indices"] = (
             states["next_var_indices"] + S_in * self.max_vars_per_rule)
         return states, sync
@@ -744,14 +831,18 @@ class BCGrounder(nn.Module):
         self,
         states: Dict[str, Tensor],
         sync: SyncParams,
+        d: int,
     ) -> Dict[str, Tensor]:
-        """Propagate accumulated_body: gather from parents, apply subs, append new atoms.
+        """Propagate accumulated_body: gather from parents, apply subs, write at depth d.
 
-        All operations are static-shape and torch.compile(fullgraph=True) compatible.
+        Structured layout: accumulated_body is [B, S, D, M, 3].
+        Each depth d writes its body atoms to slot ``[:, :, d, :, :]``.
 
         Args:
             states: Current states dict with accumulated_body and grounding_body.
-            sync: SyncParams with parent_map, winning_subs, has_new_body, parent_bcount.
+            sync: SyncParams with parent_map, winning_subs, has_new_body,
+                  parent_bcount, current_ridx.
+            d: Current depth index.
         """
         parent_map = sync.parent_map
         winning_subs = sync.winning_subs
@@ -763,49 +854,77 @@ class BCGrounder(nn.Module):
             return states
 
         B, S_out = parent_map.shape
-        G_body = states["accumulated_body"].shape[2]
+        D_dim = states["accumulated_body"].shape[2]  # D
+        M_acc = states["accumulated_body"].shape[3]   # M
         M_work = states["grounding_body"].shape[2]
         pad = self.kb.padding_idx
         dev = parent_map.device
 
-        # a. Gather accumulated_body from parents
-        pi = parent_map.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, G_body, 3)
-        acc = states["accumulated_body"].gather(1, pi)  # [B, S_out, G_body, 3]
+        # a. Gather accumulated_body [B, S_out, D, M, 3] from parents
+        pi = parent_map[:, :, None, None, None].expand(-1, -1, D_dim, M_acc, 3)
+        acc = states["accumulated_body"].gather(1, pi)
 
-        # b. Gather body_count from parents (already passed as parent_bcount)
-        bc = parent_bcount  # [B, S_out]
+        # b. Gather ridx_per_depth [B, S_out, D] from parents
+        rpi = parent_map[:, :, None].expand(-1, -1, D_dim)
+        ridx = states["ridx_per_depth"].gather(1, rpi)
 
-        # c. Apply winning substitutions to accumulated_body
-        acc_flat = acc.reshape(B * S_out, G_body, 3)
+        # c. Gather body_count [B, S_out, D] from parents
+        bc = states["body_count"].gather(1, rpi)
+
+        # d. Apply substitutions to entire accumulated body
+        acc_flat = acc.reshape(B * S_out, D_dim * M_acc, 3)
         subs_flat = winning_subs.reshape(B * S_out, 2, 2)
         acc_flat = apply_substitutions(acc_flat, subs_flat, pad)
-        acc = acc_flat.reshape(B, S_out, G_body, 3)
+        acc = acc_flat.reshape(B, S_out, D_dim, M_acc, 3)
 
-        # d. Append new body atoms from grounding_body where has_new_body
+        # e. Write new body atoms at depth slot d
         new_atoms = states["grounding_body"]  # [B, S_out, M_work, 3]
-        new_active = (new_atoms[:, :, :, 0] != pad)  # [B, S_out, M_work]
-        new_lens = new_active.long().sum(dim=-1)  # [B, S_out]
+        # Truncate or pad to M_acc if needed
+        if M_work > M_acc:
+            write_atoms = new_atoms[:, :, :M_acc, :]
+        elif M_work < M_acc:
+            write_atoms = torch.full(
+                (B, S_out, M_acc, 3), pad, dtype=torch.long, device=dev)
+            write_atoms[:, :, :M_work, :] = new_atoms
+        else:
+            write_atoms = new_atoms
+        write_mask = has_new_body[:, :, None, None]  # [B, S_out, 1, 1]
+        acc[:, :, d, :, :] = torch.where(write_mask, write_atoms,
+                                          acc[:, :, d, :, :])
 
-        local_idx = torch.arange(M_work, device=dev).view(1, 1, M_work)
-        raw_write_pos = bc.unsqueeze(-1) + local_idx  # [B, S_out, M_work]
-        write_pos = raw_write_pos.clamp(max=G_body - 1)  # [B, S_out, M_work]
-        write_mask = (
-            has_new_body.unsqueeze(-1)
-            & new_active
-            & (raw_write_pos < G_body)
-        )  # [B, S_out, M_work]
+        # f. Write current rule index at depth d
+        ridx[:, :, d] = torch.where(has_new_body, sync.current_ridx,
+                                     ridx[:, :, d])
 
-        wi = write_pos.unsqueeze(-1).expand(-1, -1, -1, 3)
-        existing = acc.gather(2, wi)
-        to_write = torch.where(write_mask.unsqueeze(-1), new_atoms, existing)
-        acc.scatter_(2, wi, to_write)
+        # g. Update per-depth body count at depth d
+        new_active = (write_atoms[:, :, :, 0] != pad)  # [B, S_out, M_acc]
+        new_lens = new_active.long().sum(dim=-1)       # [B, S_out]
+        bc[:, :, d] = torch.where(has_new_body, new_lens, bc[:, :, d])
 
-        # e. Update body_count
-        bc = bc + torch.where(has_new_body, new_lens, torch.zeros_like(new_lens))
-        bc = bc.clamp(max=G_body)
+        # h. Gather and write head_per_depth at depth d
+        hpi = parent_map[:, :, None, None].expand(-1, -1, D_dim, 3)
+        head = states["head_per_depth"].gather(1, hpi)
+        # Apply substitutions to heads too (variables may get resolved)
+        head_flat = head.reshape(B * S_out, D_dim, 3)
+        head_flat = apply_substitutions(head_flat, subs_flat, pad)
+        head = head_flat.reshape(B, S_out, D_dim, 3)
+        # Write the selected goal at depth d
+        if "_selected_goal" in states:
+            sel = states["_selected_goal"]  # [B, S_in, 3]
+            # Gather from parent
+            sel_parent = sel.gather(
+                1, parent_map.unsqueeze(-1).expand(-1, -1, 3))
+            # Apply subs
+            sel_flat = sel_parent.reshape(B * S_out, 1, 3)
+            sel_flat = apply_substitutions(sel_flat, subs_flat, pad)
+            sel_parent = sel_flat.reshape(B, S_out, 3)
+            head[:, :, d, :] = torch.where(
+                has_new_body.unsqueeze(-1), sel_parent, head[:, :, d, :])
 
         states["accumulated_body"] = acc
         states["body_count"] = bc
+        states["ridx_per_depth"] = ridx
+        states["head_per_depth"] = head
         return states
 
     # ==================================================================
@@ -855,18 +974,23 @@ class BCGrounder(nn.Module):
     def _collect_groundings(self, states: Dict) -> Dict[str, Tensor]:
         """Collect completed groundings into output buffer.
 
-        Uses accumulated_body (G_body-sized). Called outside the compiled
-        step to keep G_body tensors out of the CUDA graph.
+        Uses accumulated_body [B, S, D, M, 3] (structured). Called outside
+        the compiled step to keep G_body tensors out of the CUDA graph.
         """
-        cb, cm, cr, sv, c_bc = collect_groundings(
+        # In "grounded" mode, don't deactivate — states continue to deeper depths
+        deactivate = (self._collect_mode != "grounded")
+        cb, cm, cr, sv, c_bc, c_hd = collect_groundings(
             states["accumulated_body"], states["proof_goals"],
-            states["state_valid"], states["top_ridx"],
+            states["state_valid"], states["ridx_per_depth"],
             states["collected_body"], states["collected_mask"],
             states["collected_ridx"],
             self.kb.constant_no, self.kb.padding_idx, self.C,
             body_count=states["body_count"],
             collected_bcount=states["collected_bcount"],
             collect_mode=self._collect_mode,
+            deactivate=deactivate,
+            head_per_depth=states.get("head_per_depth"),
+            collected_head=states.get("collected_head"),
         )
 
         states["collected_body"] = cb
@@ -874,9 +998,92 @@ class BCGrounder(nn.Module):
         states["collected_ridx"] = cr
         states["state_valid"] = sv
         states["collected_bcount"] = c_bc
+        if c_hd is not None:
+            states["collected_head"] = c_hd
         return states
 
-    def _postprocess(self, states: Dict[str, Tensor], sync: SyncParams) -> Dict[str, Tensor]:
+    def _collect_r2g(self, resolved, states: Dict[str, Tensor]) -> None:
+        """Collect per-rule-application groundings before dedup.
+
+        Extracts (head, body) from ALL resolved children and stores in
+        self._r2g_buffer (Python dict of sets). Called between RESOLVE and PACK.
+        Works for both FlatResolvedChildren (enum) and ResolvedChildren (SLD/RTF).
+        """
+        pad = self.kb.padding_idx
+        M = self.kb.M
+        sel = states.get("_selected_goal")  # [B, S_in, 3]
+
+        if isinstance(resolved, FlatResolvedChildren):
+            T = resolved.flat_rule_idx.size(0)
+            if T == 0:
+                return
+            ridx = resolved.flat_rule_idx.cpu()
+            goals = resolved.flat_goals.cpu()      # [T, G, 3]
+            b_idx = resolved.flat_b_idx.cpu()
+            s_idx = resolved.flat_s_idx.cpu()
+            sel_cpu = sel.cpu() if sel is not None else None
+
+            for t in range(T):
+                r = ridx[t].item()
+                # Body atoms = first M slots of goals
+                body = []
+                for m in range(M):
+                    p = goals[t, m, 0].item()
+                    if p == pad:
+                        break
+                    body.append((goals[t, m, 0].item(),
+                                 goals[t, m, 1].item(),
+                                 goals[t, m, 2].item()))
+                if not body:
+                    continue
+                # Head = selected goal of the parent state
+                if sel_cpu is not None:
+                    b, s = b_idx[t].item(), s_idx[t].item()
+                    head = tuple(sel_cpu[b, s].tolist())
+                else:
+                    head = (pad, pad, pad)
+                # Map variant index → original rule index (for all_anchors)
+                orig_r = self._variant_to_orig[r] if hasattr(self, '_variant_to_orig') else r
+                if orig_r not in self._r2g_buffer:
+                    self._r2g_buffer[orig_r] = set()
+                # Sort body for dedup across anchor variants
+                self._r2g_buffer[orig_r].add((head, tuple(sorted(body))))
+
+        else:
+            # ResolvedChildren (SLD/RTF): dense [B, S, K_r, ...]
+            ridx = resolved.sub_rule_idx.cpu()    # [B, S, K_r]
+            goals = resolved.rule_goals.cpu()     # [B, S, K_r, G, 3]
+            success = resolved.rule_success.cpu() # [B, S, K_r]
+            sel_cpu = sel.cpu() if sel is not None else None
+            B, S, K_r = ridx.shape
+
+            for b in range(B):
+                for s in range(S):
+                    for k in range(K_r):
+                        if not success[b, s, k]:
+                            continue
+                        r = ridx[b, s, k].item()
+                        body = []
+                        for m in range(M):
+                            p = goals[b, s, k, m, 0].item()
+                            if p == pad:
+                                break
+                            body.append((goals[b, s, k, m, 0].item(),
+                                         goals[b, s, k, m, 1].item(),
+                                         goals[b, s, k, m, 2].item()))
+                        if not body:
+                            continue
+                        if sel_cpu is not None:
+                            head = tuple(sel_cpu[b, s].tolist())
+                        else:
+                            head = (pad, pad, pad)
+                        # SLD/RTF: rule_idx is already original (no variants)
+                        if r not in self._r2g_buffer:
+                            self._r2g_buffer[r] = set()
+                        self._r2g_buffer[r].add((head, tuple(sorted(body))))
+
+    def _postprocess(self, states: Dict[str, Tensor], sync: SyncParams,
+                     d: int = 0) -> Dict[str, Tensor]:
         """Full postprocess: prune goals + sync accumulated + collect groundings.
 
         Used by the non-compiled path. The compiled path splits this into
@@ -888,9 +1095,10 @@ class BCGrounder(nn.Module):
         Args:
             states: Current proof states dict.
             sync: SyncParams from _pack (parent_map, winning_subs, etc.).
+            d: Current depth index (for structured accumulation).
         """
         states = self._postprocess_goals(states)
-        states = self._sync_accumulated(states, sync)
+        states = self._sync_accumulated(states, sync, d)
         if self.collect_evidence:
             states = self._collect_groundings(states)
         return states
@@ -933,22 +1141,34 @@ class BCGrounder(nn.Module):
     # Compiled step (optimization — same semantics as clean path)
     # ==================================================================
 
-    def _step_compiled(self, states: Dict) -> Dict[str, Tensor]:
+    def _fn_step_for_depth(self, d: int):
+        """Get or lazily compile the step function for depth d."""
+        if d not in self._fn_steps_by_depth:
+            import functools
+            fn = functools.partial(self._step_impl, d=d)
+            self._fn_steps_by_depth[d] = torch.compile(
+                fn, fullgraph=True, mode=self.compile_mode)
+        return self._fn_steps_by_depth[d]
+
+    def _step_compiled(self, states: Dict, d: int = 0) -> Dict[str, Tensor]:
         """Compiled step: dict <-> raw tensors."""
         if self._clone_between_steps:
             states = {k: v.clone() if isinstance(v, Tensor) else v
                       for k, v in states.items()}
 
+        # Use per-depth compiled function (d is a trace-time constant)
+        fn = self._fn_step_for_depth(d)
+
         (states["grounding_body"], states["accumulated_body"],
-         states["body_count"],
+         states["body_count"], states["ridx_per_depth"],
          states["proof_goals"],
          states["top_ridx"], states["state_valid"],
          states["next_var_indices"],
          states["collected_body"], states["collected_mask"],
          states["collected_ridx"],
-         states["collected_bcount"]) = self._fn_step(
+         states["collected_bcount"]) = fn(
             states["grounding_body"], states["accumulated_body"],
-            states["body_count"],
+            states["body_count"], states["ridx_per_depth"],
             states["proof_goals"],
             states["top_ridx"], states["state_valid"],
             states["next_var_indices"],
@@ -963,6 +1183,7 @@ class BCGrounder(nn.Module):
         grounding_body: Tensor,
         accumulated_body: Tensor,
         body_count: Tensor,
+        ridx_per_depth: Tensor,
         proof_goals: Tensor,
         top_ridx: Tensor,
         state_valid: Tensor,
@@ -971,13 +1192,15 @@ class BCGrounder(nn.Module):
         collected_mask: Tensor,
         collected_ridx: Tensor,
         collected_bcount: Tensor,
+        d: int = 0,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
-               Tensor, Tensor, Tensor, Tensor]:
+               Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Raw tensor step for torch.compile -- same phases as clean path."""
         states = {
             "grounding_body": grounding_body,
             "accumulated_body": accumulated_body,
             "body_count": body_count,
+            "ridx_per_depth": ridx_per_depth,
             "proof_goals": proof_goals,
             "top_ridx": top_ridx,
             "state_valid": state_valid,
@@ -992,15 +1215,15 @@ class BCGrounder(nn.Module):
         queries, remaining, active_mask = self._select(states)
         resolved = self._resolve(
             queries, remaining, grounding_body, state_valid,
-            active_mask, states, d=1, use_hooks=False,
+            active_mask, states, d=d, use_hooks=False,
         )
         resolved = self._apply_search_filters(resolved)
         resolved = self._apply_hooks(resolved, states)
         states, sync = self._pack(resolved, states)
-        states = self._postprocess(states, sync)
+        states = self._postprocess(states, sync, d)
 
         return (states["grounding_body"], states["accumulated_body"],
-                states["body_count"],
+                states["body_count"], states["ridx_per_depth"],
                 states["proof_goals"],
                 states["top_ridx"], states["state_valid"],
                 states["next_var_indices"],
@@ -1032,17 +1255,21 @@ class BCGrounder(nn.Module):
     def _empty_result(
         self, B: int, C: int, G_body: int, dev: torch.device,
     ) -> ProofEvidence:
+        D = self.depth if self.collect_evidence else 1
+        M = self.kb.M if self.collect_evidence else 1
         return ProofEvidence(
             body=torch.zeros(
-                B, C, G_body, 3, dtype=torch.long, device=dev),
+                B, C, D, M, 3, dtype=torch.long, device=dev),
             mask=torch.zeros(
                 B, C, dtype=torch.bool, device=dev),
             count=torch.zeros(
                 B, dtype=torch.long, device=dev),
-            rule_idx=torch.zeros(
-                B, C, dtype=torch.long, device=dev),
+            rule_idx=torch.full(
+                (B, C, D), -1, dtype=torch.long, device=dev),
             body_count=torch.zeros(
-                B, C, dtype=torch.long, device=dev),
+                B, C, D, dtype=torch.long, device=dev),
+            D=D if self.collect_evidence else 0,
+            M=M if self.collect_evidence else 0,
         )
 
     def __repr__(self) -> str:

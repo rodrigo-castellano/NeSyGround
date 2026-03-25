@@ -86,8 +86,8 @@ def _torch_step0_bodies(
     bodies: set[tuple[tuple[str, str, str], ...]] = set()
     if evidence is None:
         return bodies
-    mask = evidence.mask[0]   # [tG]
-    body = evidence.body[0]   # [tG, G_body, 3]
+    mask = evidence.mask[0]        # [tG]
+    body = evidence.body_flat[0]   # [tG, G_body, 3]
     for g in range(mask.shape[0]):
         if not mask[g].item():
             continue

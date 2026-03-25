@@ -35,6 +35,7 @@ def apply_fp_batch(
     pack_base: int,
     padding_idx: int,
     depth: int,
+    grounding_heads: Tensor = None,  # [B, N, D, 3] per-grounding heads
 ) -> Tensor:
     """Cross-query Kleene T_P fixed-point on collected groundings.
 
@@ -42,13 +43,17 @@ def apply_fp_batch(
     heads of other proved groundings *anywhere in the batch*.
 
     Args:
-        body:        [B, N, M, 3] collected grounding body atoms.
-        mask:        [B, N] validity mask.
-        queries:     [B, 3] original query atoms (head of each grounding).
-        fact_index:  FactIndex with .exists() method.
-        pack_base:   hash packing base.
-        padding_idx: padding value.
-        depth:       number of fixed-point iterations.
+        body:              [B, N, M, 3] collected grounding body atoms.
+        mask:              [B, N] validity mask.
+        queries:           [B, 3] original query atoms (head of each grounding).
+        fact_index:        FactIndex with .exists() method.
+        pack_base:         hash packing base.
+        padding_idx:       padding value.
+        depth:             number of fixed-point iterations.
+        grounding_heads:   [B, N, D, 3] per-depth head atoms (optional).
+            When provided, each grounding contributes D heads (one per depth)
+            to the proved pool, enabling cross-proof transitive closure for
+            intermediate groundings collected in 'grounded' mode.
 
     Returns:
         [B, N] bool — which groundings are transitively proved.
@@ -61,39 +66,106 @@ def apply_fp_batch(
     body_hashes = (body[..., 0].long() * (pb * pb)
                    + body[..., 1].long() * pb
                    + body[..., 2].long())             # [B, N, M]
-    q_hash = (queries[:, 0].long() * (pb * pb)
-              + queries[:, 1].long() * pb
-              + queries[:, 2].long())                  # [B]
-    head_hashes = q_hash.unsqueeze(1).expand(-1, N)   # [B, N]
 
-    # --- Fact check ---
+    if grounding_heads is not None:
+        # Per-grounding, per-depth heads: [B, N, D, 3] → [B, N*D] hashes
+        D_h = grounding_heads.shape[2]
+        gh = grounding_heads.long()
+        all_head_hashes = (gh[..., 0] * (pb * pb) + gh[..., 1] * pb
+                           + gh[..., 2])              # [B, N, D]
+        # Valid heads: not padding
+        head_valid = grounding_heads[..., 0] != padding_idx  # [B, N, D]
+        # Flatten: each grounding contributes D head entries
+        head_hashes_flat = all_head_hashes.reshape(B, N * D_h)  # [B, N*D]
+        head_valid_flat = head_valid.reshape(B, N * D_h)        # [B, N*D]
+        # Expand mask: grounding must be valid for its heads to count
+        mask_expanded = mask.unsqueeze(-1).expand(-1, -1, D_h).reshape(B, N * D_h)
+        head_valid_flat = head_valid_flat & mask_expanded
+        N_pool = N * D_h
+    else:
+        q_hash = (queries[:, 0].long() * (pb * pb)
+                  + queries[:, 1].long() * pb
+                  + queries[:, 2].long())              # [B]
+        head_hashes_flat = q_hash.unsqueeze(1).expand(-1, N)  # [B, N]
+        head_valid_flat = mask  # [B, N]
+        N_pool = N
+
+    # --- Per-depth virtual grounding mode ---
+    if grounding_heads is not None:
+        # Treat each (grounding, depth) as a separate virtual grounding.
+        # Virtual grounding v=(c,d): body=body_structured[c,d,:M,:],
+        # head=grounding_heads[c,d,:]. This matches keras's per-rule-application
+        # representation.
+        #
+        # body is [B, N, D*M, 3] flat — reshape to [B, N, D, M_per, 3]
+        M_per = M // D_h  # M atoms per depth (D*M_per = M)
+        body_structured = body.reshape(B, N, D_h, M_per, 3)
+
+        # Flatten to virtual groundings: [B, N*D, M_per, 3]
+        V = N * D_h
+        vbody = body_structured.reshape(B, V, M_per, 3)
+        vhead = grounding_heads.reshape(B, V, 3)  # [B, V, 3]
+
+        # Virtual mask: grounding valid AND depth active
+        vmask_base = mask.unsqueeze(-1).expand(-1, -1, D_h)
+        vhead_active = grounding_heads[..., 0] != padding_idx
+        vmask = (vmask_base & vhead_active).reshape(B, V)  # [B, V]
+
+        # Hashes
+        vbody_h = (vbody[..., 0].long() * (pb * pb)
+                   + vbody[..., 1].long() * pb
+                   + vbody[..., 2].long())  # [B, V, M_per]
+        vhead_h = (vhead[..., 0].long() * (pb * pb)
+                   + vhead[..., 1].long() * pb
+                   + vhead[..., 2].long())  # [B, V]
+
+        # Fact check per virtual grounding
+        vis_fact = fact_index.exists(
+            vbody.reshape(-1, 3)).view(B, V, M_per)
+        vbody_active = vbody[..., 0] != padding_idx
+
+        # Seed
+        vproved = (vis_fact | ~vbody_active).all(dim=-1) & vmask
+
+        sentinel = torch.tensor(-1, dtype=torch.long, device=dev)
+        for _ in range(depth + 1):
+            pool = torch.where(vproved, vhead_h, sentinel.expand(B, V))
+            pool_sorted, _ = pool.reshape(B * V).sort()
+            flat_vb = vbody_h.reshape(B * V * M_per)
+            pos = torch.searchsorted(pool_sorted, flat_vb)
+            pos = pos.clamp(max=B * V - 1)
+            found = pool_sorted[pos] == flat_vb
+            in_pool = found.view(B, V, M_per)
+            vproved = (vis_fact | in_pool | ~vbody_active).all(dim=-1) & vmask
+
+        # A grounding is proved if ALL its active depths are proved
+        vproved_per_depth = vproved.reshape(B, N, D_h)
+        depth_inactive = ~vhead_active  # inactive depths don't block
+        proved = (vproved_per_depth | depth_inactive).all(dim=-1) & mask
+        return proved
+
+    # --- Standard mode (flat body, query = head) ---
     is_fact = fact_index.exists(
-        body.reshape(-1, 3)).view(B, N, M)            # [B, N, M]
-    body_active = body[..., 0] != padding_idx         # [B, N, M]
+        body.reshape(-1, 3)).view(B, N, M)
+    body_active = body[..., 0] != padding_idx
 
-    # --- Seed: all active body atoms are facts ---
-    proved = (is_fact | ~body_active).all(dim=-1) & mask  # [B, N]
+    proved = (is_fact | ~body_active).all(dim=-1) & mask
 
-    # --- Fixed-point iterations ---
     sentinel = torch.tensor(-1, dtype=torch.long, device=dev)
-
     for _ in range(depth + 1):
-        # Collect proved heads across ENTIRE batch into 1D pool
-        all_heads = head_hashes.reshape(B * N)           # [B*N]
-        all_proved = proved.reshape(B * N)                # [B*N]
-        proved_pool = torch.where(all_proved, all_heads, sentinel.expand_as(all_heads))
-        proved_pool_sorted, _ = proved_pool.sort()        # [B*N]
+        all_heads = head_hashes_flat.reshape(B * N_pool)
+        all_valid = proved.reshape(B * N_pool)
+        proved_pool = torch.where(
+            all_valid, all_heads, sentinel.expand(B * N_pool))
+        proved_pool_sorted, _ = proved_pool.sort()
 
-        # Check each body atom against the global pool
-        flat_body = body_hashes.reshape(B * N * M)        # [B*N*M]
+        flat_body = body_hashes.reshape(B * N * M)
         pos = torch.searchsorted(proved_pool_sorted, flat_body)
-        pos = pos.clamp(max=B * N - 1)
+        pos = pos.clamp(max=B * N_pool - 1)
         found = proved_pool_sorted[pos] == flat_body
-        in_proved = found.view(B, N, M)                   # [B, N, M]
+        in_proved = found.view(B, N, M)
 
         atom_ok = is_fact | in_proved | ~body_active
-        new_proved = atom_ok.all(dim=-1) & mask
-
-        proved = new_proved
+        proved = atom_ok.all(dim=-1) & mask
 
     return proved

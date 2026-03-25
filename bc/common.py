@@ -7,7 +7,7 @@ All functions are pure (no class dependencies) and torch.compile compatible.
 """
 
 from __future__ import annotations
-from typing import Optional, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 import torch
 from torch import Tensor
@@ -73,7 +73,7 @@ def pack_states(
     rule_subs: Tensor,         # [B, S, K_r, 2, 2]
     top_ridx: Tensor,          # [B, S]
     grounding_body: Tensor,    # [B, S, M_work, 3]
-    body_count: Tensor,        # [B, S]
+    body_count: Tensor,        # [B, S, D] (structured) or [B, S] (legacy)
     S_out: int,
     padding_idx: int,
     collect_evidence: bool = True,
@@ -121,13 +121,19 @@ def pack_states(
     G = rule_goals.shape[3]
 
     # ── Fact children: flatten, inherit parent ridx and body_count ──
+    bc_is_3d = body_count.dim() == 3   # [B, S, D] vs [B, S]
     if K_f > 0:
         f_goals = fact_goals.reshape(B, n_f, G, 3)
         f_valid = fact_success.reshape(B, n_f)
         f_ridx = top_ridx.unsqueeze(2).expand(
             B, S_in, K_f).reshape(B, n_f)
-        f_bcount = body_count.unsqueeze(2).expand(
-            B, S_in, K_f).reshape(B, n_f)
+        if bc_is_3d:
+            D_bc = body_count.shape[2]
+            f_bcount = body_count.unsqueeze(2).expand(
+                B, S_in, K_f, D_bc).reshape(B, n_f, D_bc)
+        else:
+            f_bcount = body_count.unsqueeze(2).expand(
+                B, S_in, K_f).reshape(B, n_f)
         f_subs = fact_subs.reshape(B, n_f, 2, 2)
         # Parent indices for fact children: child j has parent j // K_f
         f_parents = torch.arange(S_in, device=dev).unsqueeze(1).expand(
@@ -135,7 +141,10 @@ def pack_states(
         f_parents = f_parents.unsqueeze(0).expand(B, n_f)
         if collect_evidence:
             # Skip facts when grounding_body not yet established
-            uninit = (body_count == 0)
+            if bc_is_3d:
+                uninit = (body_count.sum(dim=-1) == 0)  # [B, S]
+            else:
+                uninit = (body_count == 0)
             f_valid = f_valid & ~uninit.unsqueeze(-1).expand(
                 B, S_in, K_f).reshape(B, n_f)
         # Fact children: no new body atoms (padding)
@@ -148,7 +157,11 @@ def pack_states(
         f_goals = torch.full((B, 0, G, 3), pad, dtype=torch.long, device=dev)
         f_valid = torch.zeros(B, 0, dtype=torch.bool, device=dev)
         f_ridx = torch.zeros(B, 0, dtype=torch.long, device=dev)
-        f_bcount = torch.zeros(B, 0, dtype=torch.long, device=dev)
+        if bc_is_3d:
+            D_bc = body_count.shape[2]
+            f_bcount = torch.zeros(B, 0, D_bc, dtype=torch.long, device=dev)
+        else:
+            f_bcount = torch.zeros(B, 0, dtype=torch.long, device=dev)
         f_subs = torch.full((B, 0, 2, 2), pad, dtype=torch.long, device=dev)
         f_parents = torch.zeros(B, 0, dtype=torch.long, device=dev)
         f_has_new = torch.zeros(B, 0, dtype=torch.bool, device=dev)
@@ -179,8 +192,12 @@ def pack_states(
             (B, n_r, M_work, 3), pad, dtype=torch.long, device=dev)
         r_has_new = torch.zeros(B, n_r, dtype=torch.bool, device=dev)
 
-    r_bcount = body_count.unsqueeze(2).expand(
-        B, S_in, K_r).reshape(B, n_r)  # inherited from parent
+    if bc_is_3d:
+        r_bcount = body_count.unsqueeze(2).expand(
+            B, S_in, K_r, D_bc).reshape(B, n_r, D_bc)
+    else:
+        r_bcount = body_count.unsqueeze(2).expand(
+            B, S_in, K_r).reshape(B, n_r)  # inherited from parent
 
     r_ridx = torch.where(
         first,
@@ -196,6 +213,13 @@ def pack_states(
         S_in, K_r).reshape(n_r)
     r_parents = r_parents.unsqueeze(0).expand(B, n_r)
 
+    # ── Current-depth rule index (for per-depth evidence) ──
+    # Fact children: -1 (no rule at this depth); Rule children: sub_rule_idx
+    f_current_ridx = torch.full(
+        (B, n_f), -1, dtype=torch.long, device=dev) if K_f > 0 else (
+        torch.zeros(B, 0, dtype=torch.long, device=dev))
+    r_current_ridx = sub_rule_idx.reshape(B, n_r)
+
     # ── Concatenate all children (skip cat when K_f=0) ──
     if K_f == 0:
         all_gbody = r_gbody
@@ -206,6 +230,7 @@ def pack_states(
         all_subs = r_subs
         all_parents = r_parents
         all_has_new = r_has_new
+        all_current_ridx = r_current_ridx
     else:
         all_gbody = torch.cat([f_gbody, r_gbody], dim=1)     # [B, N, M_work, 3]
         all_goals = torch.cat([f_goals, r_goals], dim=1)      # [B, N, G, 3]
@@ -215,6 +240,7 @@ def pack_states(
         all_subs = torch.cat([f_subs, r_subs], dim=1)        # [B, N, 2, 2]
         all_parents = torch.cat([f_parents, r_parents], dim=1)  # [B, N]
         all_has_new = torch.cat([f_has_new, r_has_new], dim=1)  # [B, N]
+        all_current_ridx = torch.cat([f_current_ridx, r_current_ridx], dim=1)
 
     # ── Scatter-compact to S_out ──
     cumsum = all_valid.long().cumsum(dim=1)
@@ -228,21 +254,31 @@ def pack_states(
     out_goals = torch.full(
         (B, S_out + 1, G, 3), pad, dtype=torch.long, device=dev)
     out_ridx = torch.zeros(B, S_out + 1, dtype=torch.long, device=dev)
-    out_bcount = torch.zeros(B, S_out + 1, dtype=torch.long, device=dev)
+    if bc_is_3d:
+        out_bcount = torch.zeros(B, S_out + 1, D_bc, dtype=torch.long, device=dev)
+    else:
+        out_bcount = torch.zeros(B, S_out + 1, dtype=torch.long, device=dev)
     out_subs = torch.full(
         (B, S_out + 1, 2, 2), pad, dtype=torch.long, device=dev)
     out_parents = torch.zeros(B, S_out + 1, dtype=torch.long, device=dev)
     out_has_new = torch.zeros(B, S_out + 1, dtype=torch.bool, device=dev)
+    out_cur_ridx = torch.full(
+        (B, S_out + 1), -1, dtype=torch.long, device=dev)
 
     ti = target.unsqueeze(-1).unsqueeze(-1)
     out_gbody.scatter_(1, ti.expand(-1, -1, M_work, 3), all_gbody)
     out_goals.scatter_(1, ti.expand(-1, -1, G, 3), all_goals)
     out_ridx.scatter_(1, target, all_ridx)
-    out_bcount.scatter_(1, target, all_bcount)
+    if bc_is_3d:
+        out_bcount.scatter_(1, target[:, :, None].expand(-1, -1, D_bc),
+                            all_bcount)
+    else:
+        out_bcount.scatter_(1, target, all_bcount)
     out_subs.scatter_(
         1, target.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 2, 2), all_subs)
     out_parents.scatter_(1, target, all_parents)
     out_has_new.scatter_(1, target, all_has_new)
+    out_cur_ridx.scatter_(1, target, all_current_ridx)
 
     counts = all_valid.sum(dim=1).clamp(max=S_out)
     out_valid = torch.arange(S_out, device=dev).unsqueeze(0) < counts.unsqueeze(1)
@@ -250,7 +286,138 @@ def pack_states(
     return PackedStates(out_gbody[:, :S_out], out_goals[:, :S_out],
                         out_ridx[:, :S_out], out_valid, out_bcount[:, :S_out],
                         out_parents[:, :S_out], out_subs[:, :S_out],
-                        out_has_new[:, :S_out])
+                        out_has_new[:, :S_out], out_cur_ridx[:, :S_out])
+
+
+# ---------------------------------------------------------------------------
+# Flat packing: FlatResolvedChildren → dense PackedStates
+# ---------------------------------------------------------------------------
+
+
+def pack_states_flat(
+    flat_resolved,           # FlatResolvedChildren
+    top_ridx: Tensor,        # [B, S] parent rule indices
+    grounding_body: Tensor,  # [B, S, M_work, 3] parent working body
+    body_count: Tensor,      # [B, S, D] or [B, S] valid atom count per state
+    padding_idx: int,
+    collect_evidence: bool = True,
+    M_rule: int = 0,
+    dedup: bool = True,
+) -> PackedStates:
+    """Pack flat resolve output into dense [B, S_out, ...] state tensors.
+
+    S_out is dynamic — computed from the actual number of unique valid children
+    per batch element. No fixed S_max cap.
+
+    Deduplicates children with identical proof goals within each batch element
+    (same hash = same state, no need to explore twice).
+    """
+    B = flat_resolved.B
+    pad = padding_idx
+    dev = flat_resolved.flat_goals.device
+
+    flat_goals = flat_resolved.flat_goals       # [T, G, 3]
+    flat_gbody = flat_resolved.flat_gbody       # [T, A, 3]
+    flat_ridx = flat_resolved.flat_rule_idx     # [T]
+    flat_b = flat_resolved.flat_b_idx           # [T]
+    flat_s = flat_resolved.flat_s_idx           # [T]
+    flat_subs = flat_resolved.flat_subs         # [T, 2, 2]
+    T = flat_goals.size(0)
+    G = flat_goals.size(1)
+    M_work = grounding_body.shape[2]
+
+    bc_is_3d = body_count.dim() == 3
+    if T == 0:
+        S_out = 1
+        out_valid = torch.zeros(B, S_out, dtype=torch.bool, device=dev)
+        out_goals = torch.full((B, S_out, G, 3), pad, dtype=torch.long, device=dev)
+        out_gbody = torch.full((B, S_out, M_work, 3), pad, dtype=torch.long, device=dev)
+        out_ridx = torch.zeros(B, S_out, dtype=torch.long, device=dev)
+        if bc_is_3d:
+            D_bc = body_count.shape[2]
+            out_bcount = torch.zeros(B, S_out, D_bc, dtype=torch.long, device=dev)
+        else:
+            out_bcount = torch.zeros(B, S_out, dtype=torch.long, device=dev)
+        out_parents = torch.zeros(B, S_out, dtype=torch.long, device=dev)
+        out_subs = torch.full((B, S_out, 2, 2), pad, dtype=torch.long, device=dev)
+        out_has_new = torch.zeros(B, S_out, dtype=torch.bool, device=dev)
+        out_cur_ridx = torch.full((B, S_out), -1, dtype=torch.long, device=dev)
+        return PackedStates(out_gbody, out_goals, out_ridx, out_valid,
+                            out_bcount, out_parents, out_subs, out_has_new,
+                            out_cur_ridx)
+
+    # ── Dedup: remove children with identical proof goals within each batch ──
+    if dedup:
+        P1, P2, P3, P4 = 1_000_003, 999_983, 999_979, 999_961
+        atom_h = (flat_goals[..., 0].long() * P1
+                  + flat_goals[..., 1].long() * P2
+                  + flat_goals[..., 2].long() * P3)       # [T, G]
+        powers = P4 ** torch.arange(G - 1, -1, -1, device=dev)
+        goal_hash = (atom_h * powers).sum(dim=-1)          # [T]
+        compound = flat_b.long() * P1 + goal_hash
+        sorted_c, sort_idx = compound.sort()
+        is_dup = torch.zeros(T, dtype=torch.bool, device=dev)
+        is_dup[1:] = sorted_c[1:] == sorted_c[:-1]
+        is_dup_orig = is_dup[sort_idx.argsort()]
+        keep = ~is_dup_orig
+
+        flat_goals = flat_goals[keep]
+        flat_gbody = flat_gbody[keep]
+        flat_ridx = flat_ridx[keep]
+        flat_b = flat_b[keep]
+        flat_s = flat_s[keep]
+        flat_subs = flat_subs[keep]
+        T = flat_goals.size(0)
+
+    # ── Dynamic S_out: max unique children per batch element ──
+    from grounder.resolution.enum import _cumcount_flat
+    counts = torch.zeros(B, dtype=torch.long, device=dev)
+    if T > 0:
+        counts.scatter_add_(0, flat_b, torch.ones(T, dtype=torch.long, device=dev))
+    S_out = max(int(counts.max().item()), 1)  # one .item() graph break
+
+    # Per-batch cumcount: assign each child a sequential position
+    pos = _cumcount_flat(flat_b)  # [T]
+
+    # ── Build dense output tensors [B, S_out, ...] ──
+    out_goals = torch.full((B, S_out, G, 3), pad, dtype=torch.long, device=dev)
+    out_gbody = torch.full((B, S_out, M_work, 3), pad, dtype=torch.long, device=dev)
+    out_ridx = torch.zeros(B, S_out, dtype=torch.long, device=dev)
+    if bc_is_3d:
+        D_bc = body_count.shape[2]
+        out_bcount = torch.zeros(B, S_out, D_bc, dtype=torch.long, device=dev)
+    else:
+        out_bcount = torch.zeros(B, S_out, dtype=torch.long, device=dev)
+    out_subs = torch.full((B, S_out, 2, 2), pad, dtype=torch.long, device=dev)
+    out_parents = torch.zeros(B, S_out, dtype=torch.long, device=dev)
+    out_has_new = torch.zeros(B, S_out, dtype=torch.bool, device=dev)
+    out_cur_ridx = torch.full((B, S_out), -1, dtype=torch.long, device=dev)
+
+    if T > 0:
+        out_goals[flat_b, pos] = flat_goals
+
+        if M_rule <= 0:
+            M_rule = M_work
+        new_body = flat_goals[:, :M_rule, :]
+        if M_rule < M_work:
+            new_body = torch.nn.functional.pad(
+                new_body, (0, 0, 0, M_work - M_rule), value=pad)
+        out_gbody[flat_b, pos] = new_body
+
+        parent_ridx = top_ridx[flat_b, flat_s]
+        first = (parent_ridx == -1)
+        out_ridx[flat_b, pos] = torch.where(first, flat_ridx, flat_ridx)
+        out_bcount[flat_b, pos] = body_count[flat_b, flat_s]
+        out_parents[flat_b, pos] = flat_s
+        out_subs[flat_b, pos] = flat_subs
+        out_has_new[flat_b, pos] = True
+        out_cur_ridx[flat_b, pos] = flat_ridx  # current depth's rule index
+
+    out_valid = torch.arange(S_out, device=dev).unsqueeze(0) < counts.clamp(max=S_out).unsqueeze(1)
+
+    return PackedStates(out_gbody, out_goals, out_ridx, out_valid,
+                        out_bcount, out_parents, out_subs, out_has_new,
+                        out_cur_ridx)
 
 
 # ---------------------------------------------------------------------------
@@ -259,136 +426,148 @@ def pack_states(
 
 
 def collect_groundings(
-    grounding_body: Tensor,     # [B, S, G_body, 3]
+    grounding_body: Tensor,     # [B, S, D, M, 3] structured
     proof_goals: Tensor,        # [B, S, G, 3]
     state_valid: Tensor,        # [B, S]
-    top_ridx: Tensor,           # [B, S]
-    collected_body: Tensor,     # [B, C, G_body, 3]
+    ridx_per_depth: Tensor,     # [B, S, D]
+    collected_body: Tensor,     # [B, C, D, M, 3]
     collected_mask: Tensor,     # [B, C]
-    collected_ridx: Tensor,     # [B, C]
+    collected_ridx: Tensor,     # [B, C, D]
     constant_no: int,
     pad_idx: int,
     C: int,
-    body_count: Tensor,          # [B, S]
-    collected_bcount: Tensor,    # [B, C]
+    body_count: Tensor,          # [B, S, D]
+    collected_bcount: Tensor,    # [B, C, D]
     collect_mode: str = "terminal",
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Collect completed groundings into output buffer (TS-specific).
+    deactivate: bool = True,
+    head_per_depth: Optional[Tensor] = None,   # [B, S, D, 3]
+    collected_head: Optional[Tensor] = None,    # [B, C, D, 3]
+) -> Tuple:
+    """Collect completed groundings into output buffer.
+
+    Handles structured body [B, S, D, M, 3] and per-depth rule indices [B, S, D].
 
     Args:
-        grounding_body: [B, S, G_body, 3] current grounding bodies (accumulated)
-        proof_goals: [B, S, G, 3] current proof goals (after pruning + compaction)
-        state_valid: [B, S] active state mask
-        top_ridx: [B, S] rule index per state
-        collected_body: [B, C, G_body, 3] accumulated grounding bodies
-        collected_mask: [B, C] accumulated validity mask
-        collected_ridx: [B, C] accumulated rule indices
-        constant_no: highest constant index
-        pad_idx: padding value
-        C: max number of collected groundings (C)
-        body_count: [B, S] number of valid body atoms per state
-        collected_bcount: [B, C] accumulated body counts
-        collect_mode: 'terminal' (all goals padding) or 'grounded' (goals
-            may contain grounded unknowns — for the u-variant / nesy scoring).
+        deactivate: If True (default), collected states are deactivated so they
+            are not explored further. Set to False when collecting intermediate
+            (grounded) states that should continue to deeper depths.
 
     Returns:
-        out_body:    [B, C, G_body, 3] updated collected bodies
-        out_mask:    [B, C] updated collected mask
-        out_ridx:    [B, C] updated collected rule indices
-        state_valid: [B, S] updated (terminal states deactivated)
-        out_bcount:  [B, C] updated collected body counts
+        out_body:    [B, C, D, M, 3]
+        out_mask:    [B, C]
+        out_ridx:    [B, C, D]
+        state_valid: [B, S] updated
+        out_bcount:  [B, C, D]
     """
-    B, S, G_body, _ = grounding_body.shape
+    B, S, D_dim, M_dim, _ = grounding_body.shape
     dev = grounding_body.device
     E = constant_no + 1
-    # C is the collected groundings budget (parameter)
+    G_body_flat = D_dim * M_dim
 
     is_padding = (proof_goals[:, :, :, 0] == pad_idx)  # [B, S, G]
 
-    body_args = grounding_body[:, :, :, 1:3]
-    body_active = (grounding_body[:, :, :, 0] != pad_idx)   # [B, S, G_body]
+    # Flatten body for ground-check: [B, S, D*M, 3]
+    body_flat = grounding_body.reshape(B, S, G_body_flat, 3)
+    body_args = body_flat[:, :, :, 1:3]
+    body_active = (body_flat[:, :, :, 0] != pad_idx)
     is_ground = ((body_args < E) | ~body_active.unsqueeze(-1)).all(dim=-1).all(dim=-1)
 
     if collect_mode == "grounded":
-        # Accept states where all goals are either padding or grounded
-        # (no variables). Remaining grounded goals are open unknowns
-        # for downstream nesy scoring.
-        goal_args = proof_goals[:, :, :, 1:3]             # [B, S, G, 2]
-        goal_grounded = (goal_args < E).all(dim=-1)        # [B, S, G]
+        goal_args = proof_goals[:, :, :, 1:3]
+        goal_grounded = (goal_args < E).all(dim=-1)
         all_goals_ok = (is_padding | goal_grounded).all(dim=2)
     else:
-        # Terminal: all goals must be padding (fully resolved)
         all_goals_ok = is_padding.all(dim=2)
 
     valid_grounding = all_goals_ok & is_ground & state_valid
 
+    has_head = head_per_depth is not None and collected_head is not None
+
     n_new = S
-    body_new = grounding_body
-    ridx_new = top_ridx
-
     n_cat = C + n_new
-    cb = torch.cat([collected_body, body_new], dim=1)
-    cm = torch.cat([collected_mask, valid_grounding], dim=1)
-    cr = torch.cat([collected_ridx, ridx_new], dim=1)
+    # Cat along dim=1 — inner dims D, M, 3 carried through
+    cb = torch.cat([collected_body, grounding_body], dim=1)     # [B, C+S, D, M, 3]
+    cm = torch.cat([collected_mask, valid_grounding], dim=1)    # [B, C+S]
+    cr = torch.cat([collected_ridx, ridx_per_depth], dim=1)     # [B, C+S, D]
+    c_bc = torch.cat([collected_bcount, body_count], dim=1)     # [B, C+S, D]
+    if has_head:
+        c_hd = torch.cat([collected_head, head_per_depth], dim=1)  # [B, C+S, D, 3]
 
-    # Thread body_count through
-    c_bc = torch.cat([collected_bcount, body_count], dim=1)  # [B, C + S]
-
-    cm = _dedup_groundings(cb, cr, cm, G_body)
+    # Dedup: hash over flat body + all D rule indices
+    cb_flat = cb.reshape(B, n_cat, G_body_flat, 3)
+    cm = _dedup_groundings(cb_flat, cr, cm, G_body_flat)
 
     n_k = min(C, n_cat)
     _, ki = cm.to(torch.int8).topk(
         n_k, dim=1, largest=True, sorted=False)
 
+    # Gather with structured dimensions
+    ki_body = ki[:, :, None, None, None].expand(-1, -1, D_dim, M_dim, 3)
+    ki_ridx = ki[:, :, None].expand(-1, -1, D_dim)
+    ki_head = ki[:, :, None, None].expand(-1, -1, D_dim, 3) if has_head else None
+
     if n_k < C:
         p2 = C - n_k
         out_body = torch.nn.functional.pad(
-            cb.gather(1, ki.unsqueeze(-1).unsqueeze(-1).expand(
-                -1, -1, G_body, 3)), (0, 0, 0, 0, 0, p2))
-        out_mask = torch.nn.functional.pad(
-            cm.gather(1, ki), (0, p2))
-        out_ridx = torch.nn.functional.pad(
-            cr.gather(1, ki), (0, p2))
+            cb.gather(1, ki_body), (0, 0, 0, 0, 0, 0, 0, p2))
+        out_mask = torch.nn.functional.pad(cm.gather(1, ki), (0, p2))
+        out_ridx = torch.nn.functional.pad(cr.gather(1, ki_ridx), (0, 0, 0, p2))
         out_bcount = torch.nn.functional.pad(
-            c_bc.gather(1, ki), (0, p2))
+            c_bc.gather(1, ki_ridx), (0, 0, 0, p2))
+        out_head = (torch.nn.functional.pad(
+            c_hd.gather(1, ki_head), (0, 0, 0, 0, 0, p2))
+            if has_head else None)
     else:
-        out_body = cb.gather(
-            1, ki.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, G_body, 3))
+        out_body = cb.gather(1, ki_body)
         out_mask = cm.gather(1, ki)
-        out_ridx = cr.gather(1, ki)
-        out_bcount = c_bc.gather(1, ki)
+        out_ridx = cr.gather(1, ki_ridx)
+        out_bcount = c_bc.gather(1, ki_ridx)
+        out_head = c_hd.gather(1, ki_head) if has_head else None
 
-    state_valid = state_valid & ~valid_grounding
+    if deactivate:
+        state_valid = state_valid & ~valid_grounding
 
-    return out_body, out_mask, out_ridx, state_valid, out_bcount
+    return out_body, out_mask, out_ridx, state_valid, out_bcount, out_head
 
 
 def _dedup_groundings(
-    body: Tensor,       # [B, N, G_body, 3]
-    ridx: Tensor,       # [B, N]
+    body: Tensor,       # [B, N, G_body, 3] (flat view)
+    ridx: Tensor,       # [B, N] or [B, N, D]
     mask: Tensor,       # [B, N]
     G_body: int,
 ) -> Tensor:
     """Remove duplicate groundings based on (ridx, body) hash.
 
     Args:
-        body: [B, N, G_body, 3] grounding body atoms
-        ridx: [B, N] rule index per grounding
+        body: [B, N, G_body, 3] grounding body atoms (flat view)
+        ridx: [B, N, D] per-depth rule indices, or [B, N] single rule index
         mask: [B, N] validity mask
-        G_body: number of body atom slots (accumulated capacity)
+        G_body: number of body atom slots in flat view
 
     Returns:
         mask: [B, N] updated mask with duplicates removed
     """
     B, N = mask.shape
     dev = mask.device
-    # Vectorized prime-mixing hash (overflow-safe, no E*E needed)
     P1, P2, P3, P4 = 1_000_003, 999_983, 999_979, 999_961
+
+    # Body hash: [B, N]
     atom_hashes = (body[..., 0].long() * P1
                    + body[..., 1].long() * P2
                    + body[..., 2].long() * P3)               # [B, N, G_body]
-    powers = P4 ** torch.arange(G_body - 1, -1, -1, device=dev)   # [G_body]
-    g_hash = ridx.long() * P1 + (atom_hashes * powers).sum(dim=-1)  # [B, N]
+    powers = P4 ** torch.arange(G_body - 1, -1, -1, device=dev)
+    body_hash = (atom_hashes * powers).sum(dim=-1)            # [B, N]
+
+    # Rule index hash: include all D dimensions if structured
+    if ridx.dim() == 3:
+        D = ridx.shape[2]
+        r_powers = P4 ** torch.arange(D - 1, -1, -1, device=dev)
+        ridx_hash = (ridx.long() * r_powers).sum(dim=-1)     # [B, N]
+    else:
+        ridx_hash = ridx.long()                                # [B, N]
+
+    g_hash = ridx_hash * P1 + body_hash                       # [B, N]
+
     sentinel = torch.tensor(-1, dtype=torch.long, device=dev)
     gh = torch.where(mask, g_hash, sentinel.expand(B, N))
     sorted_gh, sort_idx = gh.sort(dim=1)
@@ -398,3 +577,126 @@ def _dedup_groundings(
     inv_sort = sort_idx.argsort(dim=1)
     is_dup_orig = is_dup.gather(1, inv_sort)
     return mask & ~is_dup_orig
+
+
+# ---------------------------------------------------------------------------
+# rule2groundings pruning + tensor conversion
+# ---------------------------------------------------------------------------
+
+
+def prune_rule_groundings(
+    rule2groundings: Dict[int, Set[Tuple]],
+    fact_set: Set[Tuple[int, int, int]],
+    max_iterations: int = 10,
+) -> Dict[int, Set[Tuple]]:
+    """Iterative fixed-point pruning of rule groundings (Kleene T_P).
+
+    Equivalent to keras's PruneIncompleteProofs. Keeps only groundings
+    whose body atoms are all either facts or heads of other proved groundings.
+
+    Args:
+        rule2groundings: rule_idx → set of (head, body) tuples
+        fact_set: set of (pred, subj, obj) known facts
+        max_iterations: convergence bound
+
+    Returns:
+        Pruned dict with same structure.
+    """
+    # Compute proved heads: start with facts
+    proved: Set[Tuple[int, int, int]] = set(fact_set)
+
+    for _ in range(max_iterations):
+        prev_size = len(proved)
+        # Add heads of groundings whose bodies are all proved
+        for r, groundings in rule2groundings.items():
+            for head, body in groundings:
+                if all(atom in proved for atom in body):
+                    proved.add(head)
+        if len(proved) == prev_size:
+            break  # converged
+
+    # Filter: keep groundings whose bodies are all proved
+    pruned: Dict[int, Set[Tuple]] = {}
+    for r, groundings in rule2groundings.items():
+        kept = set()
+        for head, body in groundings:
+            if all(atom in proved for atom in body):
+                kept.add((head, body))
+        if kept:
+            pruned[r] = kept
+    return pruned
+
+
+def build_rule_grounding_tensors(
+    rule2groundings: Dict[int, Set[Tuple]],
+    num_rules: int,
+    device: torch.device,
+) -> "RuleGroundings":
+    """Convert Python rule2groundings to (A_in, A_out) tensors.
+
+    Each entry in rule2groundings[r] is (head_tuple, body_tuple) where:
+    - head_tuple = (pred, subj, obj)
+    - body_tuple = ((p,s,o), (p,s,o), ...)
+
+    Builds a global atom table and per-rule index tensors.
+
+    Returns:
+        RuleGroundings with atom_table [num_atoms, 3] and per-rule A_in/A_out.
+    """
+    from grounder.types import RuleGroundings
+
+    # 1. Collect all unique atoms
+    all_atoms: Dict[Tuple[int, int, int], int] = {}
+
+    def get_idx(atom: Tuple[int, int, int]) -> int:
+        if atom not in all_atoms:
+            all_atoms[atom] = len(all_atoms)
+        return all_atoms[atom]
+
+    # Pre-scan to build atom table
+    for r, groundings in rule2groundings.items():
+        for head, body in groundings:
+            get_idx(head)
+            for atom in body:
+                get_idx(atom)
+
+    num_atoms = len(all_atoms)
+    atom_table = torch.zeros(num_atoms, 3, dtype=torch.long, device=device)
+    for atom, idx in all_atoms.items():
+        atom_table[idx, 0] = atom[0]
+        atom_table[idx, 1] = atom[1]
+        atom_table[idx, 2] = atom[2]
+
+    # 2. Build per-rule A_in, A_out
+    A_in: Dict[int, Tensor] = {}
+    A_out: Dict[int, Tensor] = {}
+
+    for r in range(num_rules):
+        groundings = rule2groundings.get(r, set())
+        if not groundings:
+            A_in[r] = torch.zeros(0, 0, dtype=torch.long, device=device)
+            A_out[r] = torch.zeros(0, 1, dtype=torch.long, device=device)
+            continue
+
+        g_list = sorted(groundings)  # deterministic order
+        G_r = len(g_list)
+        M_r = max(len(body) for _, body in g_list)
+
+        a_in = torch.zeros(G_r, M_r, dtype=torch.long, device=device)
+        a_out = torch.zeros(G_r, 1, dtype=torch.long, device=device)
+
+        for g, (head, body) in enumerate(g_list):
+            a_out[g, 0] = all_atoms[head]
+            for m, atom in enumerate(body):
+                a_in[g, m] = all_atoms[atom]
+
+        A_in[r] = a_in
+        A_out[r] = a_out
+
+    return RuleGroundings(
+        atom_table=atom_table,
+        A_in=A_in,
+        A_out=A_out,
+        num_atoms=num_atoms,
+        num_rules=num_rules,
+    )

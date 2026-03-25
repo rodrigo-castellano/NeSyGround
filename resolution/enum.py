@@ -19,7 +19,7 @@ import torch
 from torch import Tensor
 
 from grounder.data.rule_index import RuleIndexEnum
-from grounder.types import ResolvedChildren
+from grounder.types import FlatResolvedChildren, ResolvedChildren
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1274,7 +1274,7 @@ def _resolve_enum_step_flat(
     if T == 0:
         # No valid candidates — return empty ResolvedChildren
         G_body = grounding_body.shape[2]
-        return _empty_resolved(B, S, G, G_body, M, pad, dev, collect_evidence)
+        return _empty_flat_resolved(B, S, G, G_body, pad, dev)
 
     # 4. Gather per-entry metadata for fill_body
     dep_src = (arg_source_dep if arg_source_dep is not None
@@ -1316,106 +1316,60 @@ def _resolve_enum_step_flat(
 
     if T_surv == 0:
         G_body = grounding_body.shape[2]
-        return _empty_resolved(B, S, G, G_body, M, pad, dev, collect_evidence)
+        return _empty_flat_resolved(B, S, G, G_body, pad, dev)
 
     surv_body = flat_body[surv_idx]                    # [T_surv, M, 3]
     surv_n_idx = flat_n_idx[surv_idx]                  # [T_surv]
     surv_rule_idx = rule_global_idx[surv_idx]          # [T_surv]
     surv_r_local = flat_r_idx[surv_idx]                # [T_surv] — K_r position
 
-    # 9. Convert flat → dense [B, S, K_cap, G, 3]
+    # 9. Build flat goals [T_surv, G, 3] — body atoms + remaining parent goals
     surv_b_idx = surv_n_idx // S       # [T_surv] — batch index
     surv_s_idx = surv_n_idx % S        # [T_surv] — state index
-    state_key = surv_b_idx * S + surv_s_idx  # [T_surv] — unique state ID
 
-    # Two-level cap to match dense path behaviour:
-    # Level 1: cap each (state, rule) group to G_r entries.
-    #   The dense path caps to G_r per rule during enumeration; applying the
-    #   same budget after filtering keeps the per-rule balance consistent.
-    state_rule_key = state_key * K_r + surv_r_local
-    per_rule_pos = _cumcount_flat(state_rule_key)  # [T_surv]
-    keep_rule = per_rule_pos < G_r
-    surv_body = surv_body[keep_rule]
-    surv_b_idx = surv_b_idx[keep_rule]
-    surv_s_idx = surv_s_idx[keep_rule]
-    surv_rule_idx = surv_rule_idx[keep_rule]
-    surv_r_local = surv_r_local[keep_rule]
-    state_key = state_key[keep_rule]
-    per_rule_pos = per_rule_pos[keep_rule]
-    T_surv = surv_body.size(0)
-
-    if T_surv == 0:
-        G_body = grounding_body.shape[2]
-        return _empty_resolved(B, S, G, G_body, M, pad, dev, collect_evidence)
-
-    # Level 2: interleave rules within each state then cap to K.
-    #   Interleaved position = per_rule_pos * K_r + r_local.
-    #   This ensures the first K entries are balanced across rules,
-    #   matching the dense path's topk which picks True entries from all rules.
-    pos_in_state = per_rule_pos * K_r + surv_r_local  # [T_surv]
-    K_cap = int(pos_in_state.max().item()) + 1 if T_surv > 0 else 1
-    K_cap = max(min(K_cap, K), 1)
-
-    keep = pos_in_state < K_cap
-    surv_body = surv_body[keep]
-    surv_b_idx = surv_b_idx[keep]
-    surv_s_idx = surv_s_idx[keep]
-    surv_rule_idx = surv_rule_idx[keep]
-    pos_in_state = pos_in_state[keep]
-
-    # Scatter into dense output [B, S, K_cap, G, 3]
-    rule_goals = torch.full(
-        (B, S, K_cap, G, 3), pad, dtype=torch.long, device=dev)
-    rule_goals[surv_b_idx, surv_s_idx, pos_in_state, :M, :] = surv_body
+    # Build flat_goals: [T_surv, G, 3]
+    flat_goals = torch.full(
+        (T_surv, G, 3), pad, dtype=torch.long, device=dev)
+    flat_goals[:, :M, :] = surv_body   # body atoms at positions 0..M-1
 
     # Copy remaining goals from parent at positions M..G-1
     n_rem = min(G - M, G - 1)
     if n_rem > 0:
-        rem = remaining[:, :, 1:1 + n_rem, :]
-        rule_goals[:, :, :, M:M + n_rem, :] = \
-            rem.unsqueeze(2).expand(-1, -1, K_cap, -1, -1)
+        rem = remaining[surv_b_idx, surv_s_idx, 1:1 + n_rem, :]  # [T_surv, n_rem, 3]
+        flat_goals[:, M:M + n_rem, :] = rem
 
-    # Success mask
-    rule_success = torch.zeros(B, S, K_cap, dtype=torch.bool, device=dev)
-    rule_success[surv_b_idx, surv_s_idx, pos_in_state] = True
-
-    # Rule indices
-    sub_rule_idx = torch.zeros(B, S, K_cap, dtype=torch.long, device=dev)
-    sub_rule_idx[surv_b_idx, surv_s_idx, pos_in_state] = surv_rule_idx
-
-    # Grounding body
+    # Grounding body (parent's, for evidence tracking)
     G_body = grounding_body.shape[2]
     if collect_evidence:
-        rule_gbody = grounding_body.unsqueeze(2).expand(-1, -1, K_cap, -1, -1)
+        flat_gbody = grounding_body[surv_b_idx, surv_s_idx]  # [T_surv, G_body, 3]
     else:
-        rule_gbody = torch.zeros(B, S, K_cap, G_body, 3, dtype=torch.long, device=dev)
+        flat_gbody = torch.zeros(T_surv, G_body, 3, dtype=torch.long, device=dev)
 
-    # Empty fact results
-    fact_goals = torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev)
-    fact_gbody = torch.zeros(B, S, 0, G_body, 3, dtype=torch.long, device=dev)
-    fact_success = torch.zeros(B, S, 0, dtype=torch.bool, device=dev)
-    fact_subs = torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev)
-    rule_subs = torch.full((B, S, K_cap, 2, 2), pad, dtype=torch.long, device=dev)
+    flat_subs = torch.full(
+        (T_surv, 2, 2), pad, dtype=torch.long, device=dev)
 
-    return ResolvedChildren(fact_goals, fact_gbody, fact_success,
-                            rule_goals, rule_gbody, rule_success,
-                            sub_rule_idx, fact_subs, rule_subs)
+    return FlatResolvedChildren(
+        flat_goals=flat_goals,
+        flat_gbody=flat_gbody,
+        flat_rule_idx=surv_rule_idx,
+        flat_b_idx=surv_b_idx,
+        flat_s_idx=surv_s_idx,
+        flat_subs=flat_subs,
+        B=B, S=S,
+    )
 
 
-def _empty_resolved(B, S, G, G_body, M, pad, dev, collect_evidence):
-    """Return empty ResolvedChildren when no candidates survive."""
-    fact_goals = torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev)
-    fact_gbody = torch.zeros(B, S, 0, G_body, 3, dtype=torch.long, device=dev)
-    fact_success = torch.zeros(B, S, 0, dtype=torch.bool, device=dev)
-    rule_goals = torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev)
-    rule_gbody = torch.zeros(B, S, 0, G_body, 3, dtype=torch.long, device=dev)
-    rule_success = torch.zeros(B, S, 0, dtype=torch.bool, device=dev)
-    sub_rule_idx = torch.zeros(B, S, 0, dtype=torch.long, device=dev)
-    fact_subs = torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev)
-    rule_subs = torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev)
-    return ResolvedChildren(fact_goals, fact_gbody, fact_success,
-                            rule_goals, rule_gbody, rule_success,
-                            sub_rule_idx, fact_subs, rule_subs)
+def _empty_flat_resolved(B, S, G, G_body, pad, dev):
+    """Return empty FlatResolvedChildren when no candidates survive."""
+    return FlatResolvedChildren(
+        flat_goals=torch.full((0, G, 3), pad, dtype=torch.long, device=dev),
+        flat_gbody=torch.zeros(0, G_body, 3, dtype=torch.long, device=dev),
+        flat_rule_idx=torch.zeros(0, dtype=torch.long, device=dev),
+        flat_b_idx=torch.zeros(0, dtype=torch.long, device=dev),
+        flat_s_idx=torch.zeros(0, dtype=torch.long, device=dev),
+        flat_subs=torch.full((0, 2, 2), pad, dtype=torch.long, device=dev),
+        B=B, S=S,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════

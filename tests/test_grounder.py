@@ -54,7 +54,7 @@ class TestGrandparentChain:
         output = grounder(queries, query_mask)
         valid_idx = output.evidence.mask[0].nonzero(as_tuple=True)[0]
         assert len(valid_idx) > 0
-        body = output.evidence.body[0, valid_idx[0]]
+        body = output.evidence.body_flat[0, valid_idx[0]]
         body_list = body.tolist()
         assert [1, 1, 2] in body_list
         assert [1, 2, 3] in body_list
@@ -98,7 +98,7 @@ class TestSingleBodyRule:
         query_mask = torch.tensor([True])
         output = grounder(queries, query_mask)
         valid_idx = output.evidence.mask[0].nonzero(as_tuple=True)[0]
-        body = output.evidence.body[0, valid_idx[0]]
+        body = output.evidence.body_flat[0, valid_idx[0]]
         assert [1, 1, 2] in body.tolist()
 
 
@@ -202,7 +202,7 @@ class TestDepth2BodyAccumulation:
         valid_idx = output.evidence.mask[0].nonzero(as_tuple=True)[0]
         assert len(valid_idx) > 0, "Expected at least one valid grounding"
 
-        body = output.evidence.body[0, valid_idx[0]]
+        body = output.evidence.body_flat[0, valid_idx[0]]
         body_list = body.tolist()
 
         # Body atoms from Rule 1 (depth 0 application)
