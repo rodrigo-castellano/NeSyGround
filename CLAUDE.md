@@ -150,9 +150,11 @@ Public API aliases (for backward compatibility with experiments/model.py):
 - Keep mirrored grounder copies synchronized when the intent is shared behavior across repos.
 - Do not leave scratch artifacts inside package directories.
 - Prefer the smallest coherent change that keeps one owner per responsibility; avoid scattering one feature across multiple modules.
+- torch-kge-kernels is a sibling repo at `~/repos/torch-kge-kernels-swarm/main/`, installed as pip-editable. Edit it there, commit there, push there. The SHA pin in this repo's `pyproject.toml` must be bumped whenever the editable HEAD moves — the pre-commit hook (`scripts/check_editable_pins.py`, wired via `.pre-commit-config.yaml`) refuses commits when the pin and the editable HEAD disagree or when the editable HEAD is unpushed. Setup once with `conda activate gpu && pre-commit install`. Bypass only with `SKIP=check-editable-pins git commit ...` for genuinely unrelated commits during an in-flight cascade.
 
 ## Verification Checklist
 
-- any `grounder/` code change: `cd grounder && python -m pytest tests/ -v`
-- grounding semantics or counts changed: `cd grounder && python -m pytest tests/test_groundings.py -v`
+- any code change: `python -m pytest tests/ -v` (skip the `test_keras_*` files unless GPU + tensorflow are available)
+- grounding semantics or counts changed: `python -m pytest tests/test_groundings.py -v`
 - mirrored change intended: sync the other grounder copy or checkout and rerun its relevant tests
+- before any commit: the `check-editable-pins` pre-commit hook runs automatically (if installed) and blocks the commit if the `torch-kge-kernels` SHA pin in `pyproject.toml` has drifted from the editable install or points at an unpushed HEAD. To run it manually: `python scripts/check_editable_pins.py`.

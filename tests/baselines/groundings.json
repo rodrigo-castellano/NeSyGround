@@ -16,19 +16,19 @@
     "cuda_gpu_0": "NVIDIA GeForce RTX 3090"
   },
   "data_fingerprint": {
-    "/home/castellanoontiv/probfol-llm-swarm/main/submodules/torch-ns/grounder/data/family/train.txt": {
+    "/home/castellanoontiv/repos/grounder-swarm/main/data/family/train.txt": {
       "exists": true,
       "size_bytes": 344611,
       "mtime_epoch_s": 1773640722,
       "sha256": "f46eaabd973e70ea2e25928a05453aea60e330fc5f5f57766c9f0dca75632303"
     },
-    "/home/castellanoontiv/probfol-llm-swarm/main/submodules/torch-ns/grounder/data/family/test.txt": {
+    "/home/castellanoontiv/repos/grounder-swarm/main/data/family/test.txt": {
       "exists": true,
       "size_bytes": 97545,
       "mtime_epoch_s": 1773640722,
       "sha256": "6add760c6cb03518c79a30096f20285fae5255aec87595e53ef944ffc3555371"
     },
-    "/home/castellanoontiv/probfol-llm-swarm/main/submodules/torch-ns/grounder/data/family/rules.txt": {
+    "/home/castellanoontiv/repos/grounder-swarm/main/data/family/rules.txt": {
       "exists": true,
       "size_bytes": 7139,
       "mtime_epoch_s": 1773640722,
@@ -36,7 +36,7 @@
     }
   },
   "code_fingerprint": {
-    "repo_root": "/home/castellanoontiv/probfol-llm-swarm/main/submodules/torch-ns/grounder",
+    "repo_root": "/home/castellanoontiv/repos/grounder-swarm/main",
     "git_sha": "3fd724d3a77a8f2b681410aab7f9bd68725f89b3",
     "git_dirty": true
   },

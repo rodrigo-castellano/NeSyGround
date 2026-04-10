@@ -1,0 +1,19 @@
+# pre-commit hooks for this repo.
+#
+# Setup once per clone:
+#   conda activate gpu
+#   pre-commit install
+#
+# After that, hooks fire automatically on `git commit`. To bypass in an
+# emergency (e.g., committing a docs-only change while a dep is mid-cascade):
+#   SKIP=check-editable-pins git commit -m "..."
+# Use sparingly; the whole point of the hook is to keep SHA pins truthful.
+repos:
+  - repo: local
+    hooks:
+      - id: check-editable-pins
+        name: Verify pyproject SHA pins match editable installs
+        entry: python scripts/check_editable_pins.py
+        language: system
+        always_run: true
+        pass_filenames: false

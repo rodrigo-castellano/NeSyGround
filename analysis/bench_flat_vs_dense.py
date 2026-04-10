@@ -900,8 +900,11 @@ def main():
         print(f"\n[ERROR] Pipeline benchmark failed: {e}")
         import traceback; traceback.print_exc()
 
-    # Generate report
-    report_path = "/home/castellanoontiv/probfol-llm-swarm/main/submodules/torch-ns/docs/benchmark_flat_vs_dense.md"
+    # Generate report into this repo's docs/exp_analysis/ directory.
+    from pathlib import Path
+    report_path = str(
+        Path(__file__).resolve().parents[1] / "docs" / "exp_analysis" / "benchmark_flat_vs_dense.md"
+    )
     generate_markdown_report(report_path)
 
     print("\n" + "=" * 72)

@@ -13,7 +13,7 @@
 
 - B (batch): 1, 32, 128
 - K_f (fact candidates): 18 (avg), 200 (p95), 3612 (max for fb15k237)
-- S (state counts): 64, 256, 1024, 4096/home/castellanoontiv/probfol-llm-swarm/main/submodules/torch-ns/grounder/docs
+- S (state counts): 64, 256, 1024, 4096
 - M (body atoms): 1, 2, 3
 - G (goals): 7 (used in pipeline)
 - fb15k237 scale: E=14541, P=237, F=310116 (capped to E=5000, F=200000 for memory feasibility in enumerate/pipeline benchmarks)
