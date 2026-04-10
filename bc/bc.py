@@ -242,6 +242,11 @@ class BCGrounder(nn.Module):
             self.K = meta["K"]
             # init_enum may recompute S/C — override shared values.
             self.S = meta["S"]
+            # When depth > 1 with width > 0, intermediate steps generate many
+            # valid children that need state slots for the next step.  Ensure S
+            # is at least K so no valid children are lost during packing.
+            if self.depth > 1 and self.width is not None and self.width > 0:
+                self.S = max(self.S, self.K)
             self.C = meta["C"]
             # (C may be overridden by resolution-specific init)
             self.any_dual = meta["any_dual"]
