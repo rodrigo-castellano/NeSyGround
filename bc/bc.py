@@ -1166,20 +1166,24 @@ class BCGrounder(nn.Module):
 
         (states["grounding_body"], states["accumulated_body"],
          states["body_count"], states["ridx_per_depth"],
+         states["head_per_depth"],
          states["proof_goals"],
          states["top_ridx"], states["state_valid"],
          states["next_var_indices"],
          states["collected_body"], states["collected_mask"],
          states["collected_ridx"],
-         states["collected_bcount"]) = fn(
+         states["collected_bcount"],
+         states["collected_head"]) = fn(
             states["grounding_body"], states["accumulated_body"],
             states["body_count"], states["ridx_per_depth"],
+            states["head_per_depth"],
             states["proof_goals"],
             states["top_ridx"], states["state_valid"],
             states["next_var_indices"],
             states["collected_body"], states["collected_mask"],
             states["collected_ridx"],
             states["collected_bcount"],
+            states["collected_head"],
         )
         return states
 
@@ -1189,6 +1193,7 @@ class BCGrounder(nn.Module):
         accumulated_body: Tensor,
         body_count: Tensor,
         ridx_per_depth: Tensor,
+        head_per_depth: Tensor,
         proof_goals: Tensor,
         top_ridx: Tensor,
         state_valid: Tensor,
@@ -1197,15 +1202,17 @@ class BCGrounder(nn.Module):
         collected_mask: Tensor,
         collected_ridx: Tensor,
         collected_bcount: Tensor,
+        collected_head: Tensor,
         d: int = 0,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
-               Tensor, Tensor, Tensor, Tensor, Tensor]:
+               Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Raw tensor step for torch.compile -- same phases as clean path."""
         states = {
             "grounding_body": grounding_body,
             "accumulated_body": accumulated_body,
             "body_count": body_count,
             "ridx_per_depth": ridx_per_depth,
+            "head_per_depth": head_per_depth,
             "proof_goals": proof_goals,
             "top_ridx": top_ridx,
             "state_valid": state_valid,
@@ -1214,6 +1221,7 @@ class BCGrounder(nn.Module):
             "collected_mask": collected_mask,
             "collected_ridx": collected_ridx,
             "collected_bcount": collected_bcount,
+            "collected_head": collected_head,
         }
 
         # SELECT -> RESOLVE -> SEARCH FILTERS -> HOOKS -> PACK -> POSTPROCESS
@@ -1229,12 +1237,14 @@ class BCGrounder(nn.Module):
 
         return (states["grounding_body"], states["accumulated_body"],
                 states["body_count"], states["ridx_per_depth"],
+                states["head_per_depth"],
                 states["proof_goals"],
                 states["top_ridx"], states["state_valid"],
                 states["next_var_indices"],
                 states["collected_body"], states["collected_mask"],
                 states["collected_ridx"],
-                states["collected_bcount"])
+                states["collected_bcount"],
+                states["collected_head"])
 
     # ==================================================================
     # Provability

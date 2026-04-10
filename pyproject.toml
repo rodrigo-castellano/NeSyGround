@@ -1,5 +1,5 @@
 [project]
-name = "nesyground"
+name = "grounder"
 version = "0.1.0"
 description = "NeSyGround: Compiled CUDA-graph-safe FOL grounding for neuro-symbolic reasoning"
 requires-python = ">=3.10"
@@ -11,8 +11,37 @@ license = "MIT"
 readme = "README.md"
 
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-include = ["grounder*"]
+# The repo root IS the `grounder` package: __init__.py and the modules
+# (factory.py, types.py, utils.py) sit at the root, and subpackages
+# (bc/, fc/, filters/, nesy/, resolution/, analysis/, data/) are siblings.
+# We map "grounder" -> "." and each subpackage explicitly so consumers can
+# `import grounder` and `from grounder.bc.bc import BCGrounder` after a
+# normal `pip install`.
+[tool.setuptools]
+packages = [
+    "grounder",
+    "grounder.bc",
+    "grounder.fc",
+    "grounder.filters",
+    "grounder.filters.search",
+    "grounder.filters.soundness",
+    "grounder.nesy",
+    "grounder.resolution",
+    "grounder.analysis",
+    "grounder.data",
+]
+
+[tool.setuptools.package-dir]
+"grounder" = "."
+"grounder.bc" = "bc"
+"grounder.fc" = "fc"
+"grounder.filters" = "filters"
+"grounder.filters.search" = "filters/search"
+"grounder.filters.soundness" = "filters/soundness"
+"grounder.nesy" = "nesy"
+"grounder.resolution" = "resolution"
+"grounder.analysis" = "analysis"
+"grounder.data" = "data"

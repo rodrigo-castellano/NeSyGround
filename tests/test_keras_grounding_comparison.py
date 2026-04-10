@@ -10,6 +10,7 @@ Usage:
 """
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -19,8 +20,13 @@ import torch
 
 TESTS_DIR = Path(__file__).resolve().parent
 GROUNDER_ROOT = TESTS_DIR.parent
-TORCH_NS_ROOT = GROUNDER_ROOT.parent
-KERAS_NS_ROOT = TORCH_NS_ROOT.parent / "keras-ns"
+# keras-ns is a sibling-style reference repo (not pip-installed because its
+# top-level `ns_lib/` collides with torch-ns).  Default to ~/repos/keras-ns-swarm/main/
+# but allow override via KERAS_NS_ROOT env var.
+KERAS_NS_ROOT = Path(os.environ.get(
+    "KERAS_NS_ROOT",
+    str(Path.home() / "repos" / "keras-ns-swarm" / "main"),
+))
 
 if str(KERAS_NS_ROOT) not in sys.path:
     sys.path.insert(0, str(KERAS_NS_ROOT))
