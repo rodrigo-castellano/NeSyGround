@@ -158,9 +158,9 @@ __all__ = [
     "ResolutionRuleHook",
     "StepHook",
     # Scoring primitives
-    "kge_score_triples",
-    "kge_score_all_tails",
     "kge_score_all_heads",
+    "kge_score_all_tails",
+    "kge_score_triples",
     # Hook implementations
     "KGEScorer",
     "KGEFactFilter",
