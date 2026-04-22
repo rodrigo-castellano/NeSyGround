@@ -140,12 +140,21 @@ def pack_states(
             S_in, K_f).reshape(n_f)
         f_parents = f_parents.unsqueeze(0).expand(B, n_f)
         if collect_evidence:
-            # Skip facts when grounding_body not yet established
+            # Skip facts when grounding_body is uninitialised AND we are
+            # not at the initial depth-0 resolution. At depth 0 (top_ridx
+            # == -1, no rule applied yet) a direct fact match against the
+            # query IS a valid 0-body proof ("the query is itself a fact
+            # in the KB" — true for any base fact or, under the fp_global
+            # KB augmentation, any closure atom). Previously this case
+            # was dropped, which left 2+-hop queries and wide-existential
+            # rules with no grounding even when the head was derivable.
             if bc_is_3d:
                 uninit = (body_count.sum(dim=-1) == 0)  # [B, S]
             else:
                 uninit = (body_count == 0)
-            f_valid = f_valid & ~uninit.unsqueeze(-1).expand(
+            is_initial = (top_ridx == -1)  # [B, S] — pre-first-rule
+            skip_fact = uninit & ~is_initial
+            f_valid = f_valid & ~skip_fact.unsqueeze(-1).expand(
                 B, S_in, K_f).reshape(B, n_f)
         # Fact children: no new body atoms (padding)
         f_gbody = torch.full(

@@ -361,6 +361,268 @@ class BCGrounder(nn.Module):
         self._P_fp_global = P
         self._E_fp_global = E
 
+        # Augment the KB's fact index with the closure atoms.
+        #
+        # Without this augmentation, the SLD body-matching step
+        # enumerates over BASE facts only. Rules whose body atoms are
+        # derived (e.g. activate_failover <- is_down, can_failover_to)
+        # can never ground their body at query time because is_down /
+        # can_failover_to don't appear in facts.txt. FC at init IS
+        # able to derive such atoms, so the closure already contains
+        # the proof — but without augmenting the fact index, SLD can't
+        # find it. Concretely: merge the decoded closure triples into
+        # facts_idx and rebuild the fact index so body-atom enumeration
+        # naturally hits derived atoms as if they were base.
+        #
+        # Same fix removes the two structural failure modes for rules
+        # with wide base-fact bodies and many existential variables
+        # (e.g. shared_defect / coincident_failures with 6 atoms and
+        # 4 existentials): SLD enumeration blows the grounding budget
+        # before finding the right (X1, X2, F1, F2) assignment, but
+        # the augmented KB already contains the rule head as a fact,
+        # so a single 1-atom match is sufficient to prove the query
+        # via the identity rule pattern the grounder injects.
+        if n_fp_global > 0:
+            self._augment_kb_with_closure(device, E)
+            # After KB augmentation, precompute one (rule, body-grounding)
+            # witness per closure atom so query-time fact matches can be
+            # expanded into full rule-body groundings that SBR can score.
+            self._build_witness_table(device, E, compiled_rules)
+        else:
+            self._has_fp_global_witnesses = False
+
+    def _build_witness_table(
+        self, device: torch.device, E: int, compiled_rules=None,
+    ) -> None:
+        """Precompute per-closure-atom (rule_id, body_grounding) witnesses.
+
+        For each atom in the FC closure, find ONE rule whose head unifies
+        with the atom and whose body grounds in the (augmented) KB; record
+        that rule's index and the specific body-atom instantiation. Stored
+        as 2 dense buffers keyed by position in ``fp_global_hashes``:
+
+          fp_global_witness_rule: [N] long      — rule index (-1 = base fact)
+          fp_global_witness_body: [N, M, 3] long — body atoms, padded to M
+
+        At query time, when a fact-match grounding fires (rule_idx == -1,
+        see the ``top_ridx == -1`` branch in ``pack_states``), the caller
+        binary-searches the query's hash in ``fp_global_hashes`` and
+        replaces the empty fact-match body with the stored witness body.
+        SBR then computes ``reasoning_score = min(KGE(body atoms))`` just
+        as it would for any rule-match grounding — preserving principled
+        ranking among multi-valid closure members.
+
+        The build itself is a one-time CPU-Python pass at init (not in
+        the compiled forward-path). It enumerates body-atom bindings via
+        indexed dicts over the augmented facts; for industrial-scale
+        closures (~3k atoms, 16 rules, bodies up to 6 atoms with a few
+        existentials) the total cost is under a second.
+        """
+        from collections import defaultdict
+
+        if compiled_rules is None:
+            compiled_rules = getattr(
+                self._enum_ri, '_original_patterns', self._enum_ri.patterns)
+
+        N = int(self.fp_global_hashes.numel())
+        M = int(self.kb.M)
+        pad = int(self.kb.padding_idx)
+        c_no = int(self.kb.constant_no)
+        E2 = int(E) * int(E)
+
+        # Decode sorted closure hashes back to (pred, subj, obj) triples.
+        h_cpu = self.fp_global_hashes.cpu()
+        preds = (h_cpu // E2).tolist()
+        rem = (h_cpu % E2)
+        subjs = (rem // int(E)).tolist()
+        objs = (rem % int(E)).tolist()
+
+        # Build indexed fact lookups over the augmented KB.
+        facts_idx_cpu = self.kb.fact_index.facts_idx.cpu().tolist()
+        by_pred_s: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        by_pred_o: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+        for row in facts_idx_cpu:
+            p, s, o = int(row[0]), int(row[1]), int(row[2])
+            by_pred_s[(p, s)].append(o)
+            by_pred_o[(p, o)].append(s)
+
+        # Index rules by head predicate.
+        rules_by_head: Dict[int, List[Tuple[int, object]]] = defaultdict(list)
+        for ri, rp in enumerate(compiled_rules):
+            rules_by_head[int(rp.head_pred_idx)].append((ri, rp))
+
+        def find_body_grounding(
+            body_patterns: list, bindings: Dict[int, int],
+        ) -> Optional[List[Tuple[int, int, int]]]:
+            """Return a list of concrete body atoms or None."""
+            if not body_patterns:
+                return []
+            bp = body_patterns[0]
+            rest = body_patterns[1:]
+            bp_pred = int(bp["pred_idx"])
+            a0v = int(bp["arg0_var"])
+            a1v = int(bp["arg1_var"])
+
+            def resolve(v: int) -> Optional[int]:
+                if v <= c_no:
+                    return v
+                return bindings.get(v)
+
+            a0 = resolve(a0v)
+            a1 = resolve(a1v)
+
+            def try_pair(cs: int, co: int):
+                new_b = dict(bindings)
+                if a0v > c_no:
+                    new_b[a0v] = cs
+                if a1v > c_no:
+                    new_b[a1v] = co
+                tail = find_body_grounding(rest, new_b)
+                if tail is None:
+                    return None
+                return [(bp_pred, cs, co)] + tail
+
+            if a0 is not None and a1 is not None:
+                if a1 in by_pred_s.get((bp_pred, a0), []):
+                    r = try_pair(a0, a1)
+                    if r is not None:
+                        return r
+                return None
+            if a0 is not None:
+                for co in by_pred_s.get((bp_pred, a0), []):
+                    r = try_pair(a0, co)
+                    if r is not None:
+                        return r
+                return None
+            if a1 is not None:
+                for cs in by_pred_o.get((bp_pred, a1), []):
+                    r = try_pair(cs, a1)
+                    if r is not None:
+                        return r
+                return None
+            # Both args free: iterate over every fact of this pred.
+            # Build an index lazily on first request.
+            for (ps, po_list) in by_pred_s.items():
+                if ps[0] != bp_pred:
+                    continue
+                for co in po_list:
+                    r = try_pair(ps[1], co)
+                    if r is not None:
+                        return r
+            return None
+
+        # Allocate outputs on CPU, move to device at the end.
+        witness_rule = [-1] * N
+        witness_body: List[List[Tuple[int, int, int]]] = [[] for _ in range(N)]
+
+        for i in range(N):
+            p, s, o = preds[i], subjs[i], objs[i]
+            rules = rules_by_head.get(p, [])
+            done = False
+            for rule_id, rp in rules:
+                bindings: Dict[int, int] = {}
+                hv0 = int(rp.head_var0)
+                hv1 = int(rp.head_var1)
+                # Unify head with the closure atom.
+                if hv0 > c_no:
+                    bindings[hv0] = s
+                elif hv0 != s:
+                    continue
+                if hv1 > c_no:
+                    bindings[hv1] = o
+                elif hv1 != o:
+                    continue
+                bg = find_body_grounding(
+                    list(rp.body_patterns), bindings)
+                if bg is not None:
+                    witness_rule[i] = rule_id
+                    witness_body[i] = bg
+                    done = True
+                    break
+            if not done:
+                # Pure base fact (no matching rule): witness body is the
+                # atom itself, as a 1-atom degenerate grounding. SBR will
+                # score it via KGE(atom).
+                witness_body[i] = [(p, s, o)]
+
+        # Pack into [N, M, 3] tensors with padding, plus [N] body-atom
+        # counts (needed by SBR so body_atom_valid reflects only the
+        # real witness atoms, not the padding slots).
+        rule_t = torch.tensor(witness_rule, dtype=torch.long)
+        body_t = torch.full((N, M, 3), pad, dtype=torch.long)
+        bcount_t = torch.zeros(N, dtype=torch.long)
+        for i in range(N):
+            atoms = witness_body[i][:M]
+            bcount_t[i] = len(atoms)
+            for j, (bp_pred, bs, bo) in enumerate(atoms):
+                body_t[i, j, 0] = bp_pred
+                body_t[i, j, 1] = bs
+                body_t[i, j, 2] = bo
+
+        self.register_buffer(
+            "fp_global_witness_rule", rule_t.to(device))
+        self.register_buffer(
+            "fp_global_witness_body", body_t.to(device))
+        self.register_buffer(
+            "fp_global_witness_bcount", bcount_t.to(device))
+        self._has_fp_global_witnesses = True
+        # Static Python-int upper bound for clamp() at query time — keeps
+        # the clamp bound a compile-time constant so the injection step
+        # stays torch.compile(fullgraph=True)-friendly (no tensor .numel()
+        # sync needed in the hot path).
+        self._fp_global_last_idx = max(N - 1, 0)
+
+    def _augment_kb_with_closure(
+        self, device: torch.device, E: int,
+    ) -> None:
+        """Decode fp_global_hashes to (pred, subj, obj) triples, filter
+        out base-fact duplicates, concat to kb.fact_index.facts_idx,
+        and rebuild the fact index. Mutates self.kb.fact_index in place
+        (replaces the submodule).
+        """
+        from grounder.data.fact_index import FactIndex
+
+        fi = self.kb.fact_index
+        E2 = int(E) * int(E)
+
+        # Decode sorted hashes -> (pred, subj, obj) rows.
+        h = self.fp_global_hashes
+        preds = (h // E2).long()
+        rem = h % E2
+        subjs = (rem // int(E)).long()
+        objs = (rem % int(E)).long()
+        closure_triples = torch.stack([preds, subjs, objs], dim=1)  # [N, 3]
+
+        # Filter out triples that are already base facts (membership via
+        # the existing fact-index hash table) so we don't duplicate rows.
+        already_in_kb = fi.exists(closure_triples)
+        new_triples = closure_triples[~already_in_kb]
+        if new_triples.numel() == 0:
+            return
+
+        # Build augmented facts_idx and rebuild the fact index.
+        augmented = torch.cat([fi.facts_idx, new_triples.to(fi.facts_idx.device)],
+                              dim=0).contiguous()
+
+        # Pick the same subclass type the KB originally used.
+        fact_index_type = (
+            "block_sparse" if fi.__class__.__name__ == "BlockSparseFactIndex"
+            else "inverted" if fi.__class__.__name__ == "InvertedFactIndex"
+            else "arg_key"
+        )
+        self.kb.fact_index = FactIndex.create(
+            augmented,
+            type=fact_index_type,
+            constant_no=self.kb.constant_no,
+            predicate_no=self.kb.predicate_no,
+            padding_idx=self.kb.padding_idx,
+            device=device,
+            pack_base=fi.pack_base,
+            max_facts_per_query=fi.max_fact_pairs,
+        )
+        # K_f depends on per-pattern fact counts; refresh the cached value.
+        self.kb.K_f = self.kb.fact_index.max_fact_pairs
+
     # ==================================================================
     # Canonical loop
     # ==================================================================
@@ -617,8 +879,28 @@ class BCGrounder(nn.Module):
                 self._E_fp_global, self.kb.padding_idx,
                 self.fp_global_hashes)
 
-        count = mask.sum(dim=1)
         bcount = states["collected_bcount"]   # [B, C, D]
+
+        # Witness injection for fact-match groundings.
+        #
+        # When the query atom IS itself in the augmented KB (i.e. it's
+        # a closure member), the pack_states initial-depth fact-match
+        # path emits a grounding with an empty body. That's a valid
+        # Boolean proof but collapses to reasoning_score = 1.0 under
+        # fuzzy-AND identity, which kills ranking among multi-valid
+        # closure members at the SBR head.
+        #
+        # Fix: look up each query atom's precomputed witness body
+        # (see _build_witness_table) and splice it into the empty
+        # fact-match slot. The caller's reasoning head then computes
+        # min(KGE(witness body atoms)) just as for any rule match,
+        # restoring principled per-atom scoring.
+        if (self.filter_mode == "fp_global"
+                and getattr(self, "_has_fp_global_witnesses", False)):
+            body, ridx, bcount = self._inject_witnesses_into_evidence(
+                body, mask, ridx, bcount, states["queries"])
+
+        count = mask.sum(dim=1)
         D_val = self.depth if self.collect_evidence else 0
         M_val = self.kb.M if self.collect_evidence else 0
         return ProofEvidence(
@@ -628,6 +910,83 @@ class BCGrounder(nn.Module):
             D=D_val, M=M_val,
             head=head,
         )
+
+    def _inject_witnesses_into_evidence(
+        self,
+        body: Tensor,      # [B, C, D, M, 3]
+        mask: Tensor,      # [B, C]
+        ridx: Tensor,      # [B, C, D]
+        bcount: Tensor,    # [B, C, D]
+        queries: Tensor,   # [B, 3]
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """Replace empty-body fact-match slots with the stored witness.
+
+        A fact-match slot is identified by ``ridx[:, :, 0] == -1`` (the
+        initial-depth fact match emitted by pack_states when the query
+        unifies with a fact in the KB). For each such slot we binary-
+        search the query's hash in ``fp_global_hashes`` and, if found,
+        overwrite the depth-0 body slice with the precomputed witness
+        body and tag ``ridx[..., 0]`` with the witness rule index.
+
+        torch.compile(fullgraph=True) safety:
+          - All ops are pure tensor ops (searchsorted / indexing / cat /
+            where / expand). No in-place writes to sliced views, no
+            ``.numel()`` / ``.item()`` CPU sync — the clamp upper bound
+            is the pre-computed Python int ``_fp_global_last_idx``.
+          - Static shapes: ``body`` / ``ridx`` shapes flow through
+            unchanged; witness buffers have fixed shape from init.
+        """
+        B, C, D, M, _ = body.shape
+        E = self._E_fp_global  # Python int captured at init
+        E2 = E * E
+
+        q_hash = (queries[..., 0].long() * E2
+                  + queries[..., 1].long() * E
+                  + queries[..., 2].long())  # [B]
+
+        idx = torch.searchsorted(self.fp_global_hashes, q_hash)  # [B]
+        idx_clamped = idx.clamp(0, self._fp_global_last_idx)
+        found = self.fp_global_hashes[idx_clamped] == q_hash  # [B]
+
+        wb = self.fp_global_witness_body[idx_clamped]   # [B, M, 3]
+        wr = self.fp_global_witness_rule[idx_clamped]   # [B]
+        wc = self.fp_global_witness_bcount[idx_clamped]  # [B]
+
+        is_fact_match = (ridx[..., 0] == -1) & mask        # [B, C]
+        inject = is_fact_match & found.unsqueeze(-1)       # [B, C]
+
+        # --- Replace body[:, :, 0, :, :] without in-place writes ---
+        wb_exp = wb.unsqueeze(1).expand(B, C, M, 3)                 # [B,C,M,3]
+        inj_bcm3 = inject.unsqueeze(-1).unsqueeze(-1).expand(
+            B, C, M, 3)                                             # [B,C,M,3]
+        new_d0 = torch.where(inj_bcm3, wb_exp, body[:, :, 0, :, :])  # [B,C,M,3]
+        # Reassemble body via cat along the D axis (avoids in-place slice
+        # assignment, which isn't traceable under fullgraph compile).
+        if D == 1:
+            new_body = new_d0.unsqueeze(2)                          # [B,C,1,M,3]
+        else:
+            new_body = torch.cat(
+                [new_d0.unsqueeze(2), body[:, :, 1:, :, :]], dim=2)  # [B,C,D,M,3]
+
+        # --- Same trick for ridx[:, :, 0] ---
+        wr_exp = wr.unsqueeze(1).expand(B, C)                       # [B,C]
+        new_r0 = torch.where(inject, wr_exp, ridx[..., 0])          # [B,C]
+        if D == 1:
+            new_ridx = new_r0.unsqueeze(-1)                         # [B,C,1]
+        else:
+            new_ridx = torch.cat(
+                [new_r0.unsqueeze(-1), ridx[..., 1:]], dim=-1)       # [B,C,D]
+
+        # --- Same trick for bcount[:, :, 0]: inject witness atom count ---
+        wc_exp = wc.unsqueeze(1).expand(B, C)                       # [B,C]
+        new_c0 = torch.where(inject, wc_exp, bcount[..., 0])        # [B,C]
+        if D == 1:
+            new_bcount = new_c0.unsqueeze(-1)                       # [B,C,1]
+        else:
+            new_bcount = torch.cat(
+                [new_c0.unsqueeze(-1), bcount[..., 1:]], dim=-1)     # [B,C,D]
+
+        return new_body, new_ridx, new_bcount
 
     # ==================================================================
     # Phase 1: SELECT (shared)
