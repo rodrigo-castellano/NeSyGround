@@ -606,9 +606,15 @@ class BCGrounder(nn.Module):
         elif self.filter_mode == "fp_global":
             from grounder.filters.soundness.fp_global import apply_fp_global
             body_flat = body.reshape(B, C, -1, 3)
+            # NOTE: fp_global_hashes is built by run_forward_chaining with
+            # E = num_entities (= constant_no + 1), so body atoms must be
+            # hashed with that same base — NOT fact_index.pack_base, which
+            # is max(constant_no, padding_idx) + 2 and generally differs.
+            # Using pack_base here silently drops every derived atom from
+            # the fp_global set, so 2+-hop provable queries emit no grounding.
             mask = apply_fp_global(
                 body_flat, mask, self.kb.fact_index,
-                self.kb.fact_index.pack_base, self.kb.padding_idx,
+                self._E_fp_global, self.kb.padding_idx,
                 self.fp_global_hashes)
 
         count = mask.sum(dim=1)

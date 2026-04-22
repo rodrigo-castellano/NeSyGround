@@ -270,6 +270,10 @@ class FCDynamic(nn.Module):
         P = num_predicates
         self.E = E
         self.P = P
+        # constant_no: any body-arg value <= constant_no is a constant
+        # (entity id), not a logical variable. Used by _filter_by_consts.
+        self._constant_no = (int(compiled_rules[0].constant_no)
+                             if compiled_rules else 0)
 
         facts = facts_idx.to(dev)
         fact_preds = facts[:, 0]
@@ -317,6 +321,30 @@ class FCDynamic(nn.Module):
             self._join_orders.append(order)
             self._ordered_bps.append([cr.body_patterns[i] for i in order])
 
+    def _filter_by_consts(
+        self, partial: Dict[int, Tensor], bp: dict,
+    ) -> Optional[Dict[int, Tensor]]:
+        """Filter partial rows so that constant args in ``bp`` are satisfied.
+
+        Body args with value <= constant_no are entity ids (constants), not
+        variables. If such a constant was stored into ``partial`` under its
+        own id (from the first-atom seed or a later stage bind), this keeps
+        only rows where the stored value equals the constant id.
+
+        Returns None if the filter empties the partial (caller should abort
+        this rule application).
+        """
+        cno = self._constant_no
+        if not partial:
+            return partial
+        for av in (bp["arg0_var"], bp["arg1_var"]):
+            if av <= cno and av in partial:
+                mask = partial[av] == av
+                if not bool(mask.any()):
+                    return None
+                partial = {v: t[mask] for v, t in partial.items()}
+        return partial
+
     def _filter_new(self, all_new: Tensor, provable_hashes: Tensor) -> Tensor:
         if provable_hashes.numel() == 0:
             return all_new
@@ -362,6 +390,12 @@ class FCDynamic(nn.Module):
                 return None
 
         partial: Dict[int, Tensor] = {bp0["arg0_var"]: s0, bp0["arg1_var"]: o0}
+        # Filter by any constant args in bp0 before projecting to the frontier
+        # (projection may drop constant-keyed entries and lose the constraint).
+        filtered = self._filter_by_consts(partial, bp0)
+        if filtered is None:
+            return None
+        partial = filtered
         frontiers = _compute_frontiers(cr, ordered_bps)
         partial = {v: t for v, t in partial.items() if v in frontiers[0]}
 
@@ -419,6 +453,11 @@ class FCDynamic(nn.Module):
                 return None
 
         partial: Dict[int, Tensor] = {bp0["arg0_var"]: s0, bp0["arg1_var"]: o0}
+        # Filter by any constant args in bp0 before projecting to the frontier.
+        filtered = self._filter_by_consts(partial, bp0)
+        if filtered is None:
+            return None
+        partial = filtered
         frontiers = _compute_frontiers(cr, ordered_bps)
         partial = {v: t for v, t in partial.items() if v in frontiers[0]}
 
@@ -497,6 +536,12 @@ class FCDynamic(nn.Module):
             else:
                 return None
 
+            # Filter by any constant args in bpk before projection.
+            filtered = self._filter_by_consts(partial, bpk)
+            if filtered is None:
+                return None
+            partial = filtered
+
             if k < m - 1:
                 partial = {v: t for v, t in partial.items()
                            if v in frontiers[k]}
@@ -564,6 +609,12 @@ class FCDynamic(nn.Module):
                 partial[a0v] = sv_v
             else:
                 return None
+
+            # Filter by any constant args in bpk before projection.
+            filtered = self._filter_by_consts(partial, bpk)
+            if filtered is None:
+                return None
+            partial = filtered
 
             if k < m - 1:
                 partial = {v: t for v, t in partial.items()
