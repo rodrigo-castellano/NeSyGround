@@ -14,12 +14,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
 from torch import Tensor
 
+from grounder.analysis._logging import DEFAULT_OUTPUT_ROOT, run_logged_analysis
 from grounder.data.loader import KGDataset
 
 
@@ -63,6 +67,7 @@ def run_gpu_static(
     batch_size: int = 256,
     compile_mode: str = "reduce-overhead",
     device: str = "cuda",
+    output_dir: Optional[str] = None,
 ) -> Tuple[Set[int], float]:
     """Run static depth generation via BCGrounder.forward().
 
@@ -83,7 +88,7 @@ def run_gpu_static(
         batch_size=batch_size,
         compile_mode=compile_mode,
         device=device,
-        output_dir=None,
+        output_dir=output_dir,
     )
     elapsed = time.perf_counter() - t0
     provable = set((depths >= 0).nonzero(as_tuple=True)[0].cpu().tolist())
@@ -100,6 +105,7 @@ def run_gpu_dynamic(
     max_frontier: int = 2_000_000,
     max_per_query: int = 5000,
     device: str = "cuda",
+    output_dir: Optional[str] = None,
 ) -> Tuple[Set[int], float]:
     """Run dynamic depth generation via BCGrounder BFS loop.
 
@@ -119,7 +125,7 @@ def run_gpu_dynamic(
         max_frontier=max_frontier,
         max_per_query=max_per_query,
         device=device,
-        output_dir=None,
+        output_dir=output_dir,
     )
     elapsed = time.perf_counter() - t0
     provable = set((depths >= 0).nonzero(as_tuple=True)[0].cpu().tolist())
@@ -244,77 +250,118 @@ def main() -> None:
                         help="Device for GPU grounders (default: cuda)")
     parser.add_argument("--facts_file", type=str, default="facts.txt",
                         help="Facts file name (default: facts.txt)")
+    parser.add_argument("--output_dir", type=str, default=None,
+                        help="Optional artifact directory override")
+    parser.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--experiment_name", type=str, default="compare-groundings")
+    parser.add_argument("--run_name", type=str, default=None)
     args = parser.parse_args()
-
     grounder_names = [g.strip() for g in args.grounders.split(",")]
     for g in grounder_names:
         if g not in GROUNDER_CHOICES:
             parser.error(f"Unknown grounder '{g}'. Choose from: {', '.join(GROUNDER_CHOICES)}")
 
-    # Determine if we need GPU
-    needs_gpu = any(g in grounder_names for g in ("sld", "rtf", "sld_dynamic", "rtf_dynamic"))
-    device = args.device if needs_gpu else "cpu"
+    dataset_name = os.path.basename(os.path.normpath(args.data_dir))
+    default_signature = args.run_name or (
+        f"{dataset_name}-{args.split}-{'-'.join(grounder_names)}-d{args.max_depth}"
+    )
 
-    dataset = KGDataset(args.data_dir, facts_file=args.facts_file, device=device)
-    print(f"Loaded: {dataset}")
+    def _run(ctx, config):
+        needs_gpu = any(g in grounder_names for g in ("sld", "rtf", "sld_dynamic", "rtf_dynamic"))
+        device = config.device if needs_gpu else "cpu"
 
-    # Get queries as string tuples
-    if args.split not in dataset._splits_raw:
-        print(f"Split '{args.split}' not found. Available: {list(dataset._splits_raw.keys())}")
-        return
-    queries = dataset._splits_raw[args.split]
-    N = len(queries)
-    print(f"Split: {args.split}, Queries: {N}")
+        dataset = KGDataset(config.data_dir, facts_file=config.facts_file, device=device)
+        print(f"Loaded: {dataset}")
 
-    results: Dict[str, Tuple[Set[int], float]] = {}
+        if config.split not in dataset._splits_raw:
+            print(f"Split '{config.split}' not found. Available: {list(dataset._splits_raw.keys())}")
+            return {"status": "missing_split"}
 
-    # Map grounder names to resolution strings
-    _RESOLUTION = {"sld": "sld", "rtf": "rtf", "sld_dynamic": "sld", "rtf_dynamic": "rtf"}
+        queries = dataset._splits_raw[config.split]
+        total_queries = len(queries)
+        print(f"Split: {config.split}, Queries: {total_queries}")
 
-    for name in grounder_names:
-        print(f"\n--- Running: {name} ---")
-        if name == "swi":
-            provable, elapsed = run_swi_prolog(
-                dataset=dataset,
-                queries=queries,
-                max_depth=args.max_depth,
-                inference_limit=args.inference_limit,
-                depth_semantics=args.depth_semantics,
-                exclude_self=args.exclude_self,
-            )
-        elif name in ("sld", "rtf"):
-            provable, elapsed = run_gpu_static(
-                dataset=dataset,
-                resolution=_RESOLUTION[name],
-                split=args.split,
-                max_depth=args.max_depth,
-                max_goals=args.max_goals,
-                hard_cap=args.hard_cap,
-                batch_size=args.batch_size,
-                compile_mode=args.compile_mode,
-                device=args.device,
-            )
-        elif name in ("sld_dynamic", "rtf_dynamic"):
-            provable, elapsed = run_gpu_dynamic(
-                dataset=dataset,
-                resolution=_RESOLUTION[name],
-                split=args.split,
-                max_depth=args.max_depth,
-                max_goals=args.max_goals,
-                batch_size=args.batch_size,
-                max_frontier=args.max_frontier,
-                max_per_query=args.max_per_query,
-                device=args.device,
-            )
-        else:
-            raise ValueError(f"Unknown grounder: {name}")
+        results: Dict[str, Tuple[Set[int], float]] = {}
+        payload = {
+            "dataset": Path(config.data_dir).name,
+            "split": config.split,
+            "max_depth": config.max_depth,
+            "results": {},
+        }
+        output_dir = config.output_dir or str(ctx.paths.artifacts_dir)
 
-        results[name] = (provable, elapsed)
-        print(f"  {name}: {len(provable)}/{N} proven in {elapsed:.2f}s")
+        resolution_map = {"sld": "sld", "rtf": "rtf", "sld_dynamic": "sld", "rtf_dynamic": "rtf"}
+        for name in grounder_names:
+            print(f"\n--- Running: {name} ---")
+            if name == "swi":
+                provable, elapsed = run_swi_prolog(
+                    dataset=dataset,
+                    queries=queries,
+                    max_depth=config.max_depth,
+                    inference_limit=config.inference_limit,
+                    depth_semantics=config.depth_semantics,
+                    exclude_self=config.exclude_self,
+                )
+            elif name in ("sld", "rtf"):
+                provable, elapsed = run_gpu_static(
+                    dataset=dataset,
+                    resolution=resolution_map[name],
+                    split=config.split,
+                    max_depth=config.max_depth,
+                    max_goals=config.max_goals,
+                    hard_cap=config.hard_cap,
+                    batch_size=config.batch_size,
+                    compile_mode=config.compile_mode,
+                    device=config.device,
+                    output_dir=output_dir,
+                )
+            else:
+                provable, elapsed = run_gpu_dynamic(
+                    dataset=dataset,
+                    resolution=resolution_map[name],
+                    split=config.split,
+                    max_depth=config.max_depth,
+                    max_goals=config.max_goals,
+                    batch_size=config.batch_size,
+                    max_frontier=config.max_frontier,
+                    max_per_query=config.max_per_query,
+                    device=config.device,
+                    output_dir=output_dir,
+                )
 
-    # Print comparison
-    print_table(results, args.max_depth, N)
-    print_pairwise(results, N)
+            results[name] = (provable, elapsed)
+            summary = {
+                "total_proven": len(provable),
+                "prove_rate": (len(provable) / total_queries) if total_queries else 0.0,
+                "elapsed_sec": elapsed,
+            }
+            ctx.log_metrics(summary, split=name)
+            payload["results"][name] = {
+                **summary,
+                "provable_indices": sorted(provable),
+            }
+            print(f"  {name}: {len(provable)}/{total_queries} proven in {elapsed:.2f}s")
+
+        artifact_path = Path(ctx.paths.artifacts_dir) / "comparison.json"
+        artifact_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        print_table(results, config.max_depth, total_queries)
+        print_pairwise(results, total_queries)
+        return {
+            name: {
+                "total_proven": data["total_proven"],
+                "prove_rate": data["prove_rate"],
+                "elapsed_sec": data["elapsed_sec"],
+            }
+            for name, data in payload["results"].items()
+        }
+
+    run_logged_analysis(
+        args,
+        default_experiment_name=args.experiment_name,
+        default_signature=default_signature,
+        run_fn=_run,
+    )
 
 
 if __name__ == "__main__":

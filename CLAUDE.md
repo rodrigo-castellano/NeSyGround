@@ -46,11 +46,14 @@ Do not add standalone training scripts to `grounder/` unless they are genuinely 
 
 ## Logging Experiments
 
-- For standalone work, save logs and persistent analysis artifacts under `analysis/`.
-- If this repository is embedded inside another project, keep experiment logs in that parent project's canonical logging location instead of inside `grounder/` source folders.
-- Prefer a dated folder such as `analysis/YYYYMMDD-description/` for each experiment or comparison batch.
-- Keep analysis outputs out of importable library modules.
-- Do not commit ad hoc `.log`, `.json`, or scratch output files into source directories.
+- Standalone runtime outputs live under the repo root `output/`.
+- `output/runs/<experiment_name>/<run_name>/` is the canonical run bundle for analysis scripts.
+- Each run stores `manifest.json`, `config.json`, `stdout.log`, `events.jsonl`, `metrics.json`, and optional `artifacts/`.
+- `config.json` and `metrics.json` are analysis-script-defined; the shared logger only fixes the bundle layout.
+- `report.md` is optional and is only written when an agent or human explicitly requests it.
+- `output/registry/<experiment_name>/<run_name>/` is a manually promoted copy of the same run bundle.
+- `output/legacy/` is reserved for migrated historical artifacts only.
+- Keep analysis outputs out of importable library modules and out of curated docs directories by default.
 
 ## Testing
 

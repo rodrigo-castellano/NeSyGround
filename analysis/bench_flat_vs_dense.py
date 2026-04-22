@@ -28,6 +28,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import torch
 from torch import Tensor
 
+from grounder.analysis._logging import DEFAULT_OUTPUT_ROOT, run_logged_analysis
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -854,62 +856,89 @@ def generate_markdown_report(filepath: str):
     print(f"\nReport written to: {filepath}")
 
 
+def build_summary() -> Dict[str, float]:
+    """Build a small numeric summary for metrics.json / manifest."""
+    summary: Dict[str, float] = {
+        "num_results": float(len(all_results)),
+    }
+    if not all_results:
+        return summary
+
+    mem_ratios = []
+    speed_ratios = []
+    compiled_speed_ratios = []
+    for result in all_results:
+        dense, flat = result["dense"], result["flat"]
+        if flat.memory_mb > 0.001:
+            mem_ratios.append(dense.memory_mb / flat.memory_mb)
+        if flat.time_ms > 0:
+            speed_ratios.append(dense.time_ms / flat.time_ms)
+        dense_compiled, flat_compiled = result.get("dense_compiled"), result.get("flat_compiled")
+        if dense_compiled and flat_compiled and flat_compiled.time_ms > 0:
+            compiled_speed_ratios.append(dense_compiled.time_ms / flat_compiled.time_ms)
+
+    if mem_ratios:
+        summary["avg_memory_ratio"] = sum(mem_ratios) / len(mem_ratios)
+    if speed_ratios:
+        summary["avg_speed_ratio"] = sum(speed_ratios) / len(speed_ratios)
+    if compiled_speed_ratios:
+        summary["avg_compiled_speed_ratio"] = sum(compiled_speed_ratios) / len(compiled_speed_ratios)
+    return summary
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
 def main():
-    print(f"Device: {torch.cuda.get_device_name(0)}")
-    print(f"PyTorch: {torch.__version__}")
-    print(f"CUDA: {torch.version.cuda}")
-    print()
+    import argparse
+    import traceback
 
-    try:
-        bench_enumerate()
-    except Exception as e:
-        print(f"\n[ERROR] Enumerate benchmark failed: {e}")
-        import traceback; traceback.print_exc()
+    parser = argparse.ArgumentParser(description="Benchmark dense vs flat grounder tensors.")
+    parser.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--experiment_name", type=str, default="bench-flat-vs-dense")
+    parser.add_argument("--run_name", type=str, default=None)
+    args = parser.parse_args()
 
-    try:
-        bench_conjunction()
-    except Exception as e:
-        print(f"\n[ERROR] Conjunction benchmark failed: {e}")
-        import traceback; traceback.print_exc()
+    def _run(ctx, config):
+        all_results.clear()
 
-    try:
-        bench_disjunction()
-    except Exception as e:
-        print(f"\n[ERROR] Disjunction benchmark failed: {e}")
-        import traceback; traceback.print_exc()
+        print(f"Device: {torch.cuda.get_device_name(0)}")
+        print(f"PyTorch: {torch.__version__}")
+        print(f"CUDA: {torch.version.cuda}")
+        print()
 
-    try:
-        bench_pack()
-    except Exception as e:
-        print(f"\n[ERROR] Pack benchmark failed: {e}")
-        import traceback; traceback.print_exc()
+        for bench_fn, label in (
+            (bench_enumerate, "Enumerate"),
+            (bench_conjunction, "Conjunction"),
+            (bench_disjunction, "Disjunction"),
+            (bench_pack, "Pack"),
+            (bench_scatter, "Scatter"),
+            (bench_pipeline, "Pipeline"),
+        ):
+            try:
+                bench_fn()
+            except Exception as exc:
+                print(f"\n[ERROR] {label} benchmark failed: {exc}")
+                traceback.print_exc()
 
-    try:
-        bench_scatter()
-    except Exception as e:
-        print(f"\n[ERROR] Scatter benchmark failed: {e}")
-        import traceback; traceback.print_exc()
+        report_path = str(ctx.paths.artifacts_dir / "benchmark_flat_vs_dense.md")
+        generate_markdown_report(report_path)
 
-    try:
-        bench_pipeline()
-    except Exception as e:
-        print(f"\n[ERROR] Pipeline benchmark failed: {e}")
-        import traceback; traceback.print_exc()
+        print("\n" + "=" * 72)
+        print("ALL BENCHMARKS COMPLETE")
+        print("=" * 72)
 
-    # Generate report into this repo's docs/exp_analysis/ directory.
-    from pathlib import Path
-    report_path = str(
-        Path(__file__).resolve().parents[1] / "docs" / "exp_analysis" / "benchmark_flat_vs_dense.md"
+        summary = build_summary()
+        ctx.log_metrics(summary, split="benchmark")
+        return summary
+
+    run_logged_analysis(
+        args,
+        default_experiment_name=args.experiment_name,
+        default_signature=args.run_name or "benchmark-flat-vs-dense",
+        run_fn=_run,
     )
-    generate_markdown_report(report_path)
-
-    print("\n" + "=" * 72)
-    print("ALL BENCHMARKS COMPLETE")
-    print("=" * 72)
 
 
 if __name__ == "__main__":

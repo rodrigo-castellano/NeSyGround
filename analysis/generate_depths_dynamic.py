@@ -31,6 +31,7 @@ from grounder.analysis._dedup import (
     dedup_cross_depth,
     cap_frontier_per_query,
 )
+from grounder.analysis._logging import DEFAULT_OUTPUT_ROOT, run_logged_analysis
 from grounder.analysis._report import DepthStats, write_report
 
 
@@ -151,7 +152,7 @@ def generate_depths_dynamic(
         max_per_query: Per-query frontier cap
         query_batch_size: Queries to BFS simultaneously (0 = all)
         device: Target device
-        output_dir: Output directory (default: dataset directory)
+        output_dir: Output directory for run artifacts
 
     Returns:
         [N] int tensor of minimum proof depths (-1 if not provable)
@@ -374,7 +375,9 @@ def generate_depths_dynamic(
         depth_dist[d] = depth_dist.get(d, 0) + 1
     total_proven = sum(1 for d in depths_cpu if d >= 0)
 
-    out_dir = output_dir or str(dataset.data_dir)
+    if output_dir is None:
+        raise ValueError("output_dir is required; write depth artifacts into a canonical run bundle")
+    out_dir = output_dir
     os.makedirs(out_dir, exist_ok=True)
     depth_file = os.path.join(out_dir, f"{split}_depths_dynamic_{grounder_type}.txt")
     with open(depth_file, "w") as f:
@@ -437,25 +440,53 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--facts_file", type=str, default="facts.txt")
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--experiment_name", type=str, default="depth-dynamic")
+    parser.add_argument("--run_name", type=str, default=None)
     args = parser.parse_args()
 
-    dataset = KGDataset(args.data_dir, facts_file=args.facts_file, device=args.device)
-    print(f"Loaded: {dataset}")
+    dataset_name = os.path.basename(os.path.normpath(args.data_dir))
+    default_signature = args.run_name or (
+        f"{dataset_name}-{args.grounder}-d{args.max_depth}-{'-'.join(args.splits)}"
+    )
 
-    for split in args.splits:
-        generate_depths_dynamic(
-            dataset=dataset,
-            resolution=args.grounder,
-            split=split,
-            max_depth=args.max_depth,
-            max_goals=args.max_goals,
-            batch_size=args.batch_size,
-            max_frontier=args.max_frontier,
-            max_per_query=args.max_per_query,
-            query_batch_size=args.query_batch_size,
-            device=args.device,
-            output_dir=args.output_dir,
-        )
+    def _run(ctx, config):
+        dataset = KGDataset(config.data_dir, facts_file=config.facts_file, device=config.device)
+        print(f"Loaded: {dataset}")
+
+        summary = {}
+        output_dir = config.output_dir or str(ctx.paths.artifacts_dir)
+        for split in config.splits:
+            depths = generate_depths_dynamic(
+                dataset=dataset,
+                resolution=config.grounder,
+                split=split,
+                max_depth=config.max_depth,
+                max_goals=config.max_goals,
+                batch_size=config.batch_size,
+                max_frontier=config.max_frontier,
+                max_per_query=config.max_per_query,
+                query_batch_size=config.query_batch_size,
+                device=config.device,
+                output_dir=output_dir,
+            )
+            total_queries = int(depths.numel())
+            total_proven = int((depths >= 0).sum().item())
+            split_summary = {
+                "total_queries": total_queries,
+                "total_proven": total_proven,
+                "prove_rate": (total_proven / total_queries) if total_queries else 0.0,
+            }
+            ctx.log_metrics(split_summary, split=split)
+            summary[split] = split_summary
+        return summary
+
+    run_logged_analysis(
+        args,
+        default_experiment_name=args.experiment_name,
+        default_signature=default_signature,
+        run_fn=_run,
+    )
 
 
 if __name__ == "__main__":

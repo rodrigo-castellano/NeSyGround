@@ -26,6 +26,7 @@ from torch import Tensor
 
 from grounder.data.loader import KGDataset
 from grounder.bc.bc import BCGrounder
+from grounder.analysis._logging import DEFAULT_OUTPUT_ROOT, run_logged_analysis
 from grounder.analysis._report import DepthStats, write_report
 
 
@@ -187,7 +188,7 @@ def generate_depths_static(
         batch_size: Queries per batch (B dimension)
         compile_mode: torch.compile mode
         device: Target device
-        output_dir: Output directory (default: dataset directory)
+        output_dir: Output directory for run artifacts
         grounder: Optional pre-built BCGrounder (skips creating a new one)
         prune_facts: Remove known ground facts between depth steps
 
@@ -261,7 +262,9 @@ def generate_depths_static(
         ))
 
     # Write output
-    out_dir = output_dir or str(dataset.data_dir)
+    if output_dir is None:
+        raise ValueError("output_dir is required; write depth artifacts into a canonical run bundle")
+    out_dir = output_dir
     os.makedirs(out_dir, exist_ok=True)
     depth_file = os.path.join(out_dir, f"{split}_depths_static_{grounder_type}.txt")
     with open(depth_file, "w") as f:
@@ -320,27 +323,55 @@ def main() -> None:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--facts_file", type=str, default="facts.txt")
     parser.add_argument("--output_dir", type=str, default=None)
+    parser.add_argument("--output_root", type=str, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--experiment_name", type=str, default="depth-static")
+    parser.add_argument("--run_name", type=str, default=None)
     parser.add_argument("--prune-facts", action="store_true", default=False,
                         help="Remove known ground facts between depth steps")
     args = parser.parse_args()
 
-    dataset = KGDataset(args.data_dir, facts_file=args.facts_file, device=args.device)
-    print(f"Loaded: {dataset}")
+    dataset_name = os.path.basename(os.path.normpath(args.data_dir))
+    default_signature = args.run_name or (
+        f"{dataset_name}-{args.grounder}-d{args.max_depth}-{'-'.join(args.splits)}"
+    )
 
-    for split in args.splits:
-        generate_depths_static(
-            dataset=dataset,
-            resolution=args.grounder,
-            split=split,
-            max_depth=args.max_depth,
-            max_goals=args.max_goals,
-            hard_cap=args.max_states_cap,
-            batch_size=args.batch_size,
-            compile_mode=args.compile_mode,
-            device=args.device,
-            output_dir=args.output_dir,
-            prune_facts=args.prune_facts,
-        )
+    def _run(ctx, config):
+        dataset = KGDataset(config.data_dir, facts_file=config.facts_file, device=config.device)
+        print(f"Loaded: {dataset}")
+
+        summary = {}
+        output_dir = config.output_dir or str(ctx.paths.artifacts_dir)
+        for split in config.splits:
+            depths = generate_depths_static(
+                dataset=dataset,
+                resolution=config.grounder,
+                split=split,
+                max_depth=config.max_depth,
+                max_goals=config.max_goals,
+                hard_cap=config.max_states_cap,
+                batch_size=config.batch_size,
+                compile_mode=config.compile_mode,
+                device=config.device,
+                output_dir=output_dir,
+                prune_facts=config.prune_facts,
+            )
+            total_queries = int(depths.numel())
+            total_proven = int((depths >= 0).sum().item())
+            split_summary = {
+                "total_queries": total_queries,
+                "total_proven": total_proven,
+                "prove_rate": (total_proven / total_queries) if total_queries else 0.0,
+            }
+            ctx.log_metrics(split_summary, split=split)
+            summary[split] = split_summary
+        return summary
+
+    run_logged_analysis(
+        args,
+        default_experiment_name=args.experiment_name,
+        default_signature=default_signature,
+        run_fn=_run,
+    )
 
 
 if __name__ == "__main__":
