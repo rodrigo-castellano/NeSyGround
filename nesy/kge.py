@@ -22,7 +22,7 @@ from torch import Tensor
 
 from typing import Optional, Tuple
 
-from grounder.nesy.scoring import kge_score_triples, score_partial_atoms
+from grounder.nesy.scoring import kge_score, score_partial_atoms
 
 
 class KGEScorer(nn.Module):
@@ -64,7 +64,7 @@ class KGEScorer(nn.Module):
         body_active = body[..., 0] != self._padding_idx  # [B, tG, M]
 
         # KGE atom scores via unified scoring primitive
-        atom_scores = kge_score_triples(
+        atom_scores = kge_score(
             kge,
             body[..., 1].reshape(-1),  # h (subj)
             body[..., 0].reshape(-1),  # r (pred)
@@ -93,7 +93,7 @@ class KGEFactFilter(nn.Module):
     ResolutionFactHook: applied inside resolve_sld/rtf after mgu_resolve_facts.
 
     Re-looks up fact candidates via fact_index to obtain ground triples,
-    scores them with kge_score_triples, and zeros out low-scoring entries
+    scores them with kge_score, and zeros out low-scoring entries
     in fact_success.
 
     Args:
@@ -141,7 +141,7 @@ class KGEFactFilter(nn.Module):
         fact_triples = self._facts_idx[safe_idx.view(-1)].view(N, K_f, 3)
 
         # Score: triples are [pred, subj, obj]
-        scores = kge_score_triples(
+        scores = kge_score(
             kge,
             fact_triples[..., 1].reshape(-1),  # h (subj)
             fact_triples[..., 0].reshape(-1),  # r (pred)
@@ -221,11 +221,11 @@ class KGERuleFilter(nn.Module):
         safe_a1 = torch.where(is_ground, a1, torch.zeros_like(a1))
         safe_a2 = torch.where(is_ground, a2, torch.zeros_like(a2))
 
-        scores = kge_score_triples(
+        scores = kge_score(
             kge,
-            safe_a1.reshape(-1),  # h
-            safe_p.reshape(-1),   # r
-            safe_a2.reshape(-1),  # t
+            safe_a1.reshape(-1),
+            safe_p.reshape(-1),
+            safe_a2.reshape(-1),
         ).view(B, S, K_r)
 
         # Non-ground -> 0 (neutral), invalid -> -inf
@@ -251,7 +251,7 @@ class KGEStepFilter(nn.Module):
     """StepHook: score collected groundings between BFS depths, keep top-k.
 
     Scores the first body atom of each collected grounding:
-    - Ground atoms: scored via kge_score_triples.
+    - Ground atoms: scored via kge_score.
     - Partial atoms: scored via precomputed max_tail_score / max_head_score.
     - Fully unbound atoms (both args variable): score 0 (kept unconditionally
       unless displaced by higher-scoring entries).
@@ -343,7 +343,7 @@ class KGEStepFilter(nn.Module):
             safe_p = torch.where(is_ground, p, torch.zeros_like(p))
             safe_a1 = torch.where(is_ground, a1, torch.zeros_like(a1))
             safe_a2 = torch.where(is_ground, a2, torch.zeros_like(a2))
-            g_scores = kge_score_triples(
+            g_scores = kge_score(
                 kge,
                 safe_a1.reshape(-1),
                 safe_p.reshape(-1),
