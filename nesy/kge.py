@@ -22,7 +22,7 @@ from torch import Tensor
 
 from typing import Optional, Tuple
 
-from grounder.nesy.scoring import score_partial_atoms
+from grounder.nesy.scoring import PartialScorer
 
 
 class KGEScorer(nn.Module):
@@ -265,8 +265,8 @@ class KGEStepFilter(nn.Module):
         top_k:           max groundings to keep per query.
         constant_no:     highest constant index (for ground detection).
         padding_idx:     padding value.
-        max_tail_score:  [P, E] precomputed (from precompute_partial_scores).
-        max_head_score:  [P, E] precomputed (from precompute_partial_scores).
+        max_tail_score:  [P, E] precomputed (from PartialScorer.compute_all).
+        max_head_score:  [P, E] precomputed (from PartialScorer.compute_all).
         scoring_mode:    'ground_only' | 'partial_only' | 'both'.
     """
 
@@ -295,6 +295,14 @@ class KGEStepFilter(nn.Module):
             self.register_buffer("_max_head_score", max_head_score)
         else:
             self._max_head_score = None
+        # Wrap raw tables in a scorer for the .score_atoms lookup; only
+        # built when both tables are present.
+        if max_tail_score is not None and max_head_score is not None:
+            self._partial_scorer = PartialScorer.from_tables(
+                self._max_tail_score, self._max_head_score, constant_no,
+            )
+        else:
+            self._partial_scorer = None
 
     def on_step(
         self,
@@ -348,13 +356,12 @@ class KGEStepFilter(nn.Module):
             scores = torch.where(is_ground, g_scores, scores)
             scored = scored | is_ground
 
-        # --- Score partial atoms (unconditional — score_partial_atoms handles
-        #     empty via torch.where internally, returns 0 for non-partial) ---
+        # --- Score partial atoms (unconditional — PartialScorer.score_atoms
+        #     handles empty via torch.where internally, returns 0 for non-partial) ---
         if mode in ("partial_only", "both"):
-            if self._max_tail_score is not None and self._max_head_score is not None:
-                p_scores = score_partial_atoms(
+            if self._partial_scorer is not None:
+                p_scores = self._partial_scorer.score_atoms(
                     p.reshape(-1), a1.reshape(-1), a2.reshape(-1),
-                    c_no, self._max_tail_score, self._max_head_score,
                 ).view(B, tG)
                 scores = torch.where(is_partial, p_scores, scores)
                 scored = scored | (is_partial & (p_scores > 0.0))

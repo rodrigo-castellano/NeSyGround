@@ -3,15 +3,12 @@
 After tkk's scoring-folder consolidation there is no per-mode scoring
 wrapper anymore — KGE scoring is just ``model.score(h, r, t)`` (with
 optional ``torch.sigmoid`` if you want probabilities). This module
-re-exports the partial-atom helpers that DO live in tkk.
+re-exports the partial-atom scorer classes that DO live in tkk.
 """
 
-from kge_kernels.scoring import (
-    precompute_partial_scores,
-    score_partial_atoms,
-)
+from kge_kernels.scoring import LazyPartialScorer, PartialScorer
 
 __all__ = [
-    "precompute_partial_scores",
-    "score_partial_atoms",
+    "LazyPartialScorer",
+    "PartialScorer",
 ]

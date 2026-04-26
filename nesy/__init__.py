@@ -1,7 +1,7 @@
 # nesy/ — neural-symbolic hooks and scoring
 #
 # hooks.py   — ResolutionFactHook, ResolutionRuleHook, GroundingHook
-# scoring.py — precompute_partial_scores, score_partial_atoms
+# scoring.py — PartialScorer, LazyPartialScorer
 # kge.py     — KGEScorer, KGEFactFilter, KGERuleFilter
 # neural.py  — NeuralScorer: learned attention + topk
 # soft.py    — SoftScorer: soft provability + topk
@@ -17,8 +17,8 @@ from grounder.nesy.hooks import (
     StepHook,
 )
 from grounder.nesy.scoring import (
-    precompute_partial_scores,
-    score_partial_atoms,
+    LazyPartialScorer,
+    PartialScorer,
 )
 from grounder.nesy.kge import KGEScorer, KGEFactFilter, KGERuleFilter, KGEStepFilter
 from grounder.nesy.neural import GroundingAttention, NeuralScorer
@@ -51,8 +51,8 @@ __all__ = [
     "ResolutionRuleHook",
     "StepHook",
     # Scoring primitives
-    "precompute_partial_scores",
-    "score_partial_atoms",
+    "LazyPartialScorer",
+    "PartialScorer",
     # Hook implementations
     "KGEScorer",
     "KGEFactFilter",
