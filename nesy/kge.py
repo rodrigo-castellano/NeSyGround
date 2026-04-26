@@ -22,7 +22,7 @@ from torch import Tensor
 
 from typing import Optional, Tuple
 
-from grounder.nesy.scoring import kge_score, score_partial_atoms
+from grounder.nesy.scoring import score_partial_atoms
 
 
 class KGEScorer(nn.Module):
@@ -63,13 +63,12 @@ class KGEScorer(nn.Module):
         # Body-active mask
         body_active = body[..., 0] != self._padding_idx  # [B, tG, M]
 
-        # KGE atom scores via unified scoring primitive
-        atom_scores = kge_score(
-            kge,
+        # KGE atom scores via the model's score(h, r, t), sigmoid-normalised.
+        atom_scores = torch.sigmoid(kge.score(
             body[..., 1].reshape(-1),  # h (subj)
             body[..., 0].reshape(-1),  # r (pred)
             body[..., 2].reshape(-1),  # t (obj)
-        ).view(B, tG_in, M)
+        )).view(B, tG_in, M)
 
         # Mask inactive -> large value so min ignores them
         atom_scores = torch.where(body_active, atom_scores,
@@ -93,7 +92,7 @@ class KGEFactFilter(nn.Module):
     ResolutionFactHook: applied inside resolve_sld/rtf after mgu_resolve_facts.
 
     Re-looks up fact candidates via fact_index to obtain ground triples,
-    scores them with kge_score, and zeros out low-scoring entries
+    scores them with model.score, and zeros out low-scoring entries
     in fact_success.
 
     Args:
@@ -141,12 +140,11 @@ class KGEFactFilter(nn.Module):
         fact_triples = self._facts_idx[safe_idx.view(-1)].view(N, K_f, 3)
 
         # Score: triples are [pred, subj, obj]
-        scores = kge_score(
-            kge,
+        scores = torch.sigmoid(kge.score(
             fact_triples[..., 1].reshape(-1),  # h (subj)
             fact_triples[..., 0].reshape(-1),  # r (pred)
             fact_triples[..., 2].reshape(-1),  # t (obj)
-        ).view(B, S, K_f)
+        )).view(B, S, K_f)
 
         # Mask invalid candidates to -inf
         scores = torch.where(
@@ -221,12 +219,11 @@ class KGERuleFilter(nn.Module):
         safe_a1 = torch.where(is_ground, a1, torch.zeros_like(a1))
         safe_a2 = torch.where(is_ground, a2, torch.zeros_like(a2))
 
-        scores = kge_score(
-            kge,
+        scores = torch.sigmoid(kge.score(
             safe_a1.reshape(-1),
             safe_p.reshape(-1),
             safe_a2.reshape(-1),
-        ).view(B, S, K_r)
+        )).view(B, S, K_r)
 
         # Non-ground -> 0 (neutral), invalid -> -inf
         scores = torch.where(is_ground, scores, torch.zeros_like(scores))
@@ -251,7 +248,7 @@ class KGEStepFilter(nn.Module):
     """StepHook: score collected groundings between BFS depths, keep top-k.
 
     Scores the first body atom of each collected grounding:
-    - Ground atoms: scored via kge_score.
+    - Ground atoms: scored via model.score (sigmoid).
     - Partial atoms: scored via precomputed max_tail_score / max_head_score.
     - Fully unbound atoms (both args variable): score 0 (kept unconditionally
       unless displaced by higher-scoring entries).
@@ -343,12 +340,11 @@ class KGEStepFilter(nn.Module):
             safe_p = torch.where(is_ground, p, torch.zeros_like(p))
             safe_a1 = torch.where(is_ground, a1, torch.zeros_like(a1))
             safe_a2 = torch.where(is_ground, a2, torch.zeros_like(a2))
-            g_scores = kge_score(
-                kge,
+            g_scores = torch.sigmoid(kge.score(
                 safe_a1.reshape(-1),
                 safe_p.reshape(-1),
                 safe_a2.reshape(-1),
-            ).view(B, tG)
+            )).view(B, tG)
             scores = torch.where(is_ground, g_scores, scores)
             scored = scored | is_ground
 

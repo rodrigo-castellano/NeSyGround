@@ -99,7 +99,6 @@ from grounder.bc.bc import BCGrounder
 from grounder.nesy.hooks import (
     GroundingHook, ResolutionFactHook, ResolutionRuleHook, StepHook,
 )
-from grounder.nesy.scoring import kge_score
 from grounder.nesy.kge import KGEScorer, KGEFactFilter, KGERuleFilter
 from grounder.nesy.neural import NeuralScorer, GroundingAttention
 from grounder.nesy.soft import SoftScorer, ProvabilityMLP
@@ -157,8 +156,6 @@ __all__ = [
     "ResolutionFactHook",
     "ResolutionRuleHook",
     "StepHook",
-    # Scoring primitives
-    "kge_score",
     # Hook implementations
     "KGEScorer",
     "KGEFactFilter",
