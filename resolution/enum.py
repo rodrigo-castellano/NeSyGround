@@ -1186,7 +1186,14 @@ def _apply_enum_filters(
     if width is not None:
         if head_pred_mask is not None:
             body_pred_vals = body_atoms[..., 0]
-            head_pred_ok = head_pred_mask[body_pred_vals]
+            # ``head_pred_mask`` is sized on actual predicates (small);
+            # padded body atoms carry ``predicate=padding_idx`` which
+            # can exceed that range. Clamp for the gather — the
+            # ``~body_active_exp`` term below admits padded slots
+            # regardless, so the clamped value is never read.
+            P = head_pred_mask.size(0)
+            safe_pred_vals = body_pred_vals.clamp(max=P - 1)
+            head_pred_ok = head_pred_mask[safe_pred_vals]
             unknown_ok = exists | head_pred_ok
             all_ok = (unknown_ok | ~body_active_exp).all(dim=-1)
             mask = mask & all_ok
@@ -1584,7 +1591,9 @@ def _apply_filters_flat(
     if width is not None:
         if head_pred_mask is not None:
             body_pred_vals = flat_body[..., 0]  # [T, M]
-            head_pred_ok = head_pred_mask[body_pred_vals]  # [T, M]
+            P = head_pred_mask.size(0)
+            safe_pred_vals = body_pred_vals.clamp(max=P - 1)
+            head_pred_ok = head_pred_mask[safe_pred_vals]  # [T, M]
             unknown_ok = flat_exists | head_pred_ok
             all_ok = (unknown_ok | ~body_active).all(dim=-1)  # [T]
             mask = mask & all_ok

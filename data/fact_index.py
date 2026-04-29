@@ -319,10 +319,39 @@ class InvertedFactIndex(FactIndex):
     ) -> None:
         super().__init__(facts_idx, constant_no=constant_no,
                          padding_idx=padding_idx, device=device)
-        self._num_entities = constant_no + 1  # constant_no = max valid entity index
-        self._num_predicates = predicate_no + 1
+        # Size the offset tables on the actual data range, not the
+        # padding scheme. The KGDataset loader inflates ``predicate_no``
+        # to ``max(len(pred2idx)+1, padding_idx+1)`` so padded body
+        # atoms (predicate=padding_idx) fit downstream embeddings; on
+        # wn18rr that pushes ``predicate_no`` to ~40571 and would
+        # allocate ``P*E`` ≈ 1.6e9 offset slots (~12 GiB cumsum) for
+        # 11 actual predicates. We size the tables on
+        # ``actual max + 1`` from ``facts_idx`` and mask out-of-range
+        # inputs in ``enumerate`` (padded body atoms have no facts —
+        # the result for them is always empty).
+        if facts_idx.numel() > 0:
+            self._num_predicates = int(facts_idx[:, 0].max().item()) + 1
+            self._num_entities = max(
+                int(facts_idx[:, 1].max().item()),
+                int(facts_idx[:, 2].max().item()),
+            ) + 1
+        else:
+            self._num_predicates = max(predicate_no + 1, 1)
+            self._num_entities = max(constant_no + 1, 1)
         self._max_facts_per_query = max_facts_per_query
         self._build_offset_tables(device)
+        # Auto-clamp ``_max_facts_per_query`` to the actual maximum number
+        # of facts per (pred, bound_arg) slot in the offset tables.
+        # ``enumerate`` allocates ``[N, M]`` on every call, where M=this
+        # value, so an oversized request (e.g. 4096 on a family-size KB
+        # whose true max is ~20) wastes ~1 GiB per call once N grows with
+        # state-fan-out S. The clamped value still fits every valid slot
+        # — no truncation introduced.
+        ps_diff = self._ps_offsets[1:] - self._ps_offsets[:-1]
+        po_diff = self._po_offsets[1:] - self._po_offsets[:-1]
+        actual_max = int(torch.maximum(ps_diff.max(), po_diff.max()).item())
+        if actual_max < self._max_facts_per_query:
+            self._max_facts_per_query = max(actual_max, 1)
 
     @staticmethod
     def _build_offset_table(
@@ -370,7 +399,16 @@ class InvertedFactIndex(FactIndex):
         M = self._max_facts_per_query
         dev = preds.device
 
-        keys = preds * self._num_entities + bound_args
+        # Mask padded inputs (preds/bound_args equal to padding_idx, or
+        # any value outside the actual fact-index range). Padded body
+        # atoms have no facts; we replace their indices with 0 to keep
+        # the gather safe and zero out the result mask.
+        valid_input = (preds < self._num_predicates) & (
+            bound_args < self._num_entities)
+        safe_preds = torch.where(valid_input, preds, torch.zeros_like(preds))
+        safe_args = torch.where(
+            valid_input, bound_args, torch.zeros_like(bound_args))
+        keys = safe_preds * self._num_entities + safe_args
         is_obj = (direction == 0)
 
         starts_ps = self._ps_offsets[keys]
@@ -380,6 +418,8 @@ class InvertedFactIndex(FactIndex):
 
         starts = torch.where(is_obj, starts_ps, starts_po)
         counts = torch.where(is_obj, counts_ps, counts_po)
+        # Force zero counts for padded inputs.
+        counts = torch.where(valid_input, counts, torch.zeros_like(counts))
 
         pos = torch.arange(M, device=dev).unsqueeze(0).expand(N, -1)
         valid = pos < counts.unsqueeze(1)
@@ -517,15 +557,22 @@ class BlockSparseFactIndex(InvertedFactIndex):
             return super().enumerate(preds, bound_args, direction)
 
         K = self._K
+        P, E = self._num_predicates, self._num_entities
+        # Padded inputs (preds/bound_args == padding_idx) are out of
+        # the dense block range. Clamp for the gather and zero counts.
+        valid_input = (preds < P) & (bound_args < E)
+        sp = preds.clamp(max=P - 1)
+        sa = bound_args.clamp(max=E - 1)
         is_obj = (direction == 0)
         cands = torch.where(
             is_obj.unsqueeze(1),
-            self._ps_blocks[preds, bound_args],
-            self._po_blocks[preds, bound_args])
+            self._ps_blocks[sp, sa],
+            self._po_blocks[sp, sa])
         counts = torch.where(
             is_obj,
-            self._ps_counts[preds, bound_args],
-            self._po_counts[preds, bound_args])
+            self._ps_counts[sp, sa],
+            self._po_counts[sp, sa])
+        counts = torch.where(valid_input, counts, torch.zeros_like(counts))
         valid = torch.arange(K, device=preds.device).unsqueeze(0) < counts.unsqueeze(1)
         return cands, valid
 
