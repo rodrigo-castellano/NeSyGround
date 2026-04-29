@@ -152,13 +152,17 @@ def build_torch_grounder(
     kb, width: int, depth: int, *,
     flat: bool = True, all_anchors: bool = False,
     filt: Optional[str] = None, S_max: int = 256, C: int = 4096,
-    G_r: int = 4096,
+    G_r: int = 4096, bump_s_to_k: bool = True,
 ) -> BCGrounder:
     """Build the paper's BC_{w,d} grounder via ``make_bcwd``.
 
     ``filt=None`` lets ``make_bcwd`` pick the keras-prune-aligned
     default (``'none'`` for d=1,w>0; ``'fp_batch'`` otherwise).
     Pass an explicit ``filt`` to test a specific filter.
+
+    ``bump_s_to_k=True`` (default) keeps the no-loss ``S = max(S_max, K)``
+    bump at depth>1, width>0 — slow on high-fan-out KBs.
+    ``False`` keeps ``S = S_max`` (fast, accepts truncation).
     """
     return make_bcwd(
         kb, w=width, d=depth,
@@ -168,6 +172,7 @@ def build_torch_grounder(
         max_total_groundings=C,
         max_states=S_max,
         fc_method="join", prune_facts=True,
+        bump_s_to_k=bump_s_to_k,
     )
 
 
@@ -191,6 +196,8 @@ def compare_groundings(
     verbose: bool = True,
     max_queries: int = 0,
     G_r: int = 4096,
+    batch_size: Optional[int] = None,
+    bump_s_to_k: bool = True,
 ) -> dict:
     """Compare keras-ns vs torch-ns grounding counts.
 
@@ -241,7 +248,8 @@ def compare_groundings(
     # ── Torch ──
     g = build_torch_grounder(kb, width, depth, flat=flat,
                               all_anchors=all_anchors, filt=filt,
-                              S_max=S_max, C=C, G_r=G_r)
+                              S_max=S_max, C=C, G_r=G_r,
+                              bump_s_to_k=bump_s_to_k)
 
     # Count torch's UNIQUE rule applications (matches keras's
     # ``len(rule2groundings[r])``): out.rule_groundings.A_in[r] holds
@@ -293,14 +301,18 @@ def compare_groundings(
         # still aggregates correctly via ``_r2g_buffer`` set semantics.
         torch_per_rule = {r.name: 0 for r in keras_rules}
         torch_per_depth_rule = {}
+        # Forward kwargs — batch_size enables BCGrounder's static-shape
+        # ``_forward_chunked`` path so each chunk's reduce-overhead graph
+        # replays with stable shapes, last chunk padded + masked.
+        fwd_kwargs = {"batch_size": batch_size} if batch_size else {}
         try:
             # Warmup at full-batch shape, then steady-state timed run.
             with torch.no_grad():
-                _ = g(test, qmask)
+                _ = g(test, qmask, **fwd_kwargs)
             _sync(test.device)
             t0 = time.perf_counter()
             with torch.no_grad():
-                out = g(test, qmask)
+                out = g(test, qmask, **fwd_kwargs)
             _sync(test.device)
             torch_ms = (time.perf_counter() - t0) * 1000.0
             torch_total = (sum(out.rule_groundings.A_in[r].shape[0]
@@ -452,6 +464,14 @@ def main():
                         help="Rules filename inside dataset dir. Paper "
                              "numbers for family use 'rules_old.txt' "
                              "(47 rules vs 143 in rules.txt).")
+    parser.add_argument("--batch-size", type=int, default=0,
+                        help="BCGrounder.forward(batch_size=...) chunk "
+                             "size. 0 = full batch in one forward.")
+    parser.add_argument("--no-bump-s", action="store_true",
+                        help="Disable the ``S = max(S_max, K)`` bump for "
+                             "depth>1, width>0. Default keeps the bump "
+                             "for no-loss parity. Disable for speed on "
+                             "high-fan-out KBs (wn18rr, family at d=3).")
     args = parser.parse_args()
 
     data_dir = Path(args.dataset)
@@ -480,6 +500,8 @@ def main():
             filt=filt, S_max=args.s_max, C=args.C,
             max_queries=args.max_queries,
             G_r=args.G_r,
+            batch_size=(args.batch_size if args.batch_size > 0 else None),
+            bump_s_to_k=not args.no_bump_s,
         )
         results.append(r)
 

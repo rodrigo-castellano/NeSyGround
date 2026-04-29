@@ -99,6 +99,11 @@ class BCGrounder(nn.Module):
         # where every resolution step costs 1 depth). Enable for "compressed"
         # depth semantics where ground-fact goals are free.
         prune_facts: bool = False,
+        # Bump ``S = max(S, K)`` for ``depth>1, width>0`` to keep every
+        # intermediate child. Disabled defaults the per-step allocation
+        # to ``[B*S_max, K_r, G_r, M, 3]`` — fits high-fan-out KBs at
+        # the cost of truncating at packing. Default True (no-loss).
+        bump_s_to_k: bool = True,
     ) -> None:
         super().__init__()
         self.kb = kb
@@ -150,6 +155,7 @@ class BCGrounder(nn.Module):
         self._flat_intermediate_flag = flat_intermediate
         self._pack_dedup = pack_dedup
         self._collect_rule_groundings = collect_rule_groundings
+        self._bump_s_to_k = bump_s_to_k
         # Paper BC_{w,d,u} convention: u (= w_last_depth) defaults to 0.
         # All body atoms at the last (= terminal) step must be facts;
         # any rule application with leftover unknown leaves is dropped
@@ -274,10 +280,18 @@ class BCGrounder(nn.Module):
             self.K = meta["K"]
             # init_enum may recompute S/C — override shared values.
             self.S = meta["S"]
-            # When depth > 1 with width > 0, intermediate steps generate many
-            # valid children that need state slots for the next step.  Ensure S
-            # is at least K so no valid children are lost during packing.
-            if self.depth > 1 and self.width is not None and self.width > 0:
+            # Optional bump to ensure intermediate-step packing keeps every
+            # valid child. ``S = max(S, K)`` is a conservative *no-loss*
+            # cap when ``depth>1, width>0`` — intermediates can produce up
+            # to K children per state. Skipping the bump keeps the per-step
+            # ``[B*S, K_r, G_r, M, 3]`` allocation bounded, which is the
+            # difference between "fast" and "OOM" on high-fan-out KBs
+            # (wn18rr, family at depth 3) — but trades some apps when the
+            # actual valid children at any intermediate exceed S.
+            # Default keeps the bump for backwards-compat; pass
+            # ``bump_s_to_k=False`` to opt out.
+            if (self._bump_s_to_k and self.depth > 1
+                    and self.width is not None and self.width > 0):
                 self.S = max(self.S, self.K)
             self.C = meta["C"]
             # (C may be overridden by resolution-specific init)
