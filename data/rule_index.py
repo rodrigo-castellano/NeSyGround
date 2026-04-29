@@ -396,7 +396,8 @@ class _PatternVariant:
     """Lightweight anchor variant of a RulePattern (duck-typed)."""
 
     __slots__ = ('rule_idx', 'head_pred_idx', 'num_body', 'num_free',
-                 'body_patterns', 'body_pred_indices', 'enum_meta')
+                 'body_patterns', 'body_pred_indices', 'enum_meta',
+                 '_orig_body_patterns', '_orig_body_pred_indices')
 
     def __init__(
         self, base: RulePattern,
@@ -409,6 +410,16 @@ class _PatternVariant:
         self.body_patterns = body_patterns
         self.body_pred_indices = body_pred_indices
         self.enum_meta = enum_meta
+        # Propagate the natural (pre-anchor-reorder) body order from the
+        # base pattern. Required so that ``arg_source_dep`` and
+        # ``body_preds_dep`` (used to fill body atoms in flat/dense paths)
+        # carry canonical body order across all anchor variants of the
+        # same logical rule. Without this, variants produce body atoms
+        # in different positions → terminal dedup on
+        # ``(orig_rule_idx, head, sorted_body)`` collapses fewer
+        # logically-equivalent apps than keras-ns's set-based dedup.
+        self._orig_body_patterns = base._orig_body_patterns
+        self._orig_body_pred_indices = base._orig_body_pred_indices
 
 
 class RuleIndexEnum(RuleIndex):

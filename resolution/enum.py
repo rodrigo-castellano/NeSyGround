@@ -312,12 +312,7 @@ def resolve_enum_step(
     )
 
     # ── Flat intermediate path (zero grounding loss) ──
-    # Gated at V≥2: V=1 path under investigation (Phase 3); the
-    # ``pack_states_flat`` order-invariant goal_hash dedup is in place
-    # (necessary) but not sufficient — variants of the same logical
-    # rule application that find different free-var bindings still
-    # propagate as separate states and compound through depths.
-    if flat_intermediate and fv_enum_pred is not None and V >= 2:
+    if flat_intermediate and fv_enum_pred is not None and V >= 1:
         return _resolve_enum_step_flat(
             queries, remaining, grounding_body, state_valid, active_mask,
             fact_index=fact_index, d=d, depth=depth, width=width,
@@ -1352,6 +1347,28 @@ def _resolve_enum_step_flat(
     surv_n_idx = flat_n_idx[surv_idx]                  # [T_surv]
     surv_rule_idx = rule_global_idx[surv_idx]          # [T_surv]
     surv_r_local = flat_r_idx[surv_idx]                # [T_surv] — K_r position
+    surv_nbody = nbody_flat[surv_idx]                  # [T_surv]
+
+    # Canonicalize body atom order by per-atom hash. ``all_anchors=True``
+    # creates K_r body-ordering variants per logical rule; without
+    # canonicalisation the surviving variant's body order leaks into
+    # ``flat_goals[:, :M, :]`` and the ``_select`` at depth+1 picks
+    # different first goals for different variants, spawning different
+    # downstream rule firings (compounds through depths).
+    # Padding atoms get a sentinel so they sort to the end.
+    if M > 0:
+        P_C1, P_C2, P_C3 = 1_000_003, 999_983, 999_979
+        atom_pos = torch.arange(M, device=dev).unsqueeze(0)
+        active_canon = atom_pos < surv_nbody.unsqueeze(1)         # [T_surv, M]
+        atom_hash_canon = (surv_body[..., 0].long() * P_C1
+                           + surv_body[..., 1].long() * P_C2
+                           + surv_body[..., 2].long() * P_C3)     # [T_surv, M]
+        sentinel = torch.full_like(atom_hash_canon, (2 ** 62) - 1)
+        atom_hash_for_sort = torch.where(
+            active_canon, atom_hash_canon, sentinel)
+        canon_idx = atom_hash_for_sort.argsort(dim=-1)             # [T_surv, M]
+        surv_body = surv_body.gather(
+            1, canon_idx.unsqueeze(-1).expand(-1, -1, 3))
 
     # 9. Build flat goals [T_surv, G, 3] — body atoms + remaining parent goals
     surv_b_idx = surv_n_idx // S       # [T_surv] — batch index
@@ -1360,7 +1377,7 @@ def _resolve_enum_step_flat(
     # Build flat_goals: [T_surv, G, 3]
     flat_goals = torch.full(
         (T_surv, G, 3), pad, dtype=torch.long, device=dev)
-    flat_goals[:, :M, :] = surv_body   # body atoms at positions 0..M-1
+    flat_goals[:, :M, :] = surv_body   # body atoms at positions 0..M-1 (canonical)
 
     # Copy remaining goals from parent at positions M..G-1
     n_rem = min(G - M, G - 1)
