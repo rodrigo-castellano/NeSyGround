@@ -13,10 +13,19 @@ from __future__ import annotations
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import torch
+
+
+def _sync(device) -> None:
+    """Synchronize CUDA stream so wall-clock timings are accurate."""
+    if hasattr(device, "type") and device.type == "cuda":
+        torch.cuda.synchronize()
+    elif isinstance(device, str) and device.startswith("cuda"):
+        torch.cuda.synchronize()
 
 TESTS_DIR = Path(__file__).resolve().parent
 GROUNDER_ROOT = TESTS_DIR.parent
@@ -34,6 +43,16 @@ if str(KERAS_NS_ROOT) not in sys.path:
 from grounder.data.loader import KGDataset
 from grounder.bc.bc import BCGrounder
 from grounder.factory import make_bcwd
+
+# Force TensorFlow off the GPU before any keras-ns import. keras-ns
+# pulls in TF eagerly and TF's default policy is to grab all visible
+# GPU memory, which OOMs the torch run that follows.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+try:
+    import tensorflow as tf  # noqa: E402
+    tf.config.set_visible_devices([], "GPU")
+except Exception:
+    pass
 
 # Keras imports (guarded)
 try:
@@ -196,7 +215,9 @@ def compare_groundings(
     fact_tuples = list(ds._facts_raw)
 
     # For fp_batch: run full batch. For none: keras always runs full batch anyway.
+    t0 = time.perf_counter()
     kg.ground(fact_tuples, test_tuples)
+    keras_ms = (time.perf_counter() - t0) * 1000.0
     keras_total = sum(len(v) for v in kg.rule2groundings.values())
 
     # Per-rule keras counts
@@ -204,10 +225,13 @@ def compare_groundings(
 
     # Per-query keras counts (re-run per query for per-query comparison)
     keras_per_query = []
+    keras_per_query_ms_total = 0.0
     if filt == "none":
         for i in range(B):
             kg_i, _ = build_keras_grounder(ds, data_dir, width, depth)
+            t0 = time.perf_counter()
             kg_i.ground(fact_tuples, [test_tuples[i]])
+            keras_per_query_ms_total += (time.perf_counter() - t0) * 1000.0
             cnt = sum(len(v) for v in kg_i.rule2groundings.values())
             keras_per_query.append(cnt)
     else:
@@ -226,17 +250,30 @@ def compare_groundings(
     # ``ev.mask.sum()`` would count proof TREES (one entry per depth-D
     # tree, NOT per rule application) and undercounts whenever a tree's
     # depths share rule applications.
+    #
+    # Timing: warm up once at the shape we'll be running so the first
+    # ``torch.compile`` capture (and CUDA-graph build with
+    # ``mode='reduce-overhead'``) is excluded from ``torch_ms``. We
+    # report steady-state wall-clock to mirror keras (no compile cost).
+    torch_ms = 0.0
     if filt == "none":
         # Per-query: run each query individually so per-query counts
         # are comparable with keras's per-query rerun.
+        with torch.no_grad():
+            _ = g(test[:1], qmask[:1])  # warmup at B=1
+        _sync(test.device)
         torch_per_query = []
         torch_per_rule: Dict[str, int] = {r.name: 0 for r in keras_rules}
         torch_per_depth_rule: Dict[int, Dict[str, int]] = {}
         for i in range(B):
             q = test[i:i+1]
             qm = torch.ones(1, dtype=torch.bool, device=q.device)
+            _sync(q.device)
+            t0 = time.perf_counter()
             with torch.no_grad():
                 out = g(q, qm)
+            _sync(q.device)
+            torch_ms += (time.perf_counter() - t0) * 1000.0
             cnt_apps = (sum(out.rule_groundings.A_in[r].shape[0]
                             for r in out.rule_groundings.A_in)
                         if out.rule_groundings is not None else 0)
@@ -257,8 +294,15 @@ def compare_groundings(
         torch_per_rule = {r.name: 0 for r in keras_rules}
         torch_per_depth_rule = {}
         try:
+            # Warmup at full-batch shape, then steady-state timed run.
+            with torch.no_grad():
+                _ = g(test, qmask)
+            _sync(test.device)
+            t0 = time.perf_counter()
             with torch.no_grad():
                 out = g(test, qmask)
+            _sync(test.device)
+            torch_ms = (time.perf_counter() - t0) * 1000.0
             torch_total = (sum(out.rule_groundings.A_in[r].shape[0]
                                for r in out.rule_groundings.A_in)
                            if out.rule_groundings is not None else 0)
@@ -272,12 +316,20 @@ def compare_groundings(
             # Per-query fallback (slower but bounded memory).
             print(f"  [batched OOM: {type(exc).__name__}; falling back "
                   f"to per-query]", flush=True)
+            with torch.no_grad():
+                _ = g(test[:1], qmask[:1])  # warmup at B=1
+            _sync(test.device)
+            torch_ms = 0.0
             torch_per_query = []
             for i in range(B):
                 q = test[i:i+1]
                 qm = torch.ones(1, dtype=torch.bool, device=q.device)
+                _sync(q.device)
+                t0 = time.perf_counter()
                 with torch.no_grad():
                     out_i = g(q, qm)
+                _sync(q.device)
+                torch_ms += (time.perf_counter() - t0) * 1000.0
                 cnt = (sum(out_i.rule_groundings.A_in[r].shape[0]
                             for r in out_i.rule_groundings.A_in)
                        if out_i.rule_groundings is not None else 0)
@@ -290,6 +342,7 @@ def compare_groundings(
             torch_total = sum(torch_per_query)
 
     # ── Report ──
+    speedup = (keras_ms / torch_ms) if torch_ms > 0 else float("inf")
     result = {
         "config": f"w{width}d{depth}",
         "keras_total": keras_total,
@@ -301,6 +354,10 @@ def compare_groundings(
         "torch_per_query": torch_per_query,
         "match": keras_total == torch_total,
         "diff": torch_total - keras_total,
+        "keras_ms": keras_ms,
+        "torch_ms": torch_ms,
+        "keras_per_query_ms_total": keras_per_query_ms_total,
+        "speedup": speedup,
     }
 
     if verbose:
@@ -314,6 +371,18 @@ def compare_groundings(
         print(f"  Keras: {keras_total}  Torch: {torch_total}  "
               f"Diff: {torch_total - keras_total:+d}  "
               f"Match: {'YES' if result['match'] else 'NO'}")
+        # Wall-clock timing for the full-batch keras run (one call) vs.
+        # the steady-state torch run (post-warmup). For ``filt='none'``,
+        # torch_ms is the sum across B per-query calls; divide by B for
+        # the per-query average.
+        print(f"  Time:  Keras: {keras_ms:.1f} ms   "
+              f"Torch: {torch_ms:.1f} ms   "
+              f"Speedup keras/torch: {speedup:.2f}×")
+        if filt == "none" and B > 0:
+            print(f"         Keras per-query sum: "
+                  f"{keras_per_query_ms_total:.1f} ms "
+                  f"(avg {keras_per_query_ms_total / B:.2f} ms)   "
+                  f"Torch per-query avg: {torch_ms / B:.2f} ms")
 
         # Per-rule (top-level)
         print(f"\n  Per-rule (top-level):")
@@ -414,15 +483,24 @@ def main():
         )
         results.append(r)
 
-    # Summary table
-    print(f"\n{'='*70}")
+    # Summary table — counts on the left, timing on the right.
+    # ``K(ms)`` is the keras full-batch wall-clock; ``T(ms)`` is the
+    # steady-state torch run (sum of per-query times when filter='none',
+    # full-batch otherwise). Speedup is ``keras / torch`` — values >1
+    # mean torch is faster.
+    print(f"\n{'='*78}")
     print("SUMMARY")
-    print(f"{'='*70}")
-    print(f"{'Config':<10} {'Keras':>8} {'Torch':>8} {'Diff':>8} {'Match':>6}")
-    print("-" * 42)
+    print(f"{'='*78}")
+    print(f"{'Config':<8} {'Keras':>8} {'Torch':>8} {'Diff':>6} {'Match':>5}"
+          f"   {'K(ms)':>8} {'T(ms)':>8} {'Speedup':>8}")
+    print("-" * 78)
     for r in results:
-        print(f"{r['config']:<10} {r['keras_total']:>8} {r['torch_total']:>8} "
-              f"{r['diff']:>+8} {'YES' if r['match'] else 'NO':>6}")
+        speedup_str = (f"{r['speedup']:.2f}x" if r['speedup'] != float('inf')
+                       else "inf")
+        print(f"{r['config']:<8} {r['keras_total']:>8} {r['torch_total']:>8} "
+              f"{r['diff']:>+6} {'YES' if r['match'] else 'NO':>5}   "
+              f"{r['keras_ms']:>8.1f} {r['torch_ms']:>8.1f} "
+              f"{speedup_str:>8}")
 
 
 if __name__ == "__main__":
