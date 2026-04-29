@@ -312,11 +312,11 @@ def resolve_enum_step(
     )
 
     # ── Flat intermediate path (zero grounding loss) ──
-    # Gated at V≥2: for V=1 the all_anchors=True permutation produces
-    # extra apps that the flat path's order-invariant dedup is
-    # necessary-but-not-sufficient to collapse. The dense path stays
-    # the safer (if slower) default for V=1; deeper investigation
-    # tracked in goofy-plotting-stroustrup.md Phase 3.
+    # Gated at V≥2: V=1 path under investigation (Phase 3); the
+    # ``pack_states_flat`` order-invariant goal_hash dedup is in place
+    # (necessary) but not sufficient — variants of the same logical
+    # rule application that find different free-var bindings still
+    # propagate as separate states and compound through depths.
     if flat_intermediate and fv_enum_pred is not None and V >= 2:
         return _resolve_enum_step_flat(
             queries, remaining, grounding_body, state_valid, active_mask,
