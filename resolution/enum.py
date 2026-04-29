@@ -1524,6 +1524,13 @@ def _enumerate_cartesian_flat(
 
     combined_mask = combined_mask & has_free_q.unsqueeze(2)
     combined_mask[:, :, 0] = combined_mask[:, :, 0] | (~has_free_q & active_mask)
+    # Apply per-(state, K_r) active_mask: ``pred_rule_mask[qp]`` marks
+    # which K_r positions actually correspond to a rule with head=qp's
+    # predicate. Padded K_r slots (mask=False) should produce no
+    # candidates regardless of has_free / fv_valid status. Without
+    # this AND the candidates from the padded rule (rule_idx 0) leak
+    # through and get recorded as spurious apps with wrong heads.
+    combined_mask = combined_mask & active_mask.unsqueeze(2)
 
     # ── Extract valid entries into flat representation ──
     # combined_mask: [B, K_r, G_current] → nonzero gives [total_valid, 3]
