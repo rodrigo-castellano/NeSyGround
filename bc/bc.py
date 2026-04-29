@@ -122,13 +122,27 @@ class BCGrounder(nn.Module):
         self.step_hook = None  # Optional StepHook (nn.Module), set externally
         self.collect_evidence = collect_evidence
         self.prune_facts = prune_facts
-        # Enum defaults: all_anchors + cartesian + collect_rule_groundings
-        # for keras-compatible per-rule-application grounding output.
+        # Enum defaults:
+        #   all_anchors=True              — try every body atom as anchor
+        #                                    (matches keras's per-i loop)
+        #   collect_rule_groundings=True  — populate _r2g_buffer for the
+        #                                    keras-comparable per-rule output
+        #   cartesian_product=False       — fact-anchored enumeration: candidates
+        #                                    come from ``fact_index.enumerate``
+        #                                    (the partial atom lookup), not from
+        #                                    the full entity domain. This
+        #                                    matches keras's
+        #                                    ``fact_index._index.get(partial_atom)``
+        #                                    and keeps the d=1 body tensor
+        #                                    bounded by ``G_r`` (typically
+        #                                    ``min(K_f, max_groundings_per_query)``)
+        #                                    instead of ``E`` (entity count).
+        # Callers may opt back into ``cartesian_product=True`` for full-domain
+        # exploration; the count is identical (after filtering) because both
+        # admit the same set of valid groundings.
         if resolution == "enum":
             if not all_anchors:
                 all_anchors = True
-            if not cartesian_product:
-                cartesian_product = True
             if not collect_rule_groundings:
                 collect_rule_groundings = True
         self._cartesian_product = cartesian_product
