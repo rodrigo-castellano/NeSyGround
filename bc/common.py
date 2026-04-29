@@ -451,6 +451,7 @@ def collect_groundings(
     deactivate: bool = True,
     head_per_depth: Optional[Tensor] = None,   # [B, S, D, 3]
     collected_head: Optional[Tensor] = None,    # [B, C, D, 3]
+    variant_to_orig: Optional[Tensor] = None,   # [num_variants] long
 ) -> Tuple:
     """Collect completed groundings into output buffer.
 
@@ -504,7 +505,10 @@ def collect_groundings(
 
     # Dedup: hash over flat body + all D rule indices
     cb_flat = cb.reshape(B, n_cat, G_body_flat, 3)
-    cm = _dedup_groundings(cb_flat, cr, cm, G_body_flat)
+    cm = _dedup_groundings(
+        cb_flat, cr, cm, G_body_flat,
+        variant_to_orig=variant_to_orig,
+    )
 
     n_k = min(C, n_cat)
     _, ki = cm.to(torch.int8).topk(
@@ -544,36 +548,70 @@ def _dedup_groundings(
     ridx: Tensor,       # [B, N] or [B, N, D]
     mask: Tensor,       # [B, N]
     G_body: int,
+    *,
+    variant_to_orig: Optional[Tensor] = None,  # [num_variants] long
 ) -> Tensor:
     """Remove duplicate groundings based on (ridx, body) hash.
+
+    Hash is invariant to body-atom permutations within each depth's M slot
+    (so all_anchors variants of the same logical rule application collapse),
+    while preserving depth ordering. When ``variant_to_orig`` is provided,
+    variant rule indices are remapped to their original rule index before
+    hashing so anchor variants of the same rule share a key.
 
     Args:
         body: [B, N, G_body, 3] grounding body atoms (flat view)
         ridx: [B, N, D] per-depth rule indices, or [B, N] single rule index
         mask: [B, N] validity mask
         G_body: number of body atom slots in flat view
+        variant_to_orig: optional [num_variants] map from variant rule
+            index to original rule index (for all_anchors).
 
     Returns:
         mask: [B, N] updated mask with duplicates removed
     """
     B, N = mask.shape
     dev = mask.device
-    P1, P2, P3, P4 = 1_000_003, 999_983, 999_979, 999_961
+    P1, P2, P3, P4, P5 = 1_000_003, 999_983, 999_979, 999_961, 999_959
 
-    # Body hash: [B, N]
+    # Body hash: [B, N], order-invariant within each depth's M slot.
     atom_hashes = (body[..., 0].long() * P1
                    + body[..., 1].long() * P2
                    + body[..., 2].long() * P3)               # [B, N, G_body]
-    powers = P4 ** torch.arange(G_body - 1, -1, -1, device=dev)
-    body_hash = (atom_hashes * powers).sum(dim=-1)            # [B, N]
+    # ``ridx.dim()`` is a Python int (static under torch.compile), so this
+    # branch specializes at trace time. Caller guarantees G_body == D * M
+    # in the structured layout (see ``collect_groundings``).
+    if ridx.dim() == 3:
+        D = ridx.shape[2]
+        M = G_body // D
+        # Sort atom hashes within each depth's M slot → canonical order.
+        ah_sorted, _ = atom_hashes.view(B, N, D, M).sort(dim=-1)
+        m_powers = P4 ** torch.arange(M - 1, -1, -1, device=dev)
+        per_depth_hash = (ah_sorted * m_powers).sum(dim=-1)   # [B, N, D]
+        d_powers = P5 ** torch.arange(D - 1, -1, -1, device=dev)
+        body_hash = (per_depth_hash * d_powers).sum(dim=-1)   # [B, N]
+    else:
+        powers = P4 ** torch.arange(G_body - 1, -1, -1, device=dev)
+        body_hash = (atom_hashes * powers).sum(dim=-1)        # [B, N]
 
-    # Rule index hash: include all D dimensions if structured
+    # Remap variant rule indices to originals so anchor variants collapse.
+    # ``variant_to_orig is not None`` is a Python None check, specialized
+    # at trace time — no data-dependent branching.
+    ridx_long = ridx.long()
+    if variant_to_orig is not None:
+        idx = ridx_long.clamp(min=0)
+        remapped = variant_to_orig[idx]
+        ridx_eff = torch.where(ridx >= 0, remapped, ridx_long)
+    else:
+        ridx_eff = ridx_long
+
+    # Rule index hash: include all D dimensions if structured.
     if ridx.dim() == 3:
         D = ridx.shape[2]
         r_powers = P4 ** torch.arange(D - 1, -1, -1, device=dev)
-        ridx_hash = (ridx.long() * r_powers).sum(dim=-1)     # [B, N]
+        ridx_hash = (ridx_eff * r_powers).sum(dim=-1)         # [B, N]
     else:
-        ridx_hash = ridx.long()                                # [B, N]
+        ridx_hash = ridx_eff                                  # [B, N]
 
     g_hash = ridx_hash * P1 + body_hash                       # [B, N]
 
@@ -600,36 +638,47 @@ def prune_rule_groundings(
 ) -> Dict[int, Set[Tuple]]:
     """Iterative fixed-point pruning of rule groundings (Kleene T_P).
 
-    Equivalent to keras's PruneIncompleteProofs. Keeps only groundings
-    whose body atoms are all either facts or heads of other proved groundings.
+    Mirrors keras-ns ``PruneIncompleteProofs`` exactly: each iteration uses
+    a snapshot of the proved set from the previous iteration so each pass
+    extends the chain by exactly one step. After ``max_iterations`` passes,
+    keep groundings whose body atoms are all either facts or proved heads.
+
+    A previous in-place version converged to a strictly larger proved set
+    than keras at the same iteration count (because heads added earlier in
+    a pass were immediately usable later in the same pass), causing torch
+    to keep groundings keras dropped.
 
     Args:
         rule2groundings: rule_idx → set of (head, body) tuples
         fact_set: set of (pred, subj, obj) known facts
-        max_iterations: convergence bound
+        max_iterations: number of snapshot passes (= keras ``num_steps``)
 
     Returns:
         Pruned dict with same structure.
     """
-    # Compute proved heads: start with facts
-    proved: Set[Tuple[int, int, int]] = set(fact_set)
+    proved: Set[Tuple[int, int, int]] = set()
 
     for _ in range(max_iterations):
-        prev_size = len(proved)
-        # Add heads of groundings whose bodies are all proved
+        # Snapshot from the previous pass — heads added here are NOT
+        # visible to other groundings until the next iteration.
+        snapshot = proved | fact_set
+        new_proved = set(proved)
         for r, groundings in rule2groundings.items():
             for head, body in groundings:
-                if all(atom in proved for atom in body):
-                    proved.add(head)
-        if len(proved) == prev_size:
-            break  # converged
+                if head in new_proved:
+                    continue
+                if all(atom in snapshot for atom in body):
+                    new_proved.add(head)
+        if new_proved == proved:
+            break
+        proved = new_proved
 
-    # Filter: keep groundings whose bodies are all proved
+    proved_or_fact = proved | fact_set
     pruned: Dict[int, Set[Tuple]] = {}
     for r, groundings in rule2groundings.items():
         kept = set()
         for head, body in groundings:
-            if all(atom in proved for atom in body):
+            if all(atom in proved_or_fact for atom in body):
                 kept.add((head, body))
         if kept:
             pruned[r] = kept

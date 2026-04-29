@@ -32,6 +32,13 @@ Resolution is configured, not subclassed:
 - `resolution='rtf'`: K = K_f * K_r, two-level Rule-Then-Fact
 - `resolution='enum'`: full entity enumeration
 
+### BC_{w,d} grounders need `filter='fp_batch'` and `all_anchors=True`
+
+For the `enum` resolution, the BC_{w,d} family (e.g. `enum.fp_batch.w1.d2`) requires both:
+
+1. **`filter='fp_batch'`** (the default for `enum`). With `filter='none'` the grounder admits rule applications whose unknown body atoms cannot be derived through the chain — these are pruned by keras-ns's `prune_incomplete_proofs=True` for `depth>1`. The `fp_batch` filter applies the equivalent Kleene fixed-point pruning over `_r2g_buffer` so `out.rule_groundings` matches keras-ns rule-by-rule.
+2. **`all_anchors=True`** (forced by `BCGrounder.__init__` for `enum`). Anchoring only on the first body atom (e.g. `nb` in `nb(X,Y), loc(Y,Z) → loc(X,Z)`) misses bindings keras-ns finds when iterating each body position as anchor — anchoring on `loc(Y,Z)` admits Y values where `loc(Y,Z)` is fact and `nb(X,Y)` is the unknown. The dedup pass collapses the K_r anchor variants of the same logical rule application via `_variant_to_orig`, so consumers see a single entry per distinct rule application.
+
 ## Package Structure
 
 ```

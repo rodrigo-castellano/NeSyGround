@@ -90,7 +90,7 @@ class BCGrounder(nn.Module):
         flat_intermediate: bool = False,
         pack_dedup: bool = True,
         collect_rule_groundings: bool = False,
-        w_last_depth: int = 0,
+        w_last_depth: Optional[int] = None,
         collect_mode: str = "terminal",
         # Output variable standardization (for consumers of ungrounded states)
         standardization: Optional[StandardizationConfig] = None,
@@ -128,6 +128,13 @@ class BCGrounder(nn.Module):
         self._flat_intermediate_flag = flat_intermediate
         self._pack_dedup = pack_dedup
         self._collect_rule_groundings = collect_rule_groundings
+        # Default: at depth=1 the only step is the "last step", and forcing
+        # all body atoms to be facts there would yield zero groundings. Use
+        # `width` so width=k means "≤ k unknowns at this single step",
+        # matching keras-ns max_unknown_fact_count_last_step semantics.
+        # At depth>1 keep w_last_depth=0 (strict termination).
+        if w_last_depth is None:
+            w_last_depth = width if (depth == 1 and width is not None) else 0
         self._w_last_depth = w_last_depth
         self._collect_mode = collect_mode
 
@@ -256,13 +263,19 @@ class BCGrounder(nn.Module):
             self.K_v = meta.get("K_v", 64)
             self._fv_any_valid = meta.get("fv_any_valid", None)
             self._flat_intermediate = meta.get("flat_intermediate", False)
-            # Variant→original rule mapping (for all_anchors)
+            # Variant→original rule mapping (for all_anchors). Stored as
+            # both a Python list (consumed by per-rule collection) and a
+            # long Tensor buffer (consumed by tensor dedup).
             if self._all_anchors:
                 v2o = []
                 for orig_r, blen in enumerate(self.kb.rule_index.rule_lens_sorted.tolist()):
                     for _ in range(blen):
                         v2o.append(orig_r)
                 self._variant_to_orig = v2o
+                self.register_buffer(
+                    "_variant_to_orig_t",
+                    torch.tensor(v2o, dtype=torch.long, device=self.kb.device_),
+                )
             self.fc_method = kwargs["fc_method"]
             self.fc_depth = kwargs["fc_depth"]
             self.max_vars_per_rule = 3  # unused for enum, but keeps state uniform
@@ -680,7 +693,7 @@ class BCGrounder(nn.Module):
                 fi = self.kb.fact_index.facts_idx  # [F, 3]
                 for f in range(fi.shape[0]):
                     fact_set.add(tuple(fi[f].tolist()))
-                r2g = prune_rule_groundings(r2g, fact_set, max_iterations=self.depth + 1)
+                r2g = prune_rule_groundings(r2g, fact_set, max_iterations=self.depth)
             rule_groundings = build_rule_grounding_tensors(
                 r2g, self.kb.num_rules, queries.device)
 
@@ -1361,6 +1374,7 @@ class BCGrounder(nn.Module):
             deactivate=deactivate,
             head_per_depth=states.get("head_per_depth"),
             collected_head=states.get("collected_head"),
+            variant_to_orig=getattr(self, "_variant_to_orig_t", None),
         )
 
         states["collected_body"] = cb
@@ -1420,7 +1434,11 @@ class BCGrounder(nn.Module):
                 self._r2g_buffer[orig_r].add((head, tuple(sorted(body))))
 
         else:
-            # ResolvedChildren (SLD/RTF): dense [B, S, K_r, ...]
+            # ResolvedChildren: SLD/RTF, or enum dense path. With
+            # all_anchors=True the enum dense path emits variant indices,
+            # so map them back to the original rule index — same as the
+            # FlatResolvedChildren branch above. SLD/RTF have no variants;
+            # the lookup is a no-op there.
             ridx = resolved.sub_rule_idx.cpu()    # [B, S, K_r]
             goals = resolved.rule_goals.cpu()     # [B, S, K_r, G, 3]
             success = resolved.rule_success.cpu() # [B, S, K_r]
@@ -1447,10 +1465,13 @@ class BCGrounder(nn.Module):
                             head = tuple(sel_cpu[b, s].tolist())
                         else:
                             head = (pad, pad, pad)
-                        # SLD/RTF: rule_idx is already original (no variants)
-                        if r not in self._r2g_buffer:
-                            self._r2g_buffer[r] = set()
-                        self._r2g_buffer[r].add((head, tuple(sorted(body))))
+                        orig_r = (self._variant_to_orig[r]
+                                  if hasattr(self, '_variant_to_orig')
+                                  else r)
+                        if orig_r not in self._r2g_buffer:
+                            self._r2g_buffer[orig_r] = set()
+                        self._r2g_buffer[orig_r].add(
+                            (head, tuple(sorted(body))))
 
     def _postprocess(self, states: Dict[str, Tensor], sync: SyncParams,
                      d: int = 0) -> Dict[str, Tensor]:
@@ -1469,6 +1490,17 @@ class BCGrounder(nn.Module):
         """
         states = self._postprocess_goals(states)
         states = self._sync_accumulated(states, sync, d)
+        # Last step + w_last_depth>0: leftover ground unknowns in proof_goals
+        # would block terminal collection. The body atoms are already in
+        # accumulated_body; clear proof_goals so the rule application is
+        # emitted (matches keras-ns prune_incomplete_proofs=False semantics).
+        # Static `d == self.depth - 1` and Python-int comparison are
+        # specialized at trace time — compile-safe.
+        if (d == self.depth - 1 and self._w_last_depth is not None
+                and self._w_last_depth > 0):
+            pad = self.kb.padding_idx
+            states["proof_goals"] = torch.full_like(
+                states["proof_goals"], pad)
         if self.collect_evidence:
             states = self._collect_groundings(states)
         return states

@@ -12,6 +12,13 @@ This file defines repository-wide guidance for the `grounder` repository.
 
 NeSyGround is a compiled, fixed-shape grounding library for neuro-symbolic reasoning. It provides backward-chaining resolution, filtering, KB indexing, and optional neural/KGE hooks in a form that stays compatible with `torch.compile` and CUDA-graph-friendly execution.
 
+## BC_{w,d} grounders require `filter='fp_batch'` and `all_anchors=True`
+
+The `enum` resolution paired with the BC_{w,d} configs (`enum.fp_batch.wW.dD`) must be configured as:
+
+- `filter='fp_batch'` (the default for `enum`). `filter='none'` keeps rule applications whose unknown body atoms cannot be derived through the chain; keras-ns drops them via `prune_incomplete_proofs=True` for `depth>1`. The `fp_batch` filter runs the equivalent Kleene fixed-point pruning over `_r2g_buffer`, so `out.rule_groundings` matches keras-ns rule-by-rule. Tests that compare against keras-ns must build the torch grounder with `filter='fp_batch'` whenever they pass `prune_incomplete_proofs=True` to keras-ns.
+- `all_anchors=True` (forced for `enum` in `BCGrounder.__init__`, even if the caller passes `False`). Anchoring only on the first body atom misses rule applications that keras-ns finds when iterating each body position as anchor — for the recursive `nb(X,Y), loc(Y,Z) → loc(X,Z)` rule, anchoring on `loc` admits Y values where `nb(X,Y)` is unknown but `loc(Y,Z)` is fact (and vice versa). The dedup pipeline uses the `_variant_to_orig` map so the K_r anchor variants of the same logical rule application collapse to a single entry. Without `all_anchors=True` the BC_{w,d} grounding count is strictly smaller than keras-ns.
+
 ## Architecture
 
 Current package ownership:

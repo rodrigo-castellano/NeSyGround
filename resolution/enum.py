@@ -224,7 +224,7 @@ def resolve_enum_step(
     enum_bound_binding_a: Tensor,
     enum_direction_a: Tensor,
     check_arg_source_a: Tensor,
-    head_pred_mask: Tensor,
+    head_pred_mask: Optional[Tensor],
     # Optional dual
     has_dual: Optional[Tensor] = None,
     enum_pred_b: Optional[Tensor] = None,
@@ -302,6 +302,15 @@ def resolve_enum_step(
     if d == depth - 1 and width is not None:
         width_d = w_last_depth
 
+    # 1b. Head-pred prune is only meaningful when an unknown body atom
+    #     could later be proved by some rule — i.e. at intermediate steps.
+    #     At the last step (no further depth), pass None to admit unknowns
+    #     regardless of their predicate, matching keras-ns
+    #     prune_incomplete_proofs=False semantics for terminal collection.
+    head_pred_mask_d: Optional[Tensor] = (
+        None if d == depth - 1 else head_pred_mask
+    )
+
     # ── Flat intermediate path (zero grounding loss) ──
     if flat_intermediate and fv_enum_pred is not None and V >= 2:
         return _resolve_enum_step_flat(
@@ -310,7 +319,7 @@ def resolve_enum_step(
             M=M, padding_idx=padding_idx, G_r=G_r, K=K,
             pred_rule_indices=pred_rule_indices, pred_rule_mask=pred_rule_mask,
             has_free=has_free, body_preds=body_preds, num_body_atoms=num_body_atoms,
-            check_arg_source_a=check_arg_source_a, head_pred_mask=head_pred_mask,
+            check_arg_source_a=check_arg_source_a, head_pred_mask=head_pred_mask_d,
             fv_enum_pred=fv_enum_pred, fv_enum_bound_src=fv_enum_bound_src,
             fv_enum_direction=fv_enum_direction, fv_enum_valid=fv_enum_valid,
             V=V, fv_any_valid=fv_any_valid,
@@ -335,7 +344,7 @@ def resolve_enum_step(
         enum_bound_binding_a=enum_bound_binding_a,
         enum_direction_a=enum_direction_a,
         check_arg_source_a=check_arg_source_a,
-        head_pred_mask=head_pred_mask,
+        head_pred_mask=head_pred_mask_d,
         G_r=G_r, M=M, width=width_d,
         has_dual=has_dual,
         enum_pred_b=enum_pred_b,
@@ -460,7 +469,7 @@ def resolve_enum(
     enum_bound_binding_a: Tensor, # [R]
     enum_direction_a: Tensor,     # [R]
     check_arg_source_a: Tensor,   # [R, M, 2]
-    head_pred_mask: Tensor,       # [P] bool
+    head_pred_mask: Optional[Tensor],   # [P] bool, None to skip head-pred prune
     G_r: int,                     # groundings per rule
     M: int,                       # max body atoms
     width: Optional[int],         # width bound (None=∞)
@@ -1146,11 +1155,15 @@ def _apply_enum_filters(
     queries: Tensor,          # [B, 3]
     G_r: int,
     width: Optional[int],
-    head_pred_mask: Tensor,   # [P] bool
+    head_pred_mask: Optional[Tensor],   # [P] bool, None to skip head-pred prune
 ) -> Tensor:
     """Apply width filtering, query exclusion, and head predicate pruning.
 
     Returns: [B, K_r, G_r] grounding mask.
+
+    Pass ``head_pred_mask=None`` to disable the unprovable-unknown filter
+    (matches keras-ns ``prune_incomplete_proofs=False``). Used at the last
+    proof step, where there is no further depth to prove unknowns at.
     """
     B, K_r = active_mask.shape
     M = body_atoms.shape[3]
@@ -1169,13 +1182,14 @@ def _apply_enum_filters(
     has_query_atom = (is_query & body_active_exp).any(dim=-1)
     mask = mask & ~has_query_atom
 
-    # Head predicate pruning (only when width is bounded)
+    # Head predicate pruning (only when width is bounded AND a mask is given)
     if width is not None:
-        body_pred_vals = body_atoms[..., 0]
-        head_pred_ok = head_pred_mask[body_pred_vals]
-        unknown_ok = exists | head_pred_ok
-        all_ok = (unknown_ok | ~body_active_exp).all(dim=-1)
-        mask = mask & all_ok
+        if head_pred_mask is not None:
+            body_pred_vals = body_atoms[..., 0]
+            head_pred_ok = head_pred_mask[body_pred_vals]
+            unknown_ok = exists | head_pred_ok
+            all_ok = (unknown_ok | ~body_active_exp).all(dim=-1)
+            mask = mask & all_ok
 
         if width == 0:
             all_exist = (exists | ~body_active_exp).all(dim=-1)
@@ -1220,7 +1234,7 @@ def _resolve_enum_step_flat(
     padding_idx: int, G_r: int, K: int,
     pred_rule_indices: Tensor, pred_rule_mask: Tensor,
     has_free: Tensor, body_preds: Tensor, num_body_atoms: Tensor,
-    check_arg_source_a: Tensor, head_pred_mask: Tensor,
+    check_arg_source_a: Tensor, head_pred_mask: Optional[Tensor],
     fv_enum_pred: Tensor, fv_enum_bound_src: Tensor,
     fv_enum_direction: Tensor, fv_enum_valid: Tensor,
     V: int, fv_any_valid: Optional[list],
@@ -1242,6 +1256,10 @@ def _resolve_enum_step_flat(
     width_d = width
     if d == depth - 1 and width is not None:
         width_d = w_last_depth
+    # Last step: skip head-pred prune (no further depth to prove unknowns).
+    head_pred_mask_d: Optional[Tensor] = (
+        None if d == depth - 1 else head_pred_mask
+    )
 
     # 1. Flatten queries
     flat_q = queries.reshape(N, 3)
@@ -1308,7 +1326,7 @@ def _resolve_enum_step_flat(
     # Need original queries [N, 3] indexed by flat_n_idx
     fmask = _apply_filters_flat(
         flat_body, flat_exists, flat_n_idx, nbody_flat,
-        flat_q, width_d, head_pred_mask, M)
+        flat_q, width_d, head_pred_mask_d, M)
 
     # 8. Extract surviving entries
     surv_idx = torch.nonzero(fmask, as_tuple=False).squeeze(1)  # [T_surv]
@@ -1536,7 +1554,7 @@ def _apply_filters_flat(
     flat_num_body: Tensor,    # [total_valid] num active body atoms per entry
     queries: Tensor,          # [B, 3] original queries
     width: Optional[int],
-    head_pred_mask: Tensor,   # [P] bool
+    head_pred_mask: Optional[Tensor],   # [P] bool, None to skip head-pred prune
     M: int,
 ) -> Tensor:
     """Apply width filtering, query exclusion, head pred pruning on flat body.
@@ -1562,13 +1580,14 @@ def _apply_filters_flat(
     has_query_atom = (is_query & body_active).any(dim=-1)  # [T]
     mask = mask & ~has_query_atom
 
-    # Head predicate pruning (when width is bounded)
+    # Head predicate pruning (when width is bounded AND a mask is given)
     if width is not None:
-        body_pred_vals = flat_body[..., 0]  # [T, M]
-        head_pred_ok = head_pred_mask[body_pred_vals]  # [T, M]
-        unknown_ok = flat_exists | head_pred_ok
-        all_ok = (unknown_ok | ~body_active).all(dim=-1)  # [T]
-        mask = mask & all_ok
+        if head_pred_mask is not None:
+            body_pred_vals = flat_body[..., 0]  # [T, M]
+            head_pred_ok = head_pred_mask[body_pred_vals]  # [T, M]
+            unknown_ok = flat_exists | head_pred_ok
+            all_ok = (unknown_ok | ~body_active).all(dim=-1)  # [T]
+            mask = mask & all_ok
 
         if width == 0:
             all_exist = (flat_exists | ~body_active).all(dim=-1)

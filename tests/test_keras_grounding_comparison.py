@@ -129,12 +129,13 @@ def build_torch_grounder(
     kb, width: int, depth: int, *,
     flat: bool = True, all_anchors: bool = False,
     filt: str = "none", S_max: int = 256, C: int = 4096,
+    G_r: int = 4096,
 ) -> BCGrounder:
     """Build a torch-ns BCGrounder for enum resolution."""
     return BCGrounder(
         kb, resolution="enum", filter=filt,
         depth=depth, width=width,
-        max_groundings_per_query=4096,
+        max_groundings_per_query=G_r,
         max_total_groundings=C,
         max_states=S_max,
         fc_method="join", prune_facts=True,
@@ -160,12 +161,16 @@ def compare_groundings(
     C: int = 4096,
     split: str = "test",
     verbose: bool = True,
+    max_queries: int = 0,
+    G_r: int = 4096,
 ) -> dict:
     """Compare keras-ns vs torch-ns grounding counts.
 
     Returns dict with per-query counts and summary.
     """
     test = ds.get_queries(split)
+    if max_queries > 0:
+        test = test[:max_queries]
     B = test.size(0)
     qmask = torch.ones(B, dtype=torch.bool, device=test.device)
 
@@ -203,7 +208,7 @@ def compare_groundings(
     # ── Torch ──
     g = build_torch_grounder(kb, width, depth, flat=flat,
                               all_anchors=all_anchors, filt=filt,
-                              S_max=S_max, C=C)
+                              S_max=S_max, C=C, G_r=G_r)
 
     if filt == "none":
         # Per-query: run each query individually
@@ -332,10 +337,16 @@ def main():
     parser.add_argument("--flat", action="store_true", default=True)
     parser.add_argument("--no-flat", dest="flat", action="store_false")
     parser.add_argument("--all-anchors", action="store_true")
-    parser.add_argument("--filter", default="none")
+    # BC_{w,d} requires fp_batch to match keras-ns prune_incomplete_proofs.
+    # See README.md / CLAUDE.md "BC_{w,d} grounders require filter='fp_batch'".
+    parser.add_argument("--filter", default="fp_batch")
     parser.add_argument("--s-max", type=int, default=256)
     parser.add_argument("--C", type=int, default=4096)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--max-queries", type=int, default=0,
+                        help="Truncate test split to first N queries (0 = all).")
+    parser.add_argument("--G-r", type=int, default=4096,
+                        help="max_groundings_per_query in BCGrounder.")
     args = parser.parse_args()
 
     data_dir = Path(args.dataset)
@@ -358,6 +369,8 @@ def main():
             ds, kb, data_dir, width, depth,
             flat=args.flat, all_anchors=args.all_anchors,
             filt=filt, S_max=args.s_max, C=args.C,
+            max_queries=args.max_queries,
+            G_r=args.G_r,
         )
         results.append(r)
 
