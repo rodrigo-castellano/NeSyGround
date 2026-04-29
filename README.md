@@ -32,12 +32,43 @@ Resolution is configured, not subclassed:
 - `resolution='rtf'`: K = K_f * K_r, two-level Rule-Then-Fact
 - `resolution='enum'`: full entity enumeration
 
-### BC_{w,d} grounders need `filter='fp_batch'` and `all_anchors=True`
+### BC_{w,d,u} grounders: paper parametrization
 
-For the `enum` resolution, the BC_{w,d} family (e.g. `enum.fp_batch.w1.d2`) requires both:
+The `enum` BC family follows the paper / keras-ns notation:
 
-1. **`filter='fp_batch'`** (the default for `enum`). With `filter='none'` the grounder admits rule applications whose unknown body atoms cannot be derived through the chain — these are pruned by keras-ns's `prune_incomplete_proofs=True` for `depth>1`. The `fp_batch` filter applies the equivalent Kleene fixed-point pruning over `_r2g_buffer` so `out.rule_groundings` matches keras-ns rule-by-rule.
-2. **`all_anchors=True`** (forced by `BCGrounder.__init__` for `enum`). Anchoring only on the first body atom (e.g. `nb` in `nb(X,Y), loc(Y,Z) → loc(X,Z)`) misses bindings keras-ns finds when iterating each body position as anchor — anchoring on `loc(Y,Z)` admits Y values where `loc(Y,Z)` is fact and `nb(X,Y)` is the unknown. The dedup pass collapses the K_r anchor variants of the same logical rule application via `_variant_to_orig`, so consumers see a single entry per distinct rule application.
+- `w` — `max_unknown_fact_count` at intermediate proof steps.
+- `d` — `num_steps` (proof depth).
+- `u` — `max_unknown_fact_count_last_step`. **Paper convention is `u=0`**: every leaf body atom must be a fact.
+
+Use `grounder.make_bcwd(kb, w, d, u=0, ...)` for the parametrized constructor, or the type-string shorthands `bcWD` (paper, u=0) / `bcWDuU` (explicit u). Internal mapping: `u` → `BCGrounder.w_last_depth`.
+
+```python
+from grounder import KGDataset, make_bcwd
+ds = KGDataset(...)
+kb = ds.make_kb()
+g = make_bcwd(kb, w=1, d=2)        # bc12 paper: u=0 → filter='fp_batch'
+out = g(queries, query_mask)
+# out.rule_groundings matches keras-ns rule-by-rule.
+```
+
+Default filter depends on `u`:
+
+| `u` | default filter | matches keras-ns |
+|-----|----------------|------------------|
+| `u=0` (paper) | `fp_batch` | `prune_incomplete_proofs=True` (Kleene fixed-point pruning over the rule-application set) |
+| `u>0` (rare)  | `none`     | `prune_incomplete_proofs=False` (admit unknown leaves) |
+
+Under the paper convention, `bc01` and `bc11` produce **identical output** — at `d=1` the only step is the last step, and `u=0` caps unknown leaves regardless of `w`. They differ only for `d≥2` where `w` controls intermediate-step admissibility.
+
+`all_anchors=True` is forced by `BCGrounder.__init__` for `enum`. Anchoring only on the first body atom (e.g. `nb` in `nb(X,Y), loc(Y,Z) → loc(X,Z)`) misses bindings keras-ns finds when iterating each body position as anchor. The dedup pass collapses the K_r anchor variants of the same logical rule application via `_variant_to_orig`.
+
+**Paper rule sets.** Some datasets ship two rule files; the paper / IJCAI '25 numbers use the smaller curated set:
+
+| dataset | paper rules | extended set |
+|---|---|---|
+| `family` | `rules_old.txt` (47 rules) | `rules.txt` (143 rules) |
+
+Pass `KGDataset(..., rules_file='rules_old.txt')` to reproduce paper grounding counts on family. The 143-rule `rules.txt` is an automated expansion that blows up `K_r` and OOMs large query batches under `cartesian_product=True`.
 
 ## Package Structure
 

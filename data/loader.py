@@ -155,6 +155,7 @@ class KGDataset:
         self,
         data_dir: str,
         facts_file: str = "facts.txt",
+        rules_file: str = "rules.txt",
         device: str = "cpu",
     ) -> None:
         self.data_dir = Path(data_dir)
@@ -167,9 +168,15 @@ class KGDataset:
             facts_path = self.data_dir / "train.txt"
         self._facts_file = facts_path.name
 
+        # Rules file (paper numbers for ``family`` use ``rules_old.txt`` —
+        # 47 rules, vs the expanded ``rules.txt`` with 143 rules. Pass
+        # ``rules_file='rules_old.txt'`` to reproduce paper grounding
+        # counts on family).
+        self._rules_file = rules_file
+
         # Parse raw data, sorted alphabetically for deterministic ordering
         facts_raw = sorted(_parse_triples(facts_path))
-        rules_raw = sorted(_parse_rules(self.data_dir / "rules.txt"))
+        rules_raw = sorted(_parse_rules(self.data_dir / rules_file))
         self._facts_raw: List[Tuple[str, str, str]] = facts_raw
         self._rules_raw: List[Tuple[Tuple[str, str, str], List[Tuple[str, str, str]]]] = rules_raw
 

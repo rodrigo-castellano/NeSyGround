@@ -89,7 +89,7 @@ from grounder.data.loader import KGDataset
 from grounder.fc.fc import run_forward_chaining
 
 # --- Factory ---
-from grounder.factory import create_grounder
+from grounder.factory import create_grounder, make_bcwd
 
 # --- KB + Grounders ---
 from grounder.data.kb import KB

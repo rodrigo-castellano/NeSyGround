@@ -66,7 +66,7 @@ class BCGrounder(nn.Module):
         depth: int = 2,
         width: Optional[int] = 1,
         resolution: str = "enum",
-        filter: str = "fp_batch",
+        filter: Optional[str] = None,
         max_total_groundings: int = 64,
         compile_mode: Optional[str] = None,
         hooks: Optional[List] = None,
@@ -106,6 +106,14 @@ class BCGrounder(nn.Module):
         self.depth = depth
         self.width = width
         self.resolution = resolution
+        # Default filter is the paper BC_{w,d,u=0} convention for enum:
+        # 'fp_batch' (keras ``prune_incomplete_proofs=True`` equivalent).
+        # Callers that want u>0 semantics (admit unknown leaves) should
+        # pass ``filter='none'`` explicitly along with ``w_last_depth>0``;
+        # ``make_bcwd`` does this via its ``u`` parameter.
+        # SLD/RTF have no parity story; default 'none'.
+        if filter is None:
+            filter = "fp_batch" if resolution == "enum" else "none"
         self.filter_mode = filter
         self.compile_mode = compile_mode
         self.hooks = hooks or []
@@ -128,13 +136,16 @@ class BCGrounder(nn.Module):
         self._flat_intermediate_flag = flat_intermediate
         self._pack_dedup = pack_dedup
         self._collect_rule_groundings = collect_rule_groundings
-        # Default: at depth=1 the only step is the "last step", and forcing
-        # all body atoms to be facts there would yield zero groundings. Use
-        # `width` so width=k means "≤ k unknowns at this single step",
-        # matching keras-ns max_unknown_fact_count_last_step semantics.
-        # At depth>1 keep w_last_depth=0 (strict termination).
+        # Paper BC_{w,d,u} convention: u (= w_last_depth) defaults to 0.
+        # All body atoms at the last (= terminal) step must be facts;
+        # any rule application with leftover unknown leaves is dropped
+        # by terminal collection. Callers that want u>0 (admit unknown
+        # leaves; e.g. depth=1 with width>0 to surface single-rule
+        # applications as in keras-ns ``prune_incomplete_proofs=False``
+        # tests) pass ``w_last_depth=u`` explicitly. ``make_bcwd``
+        # exposes this as the ``u`` parameter.
         if w_last_depth is None:
-            w_last_depth = width if (depth == 1 and width is not None) else 0
+            w_last_depth = 0
         self._w_last_depth = w_last_depth
         self._collect_mode = collect_mode
 
@@ -646,6 +657,16 @@ class BCGrounder(nn.Module):
     ) -> GrounderOutput:
         if self._collect_rule_groundings:
             self._r2g_buffer: Dict[int, set] = {}  # reset each forward
+            # The per-step ``_collect_r2g`` runs *between* RESOLVE and
+            # PACK, so it sees rule applications that the per-state
+            # packing (S budget) would later drop. Use it whenever
+            # available; CUDA-graph callers can disable
+            # ``collect_rule_groundings`` and consume ``evidence``
+            # directly instead — the step loop never needs the Python
+            # path.
+            self._r2g_skip_per_step = False
+        else:
+            self._r2g_skip_per_step = False
         states = self.init_states(queries, query_mask, **init_kwargs)
         for d in range(self.depth):
             states = self.step(states, d)
@@ -681,6 +702,13 @@ class BCGrounder(nn.Module):
                 evidence = ProofEvidence(
                     body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
                     body_count=evidence.body_count)
+        # CUDA-graph-friendly post-forward extraction: when per-step
+        # collection was skipped (the default for ``collect_evidence=True``),
+        # build _r2g_buffer from the final evidence in one bulk pass.
+        if (self._collect_rule_groundings
+                and getattr(self, "_r2g_skip_per_step", False)
+                and evidence is not None):
+            self._build_r2g_from_evidence(evidence)
         # Build RuleGroundings from collected per-rule sets
         rule_groundings = None
         if self._collect_rule_groundings and hasattr(self, '_r2g_buffer') and self._r2g_buffer:
@@ -831,7 +859,11 @@ class BCGrounder(nn.Module):
         resolved = self._apply_hooks(resolved, states)
 
         # ── COLLECT per-rule groundings (before dedup) ──
-        if self._collect_rule_groundings:
+        # Skipped when ``_r2g_skip_per_step=True`` (the default for
+        # ``collect_evidence=True``); evidence-based post-forward
+        # extraction is preferred — CUDA-graph friendly.
+        if (self._collect_rule_groundings
+                and not getattr(self, "_r2g_skip_per_step", False)):
             self._collect_r2g(resolved, states)
 
         # ── PACK → returns (states, sync) — no dict pollution ──
@@ -1386,92 +1418,168 @@ class BCGrounder(nn.Module):
             states["collected_head"] = c_hd
         return states
 
+    def _build_r2g_from_evidence(self, evidence) -> None:
+        """Build self._r2g_buffer from final evidence (post-forward, fast).
+
+        Equivalent to per-step ``_collect_r2g`` but runs ONCE after the
+        step loop finishes, with a single bulk ``.cpu()`` transfer
+        instead of per-step .item()/.cpu() syncs in the hot path. This
+        keeps the step loop CUDA-graph compatible (no host-device sync,
+        no Python-side iteration over resolved tensors during step).
+
+        evidence layout (D > 0):
+          * body       [B, C, D, M, 3]
+          * head       [B, C, D, 3]
+          * rule_idx   [B, C, D] — variant index when all_anchors=True
+          * mask       [B, C]
+          * body_count [B, C, D]
+        """
+        if evidence is None or evidence.D == 0 or evidence.head is None:
+            return
+        pad = self.kb.padding_idx
+        body_t = evidence.body          # [B, C, D, M, 3]
+        head_t = evidence.head          # [B, C, D, 3]
+        ridx_t = evidence.rule_idx      # [B, C, D]
+        mask_t = evidence.mask          # [B, C]
+        bcnt_t = evidence.body_count    # [B, C, D]
+
+        # Per-(b,c,d) validity:
+        #   * mask[b, c] (terminal collection accepted the proof tree)
+        #   * ridx[b, c, d] >= 0 (a rule fired at this depth)
+        # ``head`` may be padding even when ridx>=0 for some legacy
+        # paths, so guard on head pred too.
+        valid_d = (
+            mask_t.unsqueeze(-1)
+            & (ridx_t >= 0)
+            & (head_t[..., 0] != pad)
+        )
+
+        # Single bulk transfer to CPU; the rest is fast Python over
+        # numpy arrays. T_max = B*C*D ≤ a few thousand for realistic
+        # workloads.
+        valid_cpu = valid_d.cpu().numpy()
+        body_cpu = body_t.cpu().numpy()
+        head_cpu = head_t.cpu().numpy()
+        ridx_cpu = ridx_t.cpu().numpy()
+        bcnt_cpu = bcnt_t.cpu().numpy()
+        v2o = (self._variant_to_orig
+               if hasattr(self, "_variant_to_orig") else None)
+
+        B, C, D, M, _ = body_cpu.shape
+        for b in range(B):
+            for c in range(C):
+                for d in range(D):
+                    if not valid_cpu[b, c, d]:
+                        continue
+                    r = int(ridx_cpu[b, c, d])
+                    n_atoms = int(bcnt_cpu[b, c, d])
+                    body = []
+                    for m in range(min(n_atoms, M)):
+                        p = int(body_cpu[b, c, d, m, 0])
+                        if p == pad:
+                            break
+                        body.append((p,
+                                     int(body_cpu[b, c, d, m, 1]),
+                                     int(body_cpu[b, c, d, m, 2])))
+                    if not body:
+                        continue
+                    head = (int(head_cpu[b, c, d, 0]),
+                            int(head_cpu[b, c, d, 1]),
+                            int(head_cpu[b, c, d, 2]))
+                    orig_r = v2o[r] if v2o is not None else r
+                    if orig_r not in self._r2g_buffer:
+                        self._r2g_buffer[orig_r] = set()
+                    self._r2g_buffer[orig_r].add(
+                        (head, tuple(sorted(body))))
+
     def _collect_r2g(self, resolved, states: Dict[str, Tensor]) -> None:
         """Collect per-rule-application groundings before dedup.
 
         Extracts (head, body) from ALL resolved children and stores in
-        self._r2g_buffer (Python dict of sets). Called between RESOLVE and PACK.
-        Works for both FlatResolvedChildren (enum) and ResolvedChildren (SLD/RTF).
+        self._r2g_buffer (Python dict of sets). Called between RESOLVE
+        and PACK so it sees rule applications before per-state packing
+        drops them. Works for both FlatResolvedChildren (enum flat path)
+        and ResolvedChildren (SLD/RTF + enum dense path with V<2).
+
+        Vectorised: a single bulk ``.tolist()`` transfer to host, then
+        pure-Python iteration over the resulting nested lists. This is
+        ~20× faster than per-element ``.item()`` calls and keeps the
+        host-device sync count at one per call. The function is still
+        Python-side and not CUDA-graph compatible; the compiled step
+        path (``_step_compiled``) does NOT call it — production
+        CUDA-graph callers should consume ``evidence`` instead.
         """
         pad = self.kb.padding_idx
         M = self.kb.M
         sel = states.get("_selected_goal")  # [B, S_in, 3]
+        v2o = (self._variant_to_orig
+               if hasattr(self, "_variant_to_orig") else None)
 
         if isinstance(resolved, FlatResolvedChildren):
             T = resolved.flat_rule_idx.size(0)
             if T == 0:
                 return
-            ridx = resolved.flat_rule_idx.cpu()
-            goals = resolved.flat_goals.cpu()      # [T, G, 3]
-            b_idx = resolved.flat_b_idx.cpu()
-            s_idx = resolved.flat_s_idx.cpu()
-            sel_cpu = sel.cpu() if sel is not None else None
+            ridx_l = resolved.flat_rule_idx.tolist()
+            goals_l = resolved.flat_goals[:, :M, :].tolist()  # [T][M][3]
+            b_idx_l = resolved.flat_b_idx.tolist()
+            s_idx_l = resolved.flat_s_idx.tolist()
+            sel_l = sel.tolist() if sel is not None else None
 
             for t in range(T):
-                r = ridx[t].item()
-                # Body atoms = first M slots of goals
+                r = ridx_l[t]
+                gt = goals_l[t]
                 body = []
                 for m in range(M):
-                    p = goals[t, m, 0].item()
-                    if p == pad:
+                    a = gt[m]
+                    if a[0] == pad:
                         break
-                    body.append((goals[t, m, 0].item(),
-                                 goals[t, m, 1].item(),
-                                 goals[t, m, 2].item()))
+                    body.append((a[0], a[1], a[2]))
                 if not body:
                     continue
-                # Head = selected goal of the parent state
-                if sel_cpu is not None:
-                    b, s = b_idx[t].item(), s_idx[t].item()
-                    head = tuple(sel_cpu[b, s].tolist())
+                if sel_l is not None:
+                    h = sel_l[b_idx_l[t]][s_idx_l[t]]
+                    head = (h[0], h[1], h[2])
                 else:
                     head = (pad, pad, pad)
-                # Map variant index → original rule index (for all_anchors)
-                orig_r = self._variant_to_orig[r] if hasattr(self, '_variant_to_orig') else r
+                orig_r = v2o[r] if v2o is not None else r
                 if orig_r not in self._r2g_buffer:
                     self._r2g_buffer[orig_r] = set()
-                # Sort body for dedup across anchor variants
-                self._r2g_buffer[orig_r].add((head, tuple(sorted(body))))
+                self._r2g_buffer[orig_r].add(
+                    (head, tuple(sorted(body))))
+            return
 
-        else:
-            # ResolvedChildren: SLD/RTF, or enum dense path. With
-            # all_anchors=True the enum dense path emits variant indices,
-            # so map them back to the original rule index — same as the
-            # FlatResolvedChildren branch above. SLD/RTF have no variants;
-            # the lookup is a no-op there.
-            ridx = resolved.sub_rule_idx.cpu()    # [B, S, K_r]
-            goals = resolved.rule_goals.cpu()     # [B, S, K_r, G, 3]
-            success = resolved.rule_success.cpu() # [B, S, K_r]
-            sel_cpu = sel.cpu() if sel is not None else None
-            B, S, K_r = ridx.shape
-
-            for b in range(B):
-                for s in range(S):
-                    for k in range(K_r):
-                        if not success[b, s, k]:
-                            continue
-                        r = ridx[b, s, k].item()
-                        body = []
-                        for m in range(M):
-                            p = goals[b, s, k, m, 0].item()
-                            if p == pad:
-                                break
-                            body.append((goals[b, s, k, m, 0].item(),
-                                         goals[b, s, k, m, 1].item(),
-                                         goals[b, s, k, m, 2].item()))
-                        if not body:
-                            continue
-                        if sel_cpu is not None:
-                            head = tuple(sel_cpu[b, s].tolist())
-                        else:
-                            head = (pad, pad, pad)
-                        orig_r = (self._variant_to_orig[r]
-                                  if hasattr(self, '_variant_to_orig')
-                                  else r)
-                        if orig_r not in self._r2g_buffer:
-                            self._r2g_buffer[orig_r] = set()
-                        self._r2g_buffer[orig_r].add(
-                            (head, tuple(sorted(body))))
+        # ResolvedChildren: SLD/RTF or enum dense path (V<2).
+        ridx_l = resolved.sub_rule_idx.tolist()      # [B][S][K_r]
+        goals_l = resolved.rule_goals[..., :M, :].tolist()  # [B][S][K_r][M][3]
+        success_l = resolved.rule_success.tolist()   # [B][S][K_r]
+        sel_l = sel.tolist() if sel is not None else None
+        B = len(ridx_l)
+        for b in range(B):
+            for s in range(len(ridx_l[b])):
+                ridx_bs = ridx_l[b][s]
+                succ_bs = success_l[b][s]
+                goals_bs = goals_l[b][s]
+                head_default = (sel_l[b][s] if sel_l is not None
+                                else [pad, pad, pad])
+                head = (head_default[0], head_default[1], head_default[2])
+                for k in range(len(ridx_bs)):
+                    if not succ_bs[k]:
+                        continue
+                    r = ridx_bs[k]
+                    gk = goals_bs[k]
+                    body = []
+                    for m in range(M):
+                        a = gk[m]
+                        if a[0] == pad:
+                            break
+                        body.append((a[0], a[1], a[2]))
+                    if not body:
+                        continue
+                    orig_r = v2o[r] if v2o is not None else r
+                    if orig_r not in self._r2g_buffer:
+                        self._r2g_buffer[orig_r] = set()
+                    self._r2g_buffer[orig_r].add(
+                        (head, tuple(sorted(body))))
 
     def _postprocess(self, states: Dict[str, Tensor], sync: SyncParams,
                      d: int = 0) -> Dict[str, Tensor]:

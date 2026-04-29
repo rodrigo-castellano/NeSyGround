@@ -33,6 +33,7 @@ if str(KERAS_NS_ROOT) not in sys.path:
 
 from grounder.data.loader import KGDataset
 from grounder.bc.bc import BCGrounder
+from grounder.factory import make_bcwd
 
 # Keras imports (guarded)
 try:
@@ -56,9 +57,10 @@ def _is_variable(name: str) -> bool:
 # Setup helpers
 # ══════════════════════════════════════════════════════════════════════
 
-def load_dataset(data_dir: str, device: str = "cpu"):
+def load_dataset(data_dir: str, device: str = "cpu",
+                  rules_file: str = "rules.txt"):
     """Load a KGDataset and build KB with large caps."""
-    ds = KGDataset(data_dir, device=device)
+    ds = KGDataset(data_dir, device=device, rules_file=rules_file)
     kb = ds.make_kb(max_facts_per_query=4096, fact_index_type="block_sparse")
     return ds, kb
 
@@ -106,16 +108,18 @@ def build_keras_grounder(
             var2domain=var2domain,
         ))
 
-    # Map (width, depth) to keras params
-    # width=W at step i<D-1, width=0 at last step
-    if depth == 1:
-        max_unk = width
-        max_unk_last = width
-        prune = (width == 0)
-    else:
-        max_unk = width
-        max_unk_last = 0
-        prune = True
+    # Paper BC_{w,d,u=0} convention: u=0 always.
+    #   max_unknown_fact_count            = w  (intermediate steps)
+    #   max_unknown_fact_count_last_step  = 0  (paper: every leaf body
+    #                                            atom must be a fact)
+    #   prune_incomplete_proofs           = True (paired with u=0;
+    #                                            torch maps to fp_batch)
+    # Consequence: BC_{w,1,0} ≡ BC_{0,1,0} for every w because at d=1
+    # the only step IS the last step, capped at u=0. They differ only
+    # for d≥2 where w controls intermediate-step admissibility.
+    max_unk = width
+    max_unk_last = 0
+    prune = True
 
     return ApproximateBackwardChainingGrounder(
         rules=keras_rules, facts=fact_tuples, domains=domains,
@@ -128,18 +132,23 @@ def build_keras_grounder(
 def build_torch_grounder(
     kb, width: int, depth: int, *,
     flat: bool = True, all_anchors: bool = False,
-    filt: str = "none", S_max: int = 256, C: int = 4096,
+    filt: Optional[str] = None, S_max: int = 256, C: int = 4096,
     G_r: int = 4096,
 ) -> BCGrounder:
-    """Build a torch-ns BCGrounder for enum resolution."""
-    return BCGrounder(
-        kb, resolution="enum", filter=filt,
-        depth=depth, width=width,
+    """Build the paper's BC_{w,d} grounder via ``make_bcwd``.
+
+    ``filt=None`` lets ``make_bcwd`` pick the keras-prune-aligned
+    default (``'none'`` for d=1,w>0; ``'fp_batch'`` otherwise).
+    Pass an explicit ``filt`` to test a specific filter.
+    """
+    return make_bcwd(
+        kb, w=width, d=depth,
+        flat_intermediate=flat,
+        filter=filt,
         max_groundings_per_query=G_r,
         max_total_groundings=C,
         max_states=S_max,
         fc_method="join", prune_facts=True,
-        flat_intermediate=flat, all_anchors=all_anchors,
     )
 
 
@@ -210,55 +219,75 @@ def compare_groundings(
                               all_anchors=all_anchors, filt=filt,
                               S_max=S_max, C=C, G_r=G_r)
 
+    # Count torch's UNIQUE rule applications (matches keras's
+    # ``len(rule2groundings[r])``): out.rule_groundings.A_in[r] holds
+    # one row per distinct (head, body) tuple for rule r, deduped via
+    # ``_variant_to_orig`` and ``_collect_r2g`` set semantics. Counting
+    # ``ev.mask.sum()`` would count proof TREES (one entry per depth-D
+    # tree, NOT per rule application) and undercounts whenever a tree's
+    # depths share rule applications.
     if filt == "none":
-        # Per-query: run each query individually
+        # Per-query: run each query individually so per-query counts
+        # are comparable with keras's per-query rerun.
         torch_per_query = []
-        torch_per_rule = {r.name: 0 for r in keras_rules}
-        # Per-depth-per-rule counts (structured evidence)
+        torch_per_rule: Dict[str, int] = {r.name: 0 for r in keras_rules}
         torch_per_depth_rule: Dict[int, Dict[str, int]] = {}
         for i in range(B):
             q = test[i:i+1]
             qm = torch.ones(1, dtype=torch.bool, device=q.device)
             with torch.no_grad():
                 out = g(q, qm)
-            ev = out.evidence
-            cnt = int(ev.mask.sum().item())
-            torch_per_query.append(cnt)
-            # Top-level rule (depth 0)
-            ridx_top = ev.rule_idx_top  # [1, C]
-            for ri, r in enumerate(keras_rules):
-                torch_per_rule[r.name] += int(
-                    ((ridx_top == ri) & ev.mask).sum().item())
-            # Per-depth rule counts (if structured)
-            if ev.D > 0:
-                for d in range(ev.D):
-                    if d not in torch_per_depth_rule:
-                        torch_per_depth_rule[d] = {r.name: 0 for r in keras_rules}
-                    ridx_d = ev.rule_idx[:, :, d]  # [1, C]
-                    for ri, r in enumerate(keras_rules):
-                        torch_per_depth_rule[d][r.name] += int(
-                            ((ridx_d == ri) & ev.mask).sum().item())
+            cnt_apps = (sum(out.rule_groundings.A_in[r].shape[0]
+                            for r in out.rule_groundings.A_in)
+                        if out.rule_groundings is not None else 0)
+            torch_per_query.append(cnt_apps)
+            if out.rule_groundings is not None:
+                for ri, r in enumerate(keras_rules):
+                    if ri in out.rule_groundings.A_in:
+                        torch_per_rule[r.name] += int(
+                            out.rule_groundings.A_in[ri].shape[0])
         torch_total = sum(torch_per_query)
     else:
-        # Batched
-        with torch.no_grad():
-            out = g(test, qmask)
-        ev = out.evidence
-        torch_total = int(ev.mask.sum().item())
-        torch_per_query = [torch_total]
-        torch_per_rule = {}
+        # Batched. With cartesian_product=True (forced for enum) the
+        # body tensor shape grows as ``B × K_r × E × M × 3`` which OOMs
+        # for datasets with many head-clustered rules (e.g. family with
+        # 143 rules → K_r ≥ 286). Fall back to per-query when the
+        # batched path runs out of memory; the rule_groundings count
+        # still aggregates correctly via ``_r2g_buffer`` set semantics.
+        torch_per_rule = {r.name: 0 for r in keras_rules}
         torch_per_depth_rule = {}
-        ridx_top = ev.rule_idx_top
-        for ri, r in enumerate(keras_rules):
-            torch_per_rule[r.name] = int(
-                ((ridx_top == ri) & ev.mask).sum().item())
-        if ev.D > 0:
-            for d in range(ev.D):
-                torch_per_depth_rule[d] = {}
-                ridx_d = ev.rule_idx[:, :, d]
+        try:
+            with torch.no_grad():
+                out = g(test, qmask)
+            torch_total = (sum(out.rule_groundings.A_in[r].shape[0]
+                               for r in out.rule_groundings.A_in)
+                           if out.rule_groundings is not None else 0)
+            torch_per_query = [torch_total]
+            if out.rule_groundings is not None:
                 for ri, r in enumerate(keras_rules):
-                    torch_per_depth_rule[d][r.name] = int(
-                        ((ridx_d == ri) & ev.mask).sum().item())
+                    if ri in out.rule_groundings.A_in:
+                        torch_per_rule[r.name] = int(
+                            out.rule_groundings.A_in[ri].shape[0])
+        except (RuntimeError, MemoryError) as exc:
+            # Per-query fallback (slower but bounded memory).
+            print(f"  [batched OOM: {type(exc).__name__}; falling back "
+                  f"to per-query]", flush=True)
+            torch_per_query = []
+            for i in range(B):
+                q = test[i:i+1]
+                qm = torch.ones(1, dtype=torch.bool, device=q.device)
+                with torch.no_grad():
+                    out_i = g(q, qm)
+                cnt = (sum(out_i.rule_groundings.A_in[r].shape[0]
+                            for r in out_i.rule_groundings.A_in)
+                       if out_i.rule_groundings is not None else 0)
+                torch_per_query.append(cnt)
+                if out_i.rule_groundings is not None:
+                    for ri, r in enumerate(keras_rules):
+                        if ri in out_i.rule_groundings.A_in:
+                            torch_per_rule[r.name] += int(
+                                out_i.rule_groundings.A_in[ri].shape[0])
+            torch_total = sum(torch_per_query)
 
     # ── Report ──
     result = {
@@ -337,9 +366,12 @@ def main():
     parser.add_argument("--flat", action="store_true", default=True)
     parser.add_argument("--no-flat", dest="flat", action="store_false")
     parser.add_argument("--all-anchors", action="store_true")
-    # BC_{w,d} requires fp_batch to match keras-ns prune_incomplete_proofs.
-    # See README.md / CLAUDE.md "BC_{w,d} grounders require filter='fp_batch'".
-    parser.add_argument("--filter", default="fp_batch")
+    # BC_{w,d} default filter is keras-prune-aligned per (d, w):
+    #   d=1, w>0 → 'none'       (keras prune_incomplete_proofs=False)
+    #   else     → 'fp_batch'   (keras prune_incomplete_proofs=True)
+    # 'auto' (default) lets the grounder pick. Pass an explicit value
+    # only to test a specific filter regardless of (d, w).
+    parser.add_argument("--filter", default="auto")
     parser.add_argument("--s-max", type=int, default=256)
     parser.add_argument("--C", type=int, default=4096)
     parser.add_argument("--device", default="cpu")
@@ -347,10 +379,15 @@ def main():
                         help="Truncate test split to first N queries (0 = all).")
     parser.add_argument("--G-r", type=int, default=4096,
                         help="max_groundings_per_query in BCGrounder.")
+    parser.add_argument("--rules-file", default="rules.txt",
+                        help="Rules filename inside dataset dir. Paper "
+                             "numbers for family use 'rules_old.txt' "
+                             "(47 rules vs 143 in rules.txt).")
     args = parser.parse_args()
 
     data_dir = Path(args.dataset)
-    ds, kb = load_dataset(str(data_dir), device=args.device)
+    ds, kb = load_dataset(str(data_dir), device=args.device,
+                          rules_file=args.rules_file)
 
     print(f"Dataset: {data_dir.name}")
     print(f"  facts={kb.num_facts}, rules={kb.num_rules}, M={kb.M}, "
@@ -364,7 +401,10 @@ def main():
 
     results = []
     for width, depth in configs:
-        filt = "fp_batch" if width == 0 and depth == 1 else args.filter
+        # 'auto' → None → make_bcwd picks the keras-prune-aligned default.
+        # Anything else is an explicit override (kept for testing a
+        # specific filter regardless of (d, w)).
+        filt = None if args.filter == "auto" else args.filter
         r = compare_groundings(
             ds, kb, data_dir, width, depth,
             flat=args.flat, all_anchors=args.all_anchors,

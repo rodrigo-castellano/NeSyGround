@@ -12,12 +12,47 @@ This file defines repository-wide guidance for the `grounder` repository.
 
 NeSyGround is a compiled, fixed-shape grounding library for neuro-symbolic reasoning. It provides backward-chaining resolution, filtering, KB indexing, and optional neural/KGE hooks in a form that stays compatible with `torch.compile` and CUDA-graph-friendly execution.
 
-## BC_{w,d} grounders require `filter='fp_batch'` and `all_anchors=True`
+## BC_{w,d,u} grounders: paper parametrization
 
-The `enum` resolution paired with the BC_{w,d} configs (`enum.fp_batch.wW.dD`) must be configured as:
+The `enum` BC family is parametrized by **`(w, d, u)`** matching the paper / keras-ns notation:
 
-- `filter='fp_batch'` (the default for `enum`). `filter='none'` keeps rule applications whose unknown body atoms cannot be derived through the chain; keras-ns drops them via `prune_incomplete_proofs=True` for `depth>1`. The `fp_batch` filter runs the equivalent Kleene fixed-point pruning over `_r2g_buffer`, so `out.rule_groundings` matches keras-ns rule-by-rule. Tests that compare against keras-ns must build the torch grounder with `filter='fp_batch'` whenever they pass `prune_incomplete_proofs=True` to keras-ns.
-- `all_anchors=True` (forced for `enum` in `BCGrounder.__init__`, even if the caller passes `False`). Anchoring only on the first body atom misses rule applications that keras-ns finds when iterating each body position as anchor — for the recursive `nb(X,Y), loc(Y,Z) → loc(X,Z)` rule, anchoring on `loc` admits Y values where `nb(X,Y)` is unknown but `loc(Y,Z)` is fact (and vice versa). The dedup pipeline uses the `_variant_to_orig` map so the K_r anchor variants of the same logical rule application collapse to a single entry. Without `all_anchors=True` the BC_{w,d} grounding count is strictly smaller than keras-ns.
+- `w` — `max_unknown_fact_count` at intermediate proof steps.
+- `d` — `num_steps` (proof depth).
+- `u` — `max_unknown_fact_count_last_step` (last-depth cap). The paper convention is **`u=0`**: every leaf body atom must be a fact. The IJCAI '25 experiments use this everywhere.
+
+Use `grounder.factory.make_bcwd(kb, w, d, u=0, ...)` (or the type-string shorthand `bcWD` / `bcWDuU`) to build a fully-configured BC grounder. Internal mapping: `u` → `BCGrounder.w_last_depth`.
+
+### Default filter depends on `u`
+
+When `filter` is omitted, both `BCGrounder.__init__` and `make_bcwd` derive it from `u`:
+
+| `u` | default filter | matches keras-ns |
+|-----|----------------|------------------|
+| `u=0` (paper) | `fp_batch` | `prune_incomplete_proofs=True` (Kleene fixed-point pruning over the rule-application set) |
+| `u>0` (rare)  | `none`     | `prune_incomplete_proofs=False` (admit unknown leaves; downstream scorer weights them) |
+
+With `u=0` and the implied `fp_batch`, `out.rule_groundings` matches keras rule-by-rule. Note that under the paper convention `bc{0}{1}` and `bc{1}{1}` produce **identical output** — at depth 1 the only step *is* the last step, and `u=0` caps unknown leaves to 0 regardless of `w`.
+
+### Other forced defaults
+
+- `all_anchors=True` is forced for `enum` in `BCGrounder.__init__` even if the caller passes `False`. Anchoring only on the first body atom misses bindings keras finds when iterating each body position as anchor — for `nb(X,Y), loc(Y,Z) → loc(X,Z)`, anchoring on `loc` admits Y values where `nb(X,Y)` is unknown but `loc(Y,Z)` is fact (and vice versa). The dedup pipeline uses `_variant_to_orig` so the K_r anchor variants of the same logical rule application collapse to a single entry.
+- `flat_intermediate=True` is the `make_bcwd` default — zero grounding loss when V≥2; falls through to the dense path for V<2.
+
+### Paper rule sets
+
+Some datasets ship two rule files. The paper / IJCAI '25 numbers use the smaller, hand-curated set:
+
+| dataset | paper rules | extended set | notes |
+|---|---|---|---|
+| `family` | `rules_old.txt` (47 rules) | `rules.txt` (143 rules) | Use `KGDataset(..., rules_file='rules_old.txt')` to reproduce paper grounding counts. The 143-rule set is an automated expansion that blows up `K_r` and OOMs on large query batches with `cartesian_product=True`. |
+
+### Known parity quirk: keras 1-body shortcut
+
+For 1-body rules (e.g. symmetry `also_see(y,x) → also_see(x,y)`), keras-ns's `approximate_backward_chaining_grounding_one_rule` takes a shortcut that bypasses the `max_unknown_fact_count` cap entirely (line ~70: `if len(rule.body) == 1: new_ground_atoms.add(...); continue`). It then relies on `PruneIncompleteProofs` to drop apps whose body atoms aren't proved by other rules.
+
+Torch's enum applies the width filter uniformly to 1-body rules, so when `u=0` and the body atom isn't a fact, torch drops the app. Keras's prune may resurrect these via mutual chains (other rules independently deriving the head, then the symmetric body atom is "proved" via that chain).
+
+This causes a small over-count in keras vs torch on datasets with 1-body symmetry rules and reciprocal test pairs (`also_see(A,B)` and `also_see(B,A)` both queried). On wn18rr 50 queries this is +2. Per the paper convention `u=0`, torch is the strict / correct behaviour; keras is the lenient one.
 
 ## Architecture
 
