@@ -62,6 +62,13 @@ Under the paper convention, `bc01` and `bc11` produce **identical output** — a
 
 `all_anchors=True` is forced by `BCGrounder.__init__` for `enum`. Anchoring only on the first body atom (e.g. `nb` in `nb(X,Y), loc(Y,Z) → loc(X,Z)`) misses bindings keras-ns finds when iterating each body position as anchor. The dedup pass collapses the K_r anchor variants of the same logical rule application via `_variant_to_orig`.
 
+**V≥1 flat path.** The flat-intermediate path (`_resolve_enum_step_flat`, allocates `[T_surv, M, 3]` instead of dense `[B*S, K_r, G_r, M, 3]`) runs for any `V >= 1`. Two pieces of plumbing make this work for V=1 datasets:
+
+- `_PatternVariant` carries the base rule's `_orig_body_patterns` so all anchor variants share canonical body order in `arg_source_dep` / `body_preds_dep`. Body atoms land in the same positions across variants → the terminal `(rule_idx, head, sorted_body)` dedup correctly collapses logically-equivalent apps.
+- `_enumerate_cartesian_flat` applies `active_mask` unconditionally (not just for `~has_free` rules). Padded K_r slots produce no candidates regardless of `has_free` / `fv_valid` status, so spurious apps with mismatched heads can't leak through.
+
+For `V≥2` datasets (countries_s3) the flat path was correct already; for V=1 (ablation, family) the two fixes are required for parity with keras-ns.
+
 **Paper rule sets.** Some datasets ship two rule files; the paper / IJCAI '25 numbers use the smaller curated set:
 
 | dataset | paper rules | extended set |

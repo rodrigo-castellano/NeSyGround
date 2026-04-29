@@ -52,7 +52,27 @@ For 1-body rules (e.g. symmetry `also_see(y,x) → also_see(x,y)`), keras-ns's `
 
 Torch's enum applies the width filter uniformly to 1-body rules, so when `u=0` and the body atom isn't a fact, torch drops the app. Keras's prune may resurrect these via mutual chains (other rules independently deriving the head, then the symmetric body atom is "proved" via that chain).
 
-This causes a small over-count in keras vs torch on datasets with 1-body symmetry rules and reciprocal test pairs (`also_see(A,B)` and `also_see(B,A)` both queried). On wn18rr 50 queries this is +2. Per the paper convention `u=0`, torch is the strict / correct behaviour; keras is the lenient one.
+This causes an over-count in keras vs torch on datasets with 1-body symmetry rules and reciprocal test pairs (`also_see(A,B)` and `also_see(B,A)` both queried). The gap **amplifies through depths** because `PruneIncompleteProofs` admits more atoms via the shortcut at each iteration. On wn18rr 50 queries: bc01 +2, bc12 +100 (entirely localised to r2 = `hypernym ← der_form(x,z), der_form(z,y)` whose body atoms lean on the der_form symmetry), bc13 +60. Per the paper convention `u=0`, torch is the strict / correct behaviour; keras is the lenient one.
+
+## V≥1 flat resolution path
+
+`_resolve_enum_step_flat` is enabled for `V >= 1` (was V≥2 before 2026-04-30). Two coupled fixes were needed to make V=1 datasets correct on this path:
+
+1. `_PatternVariant` propagates `_orig_body_patterns` / `_orig_body_pred_indices` from the base `RulePattern`. Without this, anchor variants carry *anchor-permuted* body order in `arg_source_dep` / `body_preds_dep`, so logically-equivalent apps don't share a key under the terminal `(orig_rule_idx, head, sorted_body)` dedup.
+2. `_enumerate_cartesian_flat` applies `active_mask` to all rule slots (not just the slot-0 carve-out for `~has_free` rules). Padded K_r positions (rule_idx clamped to 0 because the predicate has fewer than K_r matching variants) used to leak candidates that got recorded as spurious apps under wrong heads.
+
+Effect on the parity sweep (50 queries, GPU, default config):
+
+| Dataset | bc01 | bc12 | bc13 | bc12 speedup | bc13 speedup |
+|---|---|---|---|---|---|
+| ablation_d2 | ✓ 0 | ✓ 118 | ✓ 377 | 0.30× | 0.33× |
+| ablation_d3 | ✓ 0 | ✓ 0 | ✓ 252 | 0.14× | 0.27× |
+| countries_s2 | ✓ 67 | ✓ 119 | ✓ 165 | 0.28× | 0.36× |
+| countries_s3 | ✓ 42 | ✓ 783 | ✓ 3349 | **10.79×** | **2.73×** |
+| family rules_old | ✓ 195 | ✓ 610 | ✓ 787 | 1.16× | **2.24×** |
+| wn18rr | -2 (1-body quirk) | -100 (1-body quirk amplified) | -60 (1-body quirk amplified) | 0.60× | 0.66× |
+
+16/18 cells full parity. The 3 wn18rr cells trace entirely to the 1-body keras shortcut amplification documented above. Small-workload cells (ablation, countries_s2) are slower than keras because the flat path runs eager (the compiled step-fast-path is gated off when `flat_intermediate=True`); for medium+ workloads (countries_s3, family bc13) torch beats keras-ns substantially.
 
 ## Architecture
 
