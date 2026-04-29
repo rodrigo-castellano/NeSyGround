@@ -667,20 +667,217 @@ class BCGrounder(nn.Module):
 
     @torch.no_grad()
     def forward(
-        self, queries: Tensor, query_mask: Tensor, **init_kwargs,
+        self, queries: Tensor, query_mask: Tensor,
+        *, batch_size: Optional[int] = None,
+        **init_kwargs,
     ) -> GrounderOutput:
+        """Ground all ``queries`` and return a ``GrounderOutput``.
+
+        ``batch_size``: when set, queries are processed in chunks of
+        exactly ``batch_size`` (last chunk padded with zero queries +
+        ``query_mask=False`` so the compiled graph's static shapes hold
+        across all chunks). The same ``reduce-overhead`` CUDA graph
+        replays per chunk. Use this when ``len(queries)`` is too large
+        for a single forward to fit in VRAM. ``rule_groundings``
+        accumulators span chunks and dedup once at the end.
+
+        When ``batch_size`` is ``None`` the full batch is processed in
+        one forward (the default).
+        """
+        N = queries.size(0)
+        if batch_size is not None and 0 < batch_size < N:
+            return self._forward_chunked(
+                queries, query_mask, batch_size, **init_kwargs)
+        return self._forward_one_batch(queries, query_mask, **init_kwargs)
+
+    def _forward_chunked(
+        self, queries: Tensor, query_mask: Tensor,
+        batch_size: int, **init_kwargs,
+    ) -> GrounderOutput:
+        """Chunked forward: pad each chunk to ``batch_size`` so the
+        compiled graph sees stable shapes, then concat outputs.
+
+        The rule-groundings accumulators are reset once at the start
+        and finalised once at the end — across-chunk dedup is built
+        into the existing ``_finalize_r2g_tensor`` torch.unique pass.
+        """
+        N = queries.size(0)
+        dev = queries.device
+        pad_q = queries.new_zeros(batch_size, queries.shape[1])
+        pad_m = torch.zeros(batch_size, dtype=torch.bool, device=dev)
+
+        # Reset r2g accumulators once for the entire chunked call.
+        self._reset_r2g_state()
+
+        # Run each chunk through ``_forward_one_batch_inner`` (which
+        # does NOT reset / finalise r2g — those are once-per-call here).
+        chunk_outputs: List[GrounderOutput] = []
+        chunk_sizes: List[int] = []
+        for start in range(0, N, batch_size):
+            end = min(start + batch_size, N)
+            q = queries[start:end]
+            m = query_mask[start:end]
+            n_real = q.size(0)
+            if n_real < batch_size:
+                # Pad to static shape; padded rows have mask=False so
+                # init_states / step / collection all skip them.
+                q_padded = pad_q.clone()
+                m_padded = pad_m.clone()
+                q_padded[:n_real] = q
+                m_padded[:n_real] = m
+                q, m = q_padded, m_padded
+            out = self._forward_one_batch_inner(q, m, **init_kwargs)
+            chunk_outputs.append(out)
+            chunk_sizes.append(n_real)
+
+        return self._merge_chunk_outputs(chunk_outputs, chunk_sizes, queries)
+
+    def _reset_r2g_state(self) -> None:
         if self._collect_rule_groundings:
-            self._r2g_buffer: Dict[int, set] = {}  # reset each forward
-            # Tensor accumulators for the per-step pre-pack capture.
-            # ``_collect_r2g_tensor`` appends here; ``_finalize_r2g_tensor``
-            # runs once post-loop, dedups via ``torch.unique``, and
-            # projects into ``_r2g_buffer`` with a single host transfer.
+            self._r2g_buffer: Dict[int, set] = {}
             self._r2g_acc_rule: List[Tensor] = []
             self._r2g_acc_head: List[Tensor] = []
             self._r2g_acc_body: List[Tensor] = []
             self._r2g_skip_per_step = False
         else:
             self._r2g_skip_per_step = False
+
+    def _merge_chunk_outputs(
+        self,
+        chunk_outputs: List[GrounderOutput],
+        chunk_sizes: List[int],
+        queries: Tensor,
+    ) -> GrounderOutput:
+        """Concat per-chunk evidence/state along B; finalise r2g once."""
+        evidences = [o.evidence for o in chunk_outputs
+                     if o.evidence is not None]
+        if evidences:
+            # Trim padding rows by chunk_sizes, then cat.
+            def _trim_cat(attr):
+                parts = []
+                for ev, n in zip(evidences, chunk_sizes):
+                    t = getattr(ev, attr)
+                    if t is None:
+                        return None
+                    parts.append(t[:n])
+                return torch.cat(parts, dim=0)
+            body = _trim_cat("body")
+            mask = _trim_cat("mask")
+            count = mask.sum(dim=1) if mask is not None else None
+            rule_idx = _trim_cat("rule_idx")
+            body_count = _trim_cat("body_count")
+            head = _trim_cat("head")
+            evidence = ProofEvidence(
+                body=body, mask=mask, count=count, rule_idx=rule_idx,
+                body_count=body_count,
+                D=evidences[0].D, M=evidences[0].M, head=head,
+            )
+        else:
+            evidence = None
+
+        # State: concat trimmed proof_goals / state_valid / top_ridx.
+        states = [o.state for o in chunk_outputs]
+        def _state_cat(attr):
+            parts = []
+            for s, n in zip(states, chunk_sizes):
+                t = getattr(s, attr)
+                if t is None:
+                    return None
+                parts.append(t[:n])
+            return torch.cat(parts, dim=0)
+        state = ProofState(
+            proof_goals=_state_cat("proof_goals"),
+            state_valid=_state_cat("state_valid"),
+            top_ridx=_state_cat("top_ridx"),
+            next_var_indices=_state_cat("next_var_indices"),
+        )
+
+        # rule_groundings: build once across ALL chunks (the per-chunk
+        # ``_forward_one_batch_inner`` skipped finalisation; accumulators
+        # already span every chunk).
+        rule_groundings = None
+        if self._collect_rule_groundings:
+            if (not getattr(self, "_r2g_skip_per_step", False)
+                    and getattr(self, "_r2g_acc_rule", None)):
+                rule_groundings = self._finalize_r2g_tensor()
+                if rule_groundings is not None and self.filter_mode == "fp_batch":
+                    rule_groundings = self._prune_rule_groundings_tensor(
+                        rule_groundings)
+            elif hasattr(self, '_r2g_buffer') and self._r2g_buffer:
+                from grounder.bc.common import (
+                    build_rule_grounding_tensors, prune_rule_groundings)
+                r2g = self._r2g_buffer
+                if self.filter_mode == "fp_batch":
+                    fact_set = set()
+                    fi = self.kb.fact_index.facts_idx
+                    for f in range(fi.shape[0]):
+                        fact_set.add(tuple(fi[f].tolist()))
+                    r2g = prune_rule_groundings(
+                        r2g, fact_set, max_iterations=self.depth)
+                rule_groundings = build_rule_grounding_tensors(
+                    r2g, self.kb.num_rules, queries.device)
+
+        return GrounderOutput(state=state, evidence=evidence,
+                              rule_groundings=rule_groundings)
+
+    def _forward_one_batch_inner(
+        self, queries: Tensor, query_mask: Tensor, **init_kwargs,
+    ) -> GrounderOutput:
+        """Single-batch grounding without resetting / finalising r2g —
+        reserved for the chunked path where reset / finalise wrap the
+        outer chunk loop.
+        """
+        states = self.init_states(queries, query_mask, **init_kwargs)
+        for d in range(self.depth):
+            states = self.step(states, d)
+            if self.step_hook is not None:
+                cb, cm, cr = self.step_hook.on_step(
+                    states["collected_body"], states["collected_mask"],
+                    states["collected_ridx"], d)
+                states["collected_body"] = cb
+                states["collected_mask"] = cm
+                states["collected_ridx"] = cr
+        evidence = self.filter_terminal(states)
+        if isinstance(evidence, dict):
+            if self.collect_evidence:
+                evidence = ProofEvidence(
+                    body=evidence["collected_body"],
+                    mask=evidence["collected_mask"],
+                    count=evidence["collected_mask"].sum(dim=1),
+                    rule_idx=evidence["collected_ridx"],
+                    body_count=evidence["collected_bcount"],
+                    D=self.depth,
+                    M=self.kb.M,
+                    head=evidence.get("collected_head"),
+                )
+            else:
+                evidence = None
+        if evidence is not None:
+            for hook in self.hooks:
+                body, mask, ridx = hook.apply(
+                    evidence.body_flat, evidence.mask, evidence.rule_idx_top)
+                evidence = ProofEvidence(
+                    body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
+                    body_count=evidence.body_count)
+        state = ProofState(
+            proof_goals=states["proof_goals"],
+            state_valid=states["state_valid"],
+            top_ridx=states["top_ridx"],
+            next_var_indices=(
+                states["next_var_indices"]
+                if self._standardize_fn is not None else None),
+        )
+        # No rule_groundings build here — that runs once at the end of
+        # the chunked outer call (or in ``_forward_one_batch`` for
+        # non-chunked).
+        return GrounderOutput(state=state, evidence=evidence,
+                              rule_groundings=None)
+
+    def _forward_one_batch(
+        self, queries: Tensor, query_mask: Tensor, **init_kwargs,
+    ) -> GrounderOutput:
+        """Single-batch grounder forward: reset r2g, run, finalise."""
+        self._reset_r2g_state()
         states = self.init_states(queries, query_mask, **init_kwargs)
         for d in range(self.depth):
             states = self.step(states, d)
@@ -1921,20 +2118,22 @@ class BCGrounder(nn.Module):
     # ==================================================================
 
     def _fn_step_for_depth(self, d: int):
-        """Get or lazily compile the step function for depth d."""
+        """Get or lazily compile the step function for depth d.
+
+        Static-shape compile: ``dynamic=False``. The grounder is built to
+        run with a stable batch size and stable per-step buffers (S, K),
+        so ``mode='reduce-overhead'`` can build a CUDA graph and replay
+        it at sub-millisecond cost. Callers that need to process more
+        queries than fit in a single CUDA-graph-friendly batch should
+        pass ``batch_size=B`` to ``forward()``; the grounder will then
+        chunk queries and replay the same compiled graph per chunk.
+        """
         if d not in self._fn_steps_by_depth:
             import functools
             fn = functools.partial(self._step_impl, d=d)
-            # ``dynamic=True`` allows the compiled step to accept varying
-            # batch / candidate sizes without recompilation. For enum
-            # this is essential — at d>0 the per-state candidate count
-            # depends on which queries fired at d-1. Setting
-            # ``dynamic=True`` here is the difference between hot calls
-            # in the millisecond range and tens of seconds when shapes
-            # drift between calls.
             self._fn_steps_by_depth[d] = torch.compile(
                 fn, fullgraph=True, mode=self.compile_mode,
-                dynamic=True,
+                dynamic=False,
             )
         return self._fn_steps_by_depth[d]
 
