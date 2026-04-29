@@ -15,7 +15,7 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
@@ -26,6 +26,50 @@ def _sync(device) -> None:
         torch.cuda.synchronize()
     elif isinstance(device, str) and device.startswith("cuda"):
         torch.cuda.synchronize()
+
+
+def _depth_rule_counts_from_evidence(
+    out, keras_rules: list, variant_to_orig: Optional[list] = None,
+) -> Dict[int, Dict[str, int]]:
+    """Extract per-depth, per-rule firing counts from a GrounderOutput.
+
+    ``out.evidence.rule_idx`` has shape ``[B, C, D]`` (per-batch, per
+    collected proof tree, per depth). Each entry is the rule (or rule
+    variant) applied at that depth. Variants get remapped to their
+    original rule index via ``variant_to_orig`` so per-rule counts
+    align with keras's rule names.
+
+    Returns: ``{depth: {rule_name: count}}``.
+    """
+    out_dict: Dict[int, Dict[str, int]] = {}
+    ev = getattr(out, "evidence", None)
+    if ev is None or ev.rule_idx is None:
+        return out_dict
+    rule_idx = ev.rule_idx
+    if rule_idx.dim() < 3:
+        return out_dict
+    mask = ev.mask if ev.mask is not None else None
+    rule_idx_cpu = rule_idx.detach().cpu().numpy()
+    mask_cpu = mask.detach().cpu().numpy() if mask is not None else None
+    B, C, D = rule_idx_cpu.shape
+    rule_names = [r.name for r in keras_rules]
+    for d in range(D):
+        per_rule: Dict[str, int] = {}
+        for b in range(B):
+            for c in range(C):
+                if mask_cpu is not None and not mask_cpu[b, c]:
+                    continue
+                ridx = int(rule_idx_cpu[b, c, d])
+                if ridx < 0:
+                    continue
+                if variant_to_orig is not None and ridx < len(variant_to_orig):
+                    ridx = variant_to_orig[ridx]
+                if 0 <= ridx < len(rule_names):
+                    name = rule_names[ridx]
+                    per_rule[name] = per_rule.get(name, 0) + 1
+        if per_rule:
+            out_dict[d] = per_rule
+    return out_dict
 
 TESTS_DIR = Path(__file__).resolve().parent
 GROUNDER_ROOT = TESTS_DIR.parent
@@ -273,6 +317,7 @@ def compare_groundings(
         torch_per_query = []
         torch_per_rule: Dict[str, int] = {r.name: 0 for r in keras_rules}
         torch_per_depth_rule: Dict[int, Dict[str, int]] = {}
+        v2o = getattr(g, "_variant_to_orig", None)
         for i in range(B):
             q = test[i:i+1]
             qm = torch.ones(1, dtype=torch.bool, device=q.device)
@@ -291,6 +336,12 @@ def compare_groundings(
                     if ri in out.rule_groundings.A_in:
                         torch_per_rule[r.name] += int(
                             out.rule_groundings.A_in[ri].shape[0])
+            depth_counts = _depth_rule_counts_from_evidence(
+                out, keras_rules, variant_to_orig=v2o)
+            for d, per_rule in depth_counts.items():
+                bucket = torch_per_depth_rule.setdefault(d, {})
+                for name, cnt in per_rule.items():
+                    bucket[name] = bucket.get(name, 0) + cnt
         torch_total = sum(torch_per_query)
     else:
         # Batched. With cartesian_product=True (forced for enum) the
@@ -324,6 +375,9 @@ def compare_groundings(
                     if ri in out.rule_groundings.A_in:
                         torch_per_rule[r.name] = int(
                             out.rule_groundings.A_in[ri].shape[0])
+            v2o = getattr(g, "_variant_to_orig", None)
+            torch_per_depth_rule = _depth_rule_counts_from_evidence(
+                out, keras_rules, variant_to_orig=v2o)
         except (RuntimeError, MemoryError) as exc:
             # Per-query fallback (slower but bounded memory).
             print(f"  [batched OOM: {type(exc).__name__}; falling back "
@@ -441,7 +495,17 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Compare keras-ns vs torch-ns grounding counts.")
-    parser.add_argument("--dataset", default="grounder/data/countries_s3")
+    parser.add_argument("--dataset", default=None,
+                        help="Path to a single dataset directory. Mutually "
+                             "exclusive with --datasets.")
+    parser.add_argument("--datasets", default=None,
+                        help="Comma-separated dataset paths (or names) for a "
+                             "multi-dataset sweep. Each dataset runs the "
+                             "configs and a final cross-dataset summary "
+                             "table is printed.")
+    parser.add_argument("--data-root", default=None,
+                        help="Root directory used to resolve --datasets "
+                             "names (e.g. ~/repos/data-swarm/main).")
     parser.add_argument("--configs", default="w0d1,w1d2,w1d3",
                         help="Comma-separated w<W>d<D> configs")
     parser.add_argument("--flat", action="store_true", default=True)
@@ -472,15 +536,30 @@ def main():
                              "depth>1, width>0. Default keeps the bump "
                              "for no-loss parity. Disable for speed on "
                              "high-fan-out KBs (wn18rr, family at d=3).")
+    parser.add_argument("--csv", default=None,
+                        help="Write the cross-dataset summary table as CSV "
+                             "to this path (in addition to stdout).")
     args = parser.parse_args()
 
-    data_dir = Path(args.dataset)
-    ds, kb = load_dataset(str(data_dir), device=args.device,
-                          rules_file=args.rules_file)
-
-    print(f"Dataset: {data_dir.name}")
-    print(f"  facts={kb.num_facts}, rules={kb.num_rules}, M={kb.M}, "
-          f"K_f={kb.K_f}, K_r={kb.K_r}")
+    # ── Resolve dataset list ──
+    if args.datasets is not None and args.dataset is not None:
+        parser.error("Use either --dataset OR --datasets, not both.")
+    if args.datasets is None and args.dataset is None:
+        # Default: single dataset, the historical fallback.
+        args.dataset = "grounder/data/countries_s3"
+    dataset_paths: List[Tuple[str, Path]] = []  # (label, path)
+    if args.dataset is not None:
+        p = Path(args.dataset)
+        dataset_paths.append((p.name, p))
+    else:
+        for raw in args.datasets.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            p = Path(raw)
+            if not p.is_absolute() and args.data_root is not None:
+                p = Path(args.data_root).expanduser() / raw
+            dataset_paths.append((p.name, p))
 
     configs = []
     for c in args.configs.split(","):
@@ -488,41 +567,90 @@ def main():
         if m:
             configs.append((int(m.group(1)), int(m.group(2))))
 
-    results = []
-    for width, depth in configs:
-        # 'auto' → None → make_bcwd picks the keras-prune-aligned default.
-        # Anything else is an explicit override (kept for testing a
-        # specific filter regardless of (d, w)).
-        filt = None if args.filter == "auto" else args.filter
-        r = compare_groundings(
-            ds, kb, data_dir, width, depth,
-            flat=args.flat, all_anchors=args.all_anchors,
-            filt=filt, S_max=args.s_max, C=args.C,
-            max_queries=args.max_queries,
-            G_r=args.G_r,
-            batch_size=(args.batch_size if args.batch_size > 0 else None),
-            bump_s_to_k=not args.no_bump_s,
-        )
-        results.append(r)
+    # ``family`` ships two rule files; the paper / IJCAI '25 numbers
+    # use ``rules_old.txt`` (47 rules). All other datasets use
+    # ``rules.txt``. Allow explicit override via ``--rules-file``.
+    explicit_rules_file = (args.rules_file != "rules.txt")
 
-    # Summary table — counts on the left, timing on the right.
-    # ``K(ms)`` is the keras full-batch wall-clock; ``T(ms)`` is the
-    # steady-state torch run (sum of per-query times when filter='none',
-    # full-batch otherwise). Speedup is ``keras / torch`` — values >1
-    # mean torch is faster.
-    print(f"\n{'='*78}")
-    print("SUMMARY")
-    print(f"{'='*78}")
-    print(f"{'Config':<8} {'Keras':>8} {'Torch':>8} {'Diff':>6} {'Match':>5}"
-          f"   {'K(ms)':>8} {'T(ms)':>8} {'Speedup':>8}")
-    print("-" * 78)
-    for r in results:
+    all_rows: List[Dict[str, Any]] = []
+    for ds_label, ds_path in dataset_paths:
+        if explicit_rules_file:
+            rules_file = args.rules_file
+        elif "family" in ds_label:
+            rules_file = "rules_old.txt"
+        else:
+            rules_file = "rules.txt"
+        ds, kb = load_dataset(str(ds_path), device=args.device,
+                              rules_file=rules_file)
+        print(f"\n{'#'*78}")
+        print(f"Dataset: {ds_label} (rules={rules_file})")
+        print(f"  facts={kb.num_facts}, rules={kb.num_rules}, M={kb.M}, "
+              f"K_f={kb.K_f}, K_r={kb.K_r}")
+        print(f"{'#'*78}")
+
+        for width, depth in configs:
+            # 'auto' → None → make_bcwd picks the keras-prune-aligned default.
+            # Anything else is an explicit override (kept for testing a
+            # specific filter regardless of (d, w)).
+            filt = None if args.filter == "auto" else args.filter
+            r = compare_groundings(
+                ds, kb, ds_path, width, depth,
+                flat=args.flat, all_anchors=args.all_anchors,
+                filt=filt, S_max=args.s_max, C=args.C,
+                max_queries=args.max_queries,
+                G_r=args.G_r,
+                batch_size=(args.batch_size if args.batch_size > 0 else None),
+                bump_s_to_k=not args.no_bump_s,
+            )
+            r["dataset"] = ds_label
+            r["rules_file"] = rules_file
+            all_rows.append(r)
+
+    # Cross-dataset summary table — counts on the left, timing on the
+    # right. ``K(ms)`` is the keras full-batch wall-clock; ``T(ms)`` is
+    # the steady-state torch run (sum of per-query times when
+    # filter='none', full-batch otherwise). ``Speedup`` is
+    # ``keras_ms / torch_ms`` — values >1 mean torch is faster.
+    width_w = max(20, max(len(r["dataset"]) for r in all_rows) + 2)
+    print(f"\n{'='*100}")
+    print("CROSS-DATASET SUMMARY")
+    print(f"{'='*100}")
+    header = (
+        f"{'Dataset':<{width_w}} {'Config':<6} {'Keras':>7} {'Torch':>7}"
+        f" {'Diff':>6} {'Match':>5}   {'K(ms)':>8} {'T(ms)':>8} "
+        f"{'Speedup':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+    for r in all_rows:
         speedup_str = (f"{r['speedup']:.2f}x" if r['speedup'] != float('inf')
                        else "inf")
-        print(f"{r['config']:<8} {r['keras_total']:>8} {r['torch_total']:>8} "
-              f"{r['diff']:>+6} {'YES' if r['match'] else 'NO':>5}   "
-              f"{r['keras_ms']:>8.1f} {r['torch_ms']:>8.1f} "
-              f"{speedup_str:>8}")
+        print(
+            f"{r['dataset']:<{width_w}} {r['config']:<6} "
+            f"{r['keras_total']:>7} {r['torch_total']:>7} "
+            f"{r['diff']:>+6} {'YES' if r['match'] else 'NO':>5}   "
+            f"{r['keras_ms']:>8.1f} {r['torch_ms']:>8.1f} "
+            f"{speedup_str:>8}"
+        )
+
+    if args.csv:
+        import csv as _csv
+        with open(args.csv, "w", newline="") as f:
+            w = _csv.writer(f)
+            w.writerow([
+                "dataset", "rules_file", "config",
+                "keras_total", "torch_total", "diff", "match",
+                "keras_ms", "torch_ms", "speedup",
+            ])
+            for r in all_rows:
+                w.writerow([
+                    r["dataset"], r["rules_file"], r["config"],
+                    r["keras_total"], r["torch_total"], r["diff"],
+                    "YES" if r["match"] else "NO",
+                    f"{r['keras_ms']:.2f}", f"{r['torch_ms']:.2f}",
+                    f"{r['speedup']:.4f}" if r['speedup'] != float('inf') else "inf",
+                ])
+        print(f"\n[csv] wrote {args.csv}")
 
 
 if __name__ == "__main__":
