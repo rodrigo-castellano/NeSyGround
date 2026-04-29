@@ -657,13 +657,13 @@ class BCGrounder(nn.Module):
     ) -> GrounderOutput:
         if self._collect_rule_groundings:
             self._r2g_buffer: Dict[int, set] = {}  # reset each forward
-            # The per-step ``_collect_r2g`` runs *between* RESOLVE and
-            # PACK, so it sees rule applications that the per-state
-            # packing (S budget) would later drop. Use it whenever
-            # available; CUDA-graph callers can disable
-            # ``collect_rule_groundings`` and consume ``evidence``
-            # directly instead — the step loop never needs the Python
-            # path.
+            # Tensor accumulators for the per-step pre-pack capture.
+            # ``_collect_r2g_tensor`` appends here; ``_finalize_r2g_tensor``
+            # runs once post-loop, dedups via ``torch.unique``, and
+            # projects into ``_r2g_buffer`` with a single host transfer.
+            self._r2g_acc_rule: List[Tensor] = []
+            self._r2g_acc_head: List[Tensor] = []
+            self._r2g_acc_body: List[Tensor] = []
             self._r2g_skip_per_step = False
         else:
             self._r2g_skip_per_step = False
@@ -709,21 +709,31 @@ class BCGrounder(nn.Module):
                 and getattr(self, "_r2g_skip_per_step", False)
                 and evidence is not None):
             self._build_r2g_from_evidence(evidence)
-        # Build RuleGroundings from collected per-rule sets
+        # Build RuleGroundings.  Default path: tensorized per-step accumulators
+        # → ``_finalize_r2g_tensor`` returns a ready-to-use RuleGroundings.
+        # Legacy path: fall back to ``_r2g_buffer`` (Python sets) only when
+        # the tensor accumulators are empty (e.g. evidence-based mode).
         rule_groundings = None
-        if self._collect_rule_groundings and hasattr(self, '_r2g_buffer') and self._r2g_buffer:
-            from grounder.bc.common import (
-                build_rule_grounding_tensors, prune_rule_groundings)
-            r2g = self._r2g_buffer
-            # Apply fp_batch-style pruning if soundness filter is enabled
-            if self.filter_mode == "fp_batch":
-                fact_set = set()
-                fi = self.kb.fact_index.facts_idx  # [F, 3]
-                for f in range(fi.shape[0]):
-                    fact_set.add(tuple(fi[f].tolist()))
-                r2g = prune_rule_groundings(r2g, fact_set, max_iterations=self.depth)
-            rule_groundings = build_rule_grounding_tensors(
-                r2g, self.kb.num_rules, queries.device)
+        if self._collect_rule_groundings:
+            if (not getattr(self, "_r2g_skip_per_step", False)
+                    and getattr(self, "_r2g_acc_rule", None)):
+                rule_groundings = self._finalize_r2g_tensor()
+                if rule_groundings is not None and self.filter_mode == "fp_batch":
+                    rule_groundings = self._prune_rule_groundings_tensor(
+                        rule_groundings)
+            elif hasattr(self, '_r2g_buffer') and self._r2g_buffer:
+                from grounder.bc.common import (
+                    build_rule_grounding_tensors, prune_rule_groundings)
+                r2g = self._r2g_buffer
+                if self.filter_mode == "fp_batch":
+                    fact_set = set()
+                    fi = self.kb.fact_index.facts_idx  # [F, 3]
+                    for f in range(fi.shape[0]):
+                        fact_set.add(tuple(fi[f].tolist()))
+                    r2g = prune_rule_groundings(
+                        r2g, fact_set, max_iterations=self.depth)
+                rule_groundings = build_rule_grounding_tensors(
+                    r2g, self.kb.num_rules, queries.device)
 
         state = ProofState(
             proof_goals=states["proof_goals"],
@@ -859,12 +869,12 @@ class BCGrounder(nn.Module):
         resolved = self._apply_hooks(resolved, states)
 
         # ── COLLECT per-rule groundings (before dedup) ──
-        # Skipped when ``_r2g_skip_per_step=True`` (the default for
-        # ``collect_evidence=True``); evidence-based post-forward
-        # extraction is preferred — CUDA-graph friendly.
+        # Tensorized path: appends to per-step GPU tensors with no
+        # ``.item()`` / ``.tolist()`` syncs. Final dedup + host transfer
+        # happens once after the step loop in ``_finalize_r2g_tensor``.
         if (self._collect_rule_groundings
                 and not getattr(self, "_r2g_skip_per_step", False)):
-            self._collect_r2g(resolved, states)
+            self._collect_r2g_tensor(resolved, states)
 
         # ── PACK → returns (states, sync) — no dict pollution ──
         states, sync = self._pack(resolved, states)
@@ -1418,6 +1428,251 @@ class BCGrounder(nn.Module):
             states["collected_head"] = c_hd
         return states
 
+    def _collect_r2g_tensor(self, resolved, states: Dict[str, Tensor]) -> None:
+        """Tensor-only per-step accumulator for rule-application data.
+
+        Replaces the legacy ``_collect_r2g`` Python loop with a pure-tensor
+        path: gather (rule_idx, head, sorted_body) for every valid resolved
+        child and ``cat`` onto running GPU tensors. No ``.item()``, no
+        ``.tolist()``, no Python iteration in the hot path. Dedup runs
+        once after the step loop in ``_finalize_r2g_tensor`` via
+        ``torch.unique``.
+        """
+        pad = self.kb.padding_idx
+        M = self.kb.M
+        sel = states.get("_selected_goal")  # [B, S_in, 3]
+
+        # Bring both ResolvedChildren shapes onto a single flat layout:
+        #   rule_idx [T], body [T, M, 3], b_idx [T], s_idx [T], valid [T]
+        if isinstance(resolved, FlatResolvedChildren):
+            rule_idx = resolved.flat_rule_idx
+            body = resolved.flat_goals[:, :M, :]
+            b_idx = resolved.flat_b_idx
+            s_idx = resolved.flat_s_idx
+            valid = torch.ones_like(rule_idx, dtype=torch.bool)
+        else:
+            ridx = resolved.sub_rule_idx                # [B, S, K_r]
+            success = resolved.rule_success             # [B, S, K_r]
+            goals = resolved.rule_goals[..., :M, :]     # [B, S, K_r, M, 3]
+            B, S, K_r = ridx.shape
+            dev = ridx.device
+            rule_idx = ridx.reshape(-1)
+            body = goals.reshape(-1, M, 3)
+            valid = success.reshape(-1)
+            bi = (torch.arange(B, device=dev).view(B, 1, 1)
+                  .expand(B, S, K_r).reshape(-1))
+            si = (torch.arange(S, device=dev).view(1, S, 1)
+                  .expand(B, S, K_r).reshape(-1))
+            b_idx = bi
+            s_idx = si
+
+        # Drop entries with no body atom or invalid mask.
+        active_atom = body[..., 0] != pad           # [T, M]
+        has_body = active_atom.any(dim=-1)           # [T]
+        valid = valid & has_body & (rule_idx >= 0)
+        if not bool(valid.any()):
+            return
+
+        rule_idx = rule_idx[valid].long()
+        body = body[valid]
+        b_idx = b_idx[valid].long()
+        s_idx = s_idx[valid].long()
+        active_atom = active_atom[valid]
+
+        # Map variant → orig.
+        v2o = getattr(self, "_variant_to_orig_t", None)
+        if v2o is not None:
+            rule_idx = v2o[rule_idx.clamp(min=0)]
+
+        # Head: gather selected goal per (b, s).
+        if sel is not None:
+            head = sel[b_idx, s_idx]                # [T, 3]
+        else:
+            head = torch.full(
+                (rule_idx.size(0), 3), pad,
+                dtype=torch.long, device=rule_idx.device)
+
+        # Sort body atoms within each entry by per-atom hash so anchor
+        # variants of the same logical rule application share a key.
+        # Padding atoms map to a sentinel that sorts past everything.
+        P1, P2, P3 = 1_000_003, 999_983, 999_979
+        atom_hash = (body[..., 0].long() * P1
+                     + body[..., 1].long() * P2
+                     + body[..., 2].long() * P3)     # [T, M]
+        sentinel = torch.full_like(atom_hash, (2 ** 62) - 1)
+        atom_hash_for_sort = torch.where(active_atom, atom_hash, sentinel)
+        sort_idx = atom_hash_for_sort.argsort(dim=-1)
+        body_sorted = body.gather(
+            1, sort_idx.unsqueeze(-1).expand(-1, -1, 3))
+
+        # Append to running accumulators (one cat at end of forward).
+        self._r2g_acc_rule.append(rule_idx)
+        self._r2g_acc_head.append(head)
+        self._r2g_acc_body.append(body_sorted)
+
+    def _prune_rule_groundings_tensor(self, rg):
+        """fp_batch / Kleene fixed-point pruning over a RuleGroundings.
+
+        Mirrors ``common.prune_rule_groundings`` semantics (snapshot-based,
+        ``num_steps`` iterations) but operates on the tensor RuleGroundings
+        produced by ``_finalize_r2g_tensor``. Drops apps whose body atoms
+        aren't all in the proved-set (facts ∪ heads of proved apps) after
+        ``self.depth`` snapshot iterations.
+        """
+        atom_table = rg.atom_table                              # [num_atoms, 3]
+        num_atoms = atom_table.size(0)
+        device = atom_table.device
+        # Build fact-set membership: which atom_table rows are facts.
+        # facts_idx is [F, 3]. Combine atom_table and facts_idx,
+        # ``unique`` with ``return_inverse``, then count duplicates.
+        fi = self.kb.fact_index.facts_idx                       # [F, 3]
+        if fi.numel() > 0:
+            fi_dev = fi.to(device)
+            joined = torch.cat([atom_table, fi_dev], dim=0)     # [num_atoms+F, 3]
+            _, inv = torch.unique(joined, dim=0, return_inverse=True)
+            # An atom_table row is a fact iff its unique-bucket is
+            # shared by at least one row from the facts side.
+            inv_atoms = inv[:num_atoms]
+            inv_facts = inv[num_atoms:]
+            fact_mask = torch.zeros(
+                inv.max().item() + 1, dtype=torch.bool, device=device)
+            fact_mask[inv_facts] = True
+            is_fact = fact_mask[inv_atoms]                      # [num_atoms]
+        else:
+            is_fact = torch.zeros(
+                num_atoms, dtype=torch.bool, device=device)
+
+        # proved-set: starts as facts, grows with proved heads.
+        proved = is_fact.clone()
+        # Snapshot iteration: each pass uses a frozen view of
+        # ``proved`` from the previous pass.
+        for _ in range(max(1, self.depth)):
+            new_proved = proved.clone()
+            for r, a_in in rg.A_in.items():
+                if a_in.numel() == 0:
+                    continue
+                a_out = rg.A_out[r]                             # [G_r, 1]
+                head_idx = a_out[:, 0]
+                # For each app, are all body atoms in ``proved``?
+                # a_in[g, m] indexes into atom_table; -1/pad-rows are
+                # already trimmed by max_body_per_rule, so every
+                # column is a valid body atom.
+                if a_in.size(1) == 0:
+                    body_proved = torch.ones(
+                        a_in.size(0), dtype=torch.bool, device=device)
+                else:
+                    body_proved = proved[a_in].all(dim=-1)      # [G_r]
+                new_proved[head_idx[body_proved]] = True
+            if torch.equal(new_proved, proved):
+                break
+            proved = new_proved
+        # Final filter: keep apps whose body atoms are all in proved.
+        new_A_in: Dict[int, Tensor] = {}
+        new_A_out: Dict[int, Tensor] = {}
+        for r, a_in in rg.A_in.items():
+            if a_in.numel() == 0:
+                new_A_in[r] = a_in
+                new_A_out[r] = rg.A_out[r]
+                continue
+            if a_in.size(1) == 0:
+                keep = torch.ones(
+                    a_in.size(0), dtype=torch.bool, device=device)
+            else:
+                keep = proved[a_in].all(dim=-1)                 # [G_r]
+            new_A_in[r] = a_in[keep].contiguous()
+            new_A_out[r] = rg.A_out[r][keep].contiguous()
+        from grounder.types import RuleGroundings
+        return RuleGroundings(
+            atom_table=rg.atom_table,
+            A_in=new_A_in,
+            A_out=new_A_out,
+            num_atoms=rg.num_atoms,
+            num_rules=rg.num_rules,
+        )
+
+    def _finalize_r2g_tensor(self):
+        """Dedup accumulated (rule, head, body) tensors with
+        ``torch.unique`` and build a ``RuleGroundings`` directly.
+
+        Returns the RuleGroundings tensor structure (atom_table, A_in,
+        A_out) without going through ``_r2g_buffer``. The host transfer
+        is one int per (head, body) atom — O(U·(M+1)) — which is
+        orders of magnitude smaller than the legacy ``.tolist()`` of
+        raw resolved children per step.
+        """
+        from grounder.types import RuleGroundings
+
+        if not self._r2g_acc_rule:
+            return None
+        rule_idx = torch.cat(self._r2g_acc_rule, 0)
+        head = torch.cat(self._r2g_acc_head, 0)
+        body = torch.cat(self._r2g_acc_body, 0)
+        T = rule_idx.size(0)
+        if T == 0:
+            return None
+        M = body.size(1)
+        device = rule_idx.device
+        # Encode each row as a single comparable tensor for unique:
+        # [rule, head[3], body[M*3]] = [1 + 3 + 3M].
+        combined = torch.cat([
+            rule_idx.unsqueeze(-1),
+            head.long(),
+            body.long().reshape(T, M * 3),
+        ], dim=-1)
+        uniq = torch.unique(combined, dim=0)          # [U, 1 + 3 + 3M]
+        if uniq.size(0) == 0:
+            return None
+        u_rule = uniq[:, 0].long()
+        u_head = uniq[:, 1:4].long()                  # [U, 3]
+        u_body = uniq[:, 4:].reshape(-1, M, 3).long() # [U, M, 3]
+
+        # Atom table: union of (head, body) atoms across all rule
+        # applications.  Build via a single ``torch.unique`` on the
+        # flattened atom set.
+        # Drop padding body atoms by tagging them with a sentinel index;
+        # they'll get filtered when building per-rule A_in.
+        pad = self.kb.padding_idx
+        all_atoms = torch.cat([u_head.unsqueeze(1), u_body], dim=1)  # [U, M+1, 3]
+        flat_atoms = all_atoms.reshape(-1, 3)                       # [U*(M+1), 3]
+        atom_table, inverse = torch.unique(
+            flat_atoms, dim=0, return_inverse=True,
+        )
+        inverse = inverse.reshape(-1, M + 1)                        # [U, M+1]
+        head_atom_idx = inverse[:, 0]                               # [U]
+        body_atom_idx = inverse[:, 1:]                              # [U, M]
+        # Active body-atom mask (drop padding atoms in A_in).
+        body_active = (u_body[..., 0] != pad)                       # [U, M]
+
+        # Bucket into per-rule tensors.  Keep this Python loop over
+        # ``num_rules`` only — typically tens, not thousands.  The
+        # masking + indexing inside is tensor-only.
+        num_rules = self.kb.num_rules
+        A_in: Dict[int, Tensor] = {}
+        A_out: Dict[int, Tensor] = {}
+        # Track max body length per rule to size A_in.
+        max_body_per_rule = body_active.long().sum(dim=-1)          # [U]
+        for r in range(num_rules):
+            mask = (u_rule == r)
+            if not bool(mask.any()):
+                A_in[r] = torch.zeros(
+                    0, 0, dtype=torch.long, device=device)
+                A_out[r] = torch.zeros(
+                    0, 1, dtype=torch.long, device=device)
+                continue
+            r_body_idx = body_atom_idx[mask]                        # [G_r, M]
+            r_head_idx = head_atom_idx[mask].unsqueeze(-1)          # [G_r, 1]
+            # Compact: drop padding atoms by per-row slice.
+            r_max_m = int(max_body_per_rule[mask].max().item())
+            A_in[r] = r_body_idx[:, :r_max_m].contiguous()
+            A_out[r] = r_head_idx
+        return RuleGroundings(
+            atom_table=atom_table.contiguous(),
+            A_in=A_in,
+            A_out=A_out,
+            num_atoms=int(atom_table.size(0)),
+            num_rules=num_rules,
+        )
+
     def _build_r2g_from_evidence(self, evidence) -> None:
         """Build self._r2g_buffer from final evidence (post-forward, fast).
 
@@ -1656,8 +1911,17 @@ class BCGrounder(nn.Module):
         if d not in self._fn_steps_by_depth:
             import functools
             fn = functools.partial(self._step_impl, d=d)
+            # ``dynamic=True`` allows the compiled step to accept varying
+            # batch / candidate sizes without recompilation. For enum
+            # this is essential — at d>0 the per-state candidate count
+            # depends on which queries fired at d-1. Setting
+            # ``dynamic=True`` here is the difference between hot calls
+            # in the millisecond range and tens of seconds when shapes
+            # drift between calls.
             self._fn_steps_by_depth[d] = torch.compile(
-                fn, fullgraph=True, mode=self.compile_mode)
+                fn, fullgraph=True, mode=self.compile_mode,
+                dynamic=True,
+            )
         return self._fn_steps_by_depth[d]
 
     def _step_compiled(self, states: Dict, d: int = 0) -> Dict[str, Tensor]:
