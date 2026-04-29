@@ -361,6 +361,17 @@ def pack_states_flat(
         atom_h = (flat_goals[..., 0].long() * P1
                   + flat_goals[..., 1].long() * P2
                   + flat_goals[..., 2].long() * P3)       # [T, G]
+        # Body atoms at [:M_rule] are stored in anchor-variant order
+        # (all_anchors=True permutes them). Sort within the body prefix
+        # so anchor variants of the same logical rule application share
+        # a hash; leave parent-inherited goals at [M_rule:] in natural
+        # order (anchor-invariant). Mirrors the canonical-order pattern
+        # in ``BCGrounder._collect_r2g_tensor`` for terminal collection.
+        if M_rule > 0 and M_rule < G:
+            body_h, _ = atom_h[:, :M_rule].sort(dim=-1)
+            atom_h = torch.cat([body_h, atom_h[:, M_rule:]], dim=-1)
+        elif M_rule > 0 and G > 0:
+            atom_h, _ = atom_h.sort(dim=-1)
         powers = P4 ** torch.arange(G - 1, -1, -1, device=dev)
         goal_hash = (atom_h * powers).sum(dim=-1)          # [T]
         compound = flat_b.long() * P1 + goal_hash
