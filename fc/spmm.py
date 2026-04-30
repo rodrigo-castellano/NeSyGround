@@ -79,6 +79,7 @@ class SpMMOp(Enum):
     ELEM_AND = auto()      # 2-body: element-wise AND (both args identical)
     CASE_A = auto()        # 2-body: fully resolved (existence check)
     EXIST_AND = auto()     # 2-body: body0 has head vars, body1 has existential
+    MATMUL3 = auto()       # 3-body chain: A @ B @ C via two sparse matmuls
     UNSUPPORTED = auto()   # Falls back to staged FCDynamic.
 
 
@@ -89,11 +90,14 @@ class SpMMRuleDesc:
     head_pred: int
     pred_A: int = -1
     pred_B: int = -1
+    pred_C: int = -1                # 3-body chain only
     transpose_A: bool = False
     transpose_B: bool = False
+    transpose_C: bool = False        # 3-body chain only
     transpose_result: bool = False
     reflexive_body0: bool = False
     reflexive_body1: bool = False
+    reflexive_body2: bool = False    # 3-body chain only
     b10_binding: int = -1
     b11_binding: int = -1
     b00: int = -1
@@ -219,7 +223,58 @@ def classify_rule(cr) -> SpMMRuleDesc:
             transpose_result=t_R,
             reflexive_body0=reflexive0, reflexive_body1=reflexive1)
 
-    # 3+ body atoms not supported by SpMM.
+    if cr.num_body == 3:
+        # 3-body chain: bp0(X,Y), bp1(Y,K), bp2(K,Z) → head(X,Z).
+        # Pattern requirements:
+        #   * bp0 shares exactly one variable with bp1 (call it Y).
+        #   * bp1 shares exactly one variable with bp2 (call it K), and
+        #     Y ≠ K (so bp1's two args are the two shared variables).
+        #   * The non-shared var of bp0 is one head var; the non-shared
+        #     var of bp2 is the other head var. No other variables.
+        bp0, bp1, bp2 = cr.body_patterns[0], cr.body_patterns[1], cr.body_patterns[2]
+        v00, v01 = bp0["arg0_var"], bp0["arg1_var"]
+        v10, v11 = bp1["arg0_var"], bp1["arg1_var"]
+        v20, v21 = bp2["arg0_var"], bp2["arg1_var"]
+        pred0, pred1, pred2 = bp0["pred_idx"], bp1["pred_idx"], bp2["pred_idx"]
+        b0v = {v00, v01}; b1v = {v10, v11}; b2v = {v20, v21}
+        # Y = bp0 ∩ bp1; K = bp1 ∩ bp2. Non-head only.
+        Y_set = (b0v & b1v) - {hv0, hv1}
+        K_set = (b1v & b2v) - {hv0, hv1}
+        if len(Y_set) != 1 or len(K_set) != 1:
+            return SpMMRuleDesc(op=SpMMOp.UNSUPPORTED, head_pred=head_pred)
+        Y = next(iter(Y_set)); K = next(iter(K_set))
+        if Y == K:
+            return SpMMRuleDesc(op=SpMMOp.UNSUPPORTED, head_pred=head_pred)
+        # bp1 should have exactly {Y, K} as its variables.
+        if b1v != {Y, K}:
+            return SpMMRuleDesc(op=SpMMOp.UNSUPPORTED, head_pred=head_pred)
+        # Non-shared vars of bp0 / bp2 must be the head vars.
+        ns_a = (b0v - {Y}).pop() if len(b0v - {Y}) == 1 else None
+        ns_c = (b2v - {K}).pop() if len(b2v - {K}) == 1 else None
+        if ns_a is None or ns_c is None:
+            return SpMMRuleDesc(op=SpMMOp.UNSUPPORTED, head_pred=head_pred)
+        if {ns_a, ns_c} != {hv0, hv1}:
+            return SpMMRuleDesc(op=SpMMOp.UNSUPPORTED, head_pred=head_pred)
+        # Transpose flags: each matrix should have its non-shared / "from"
+        # var on rows, shared / "to" var on columns. So:
+        #   bp0 should be (ns_a, Y) — transpose if shared at arg0
+        #   bp1 should be (Y, K) — transpose if K at arg0
+        #   bp2 should be (K, ns_c) — transpose if ns_c at arg0
+        t_A = (v00 == Y)         # bp0: shared Y is at arg0 → transpose
+        t_B = (v10 == K)         # bp1: K is at arg0 → transpose
+        t_C = (v20 == ns_c)      # bp2: ns_c is at arg0 → transpose
+        # Result has rows=ns_a, cols=ns_c. If ns_a==hv0 → no transpose.
+        t_R = (ns_a == hv1)
+        return SpMMRuleDesc(
+            op=SpMMOp.MATMUL3, head_pred=head_pred,
+            pred_A=pred0, pred_B=pred1, pred_C=pred2,
+            transpose_A=t_A, transpose_B=t_B, transpose_C=t_C,
+            transpose_result=t_R,
+            reflexive_body0=(v00 == v01),
+            reflexive_body1=(v10 == v11),
+            reflexive_body2=(v20 == v21))
+
+    # 4+ body atoms unsupported.
     return SpMMRuleDesc(op=SpMMOp.UNSUPPORTED, head_pred=head_pred)
 
 
@@ -642,6 +697,48 @@ def apply_spmm_rule(
 
         return result if _sparse_nnz(result) > 0 else None
 
+    if desc.op == SpMMOp.MATMUL3:
+        # 3-body chain: result = (A op_A) @ (B op_B) @ (C op_C)
+        # where op_X = transpose if desc.transpose_X. All three matrices
+        # come from ``all_mats`` in True I* mode (passed as base_mats by
+        # the caller in that case) so newly-derived atoms participate.
+        mat_A = base_mats.get(desc.pred_A)
+        mat_B = all_mats.get(desc.pred_B)
+        mat_C = all_mats.get(desc.pred_C)
+        if mat_A is None or mat_B is None or mat_C is None:
+            return None
+        if desc.reflexive_body0:
+            mat_A = _get_diagonal_mask(mat_A, E)
+        if desc.reflexive_body1:
+            mat_B = _get_diagonal_mask(mat_B, E)
+        if desc.reflexive_body2:
+            mat_C = _get_diagonal_mask(mat_C, E)
+        if (_sparse_nnz(mat_A) == 0 or _sparse_nnz(mat_B) == 0
+                or _sparse_nnz(mat_C) == 0):
+            return None
+
+        A = mat_A
+        B = mat_B
+        C = mat_C
+        if desc.transpose_A:
+            A = _transpose_csr(A, E)
+        if desc.transpose_B:
+            B = _transpose_csr(B, E)
+        if desc.transpose_C:
+            C = _transpose_csr(C, E)
+
+        AB = torch.sparse.mm(A, B)
+        AB = _sparse_to_bool_csr(AB)
+        if _sparse_nnz(AB) == 0:
+            return None
+        result = torch.sparse.mm(AB, C)
+        result = _sparse_to_bool_csr(result)
+
+        if desc.transpose_result:
+            result = _transpose_csr(result, E)
+
+        return result if _sparse_nnz(result) > 0 else None
+
     return None
 
 
@@ -659,42 +756,54 @@ def run_forward_chaining_spmm(
     device: str = "cpu",
     *,
     verbose: bool = True,
+    complete: bool = True,
 ) -> Tuple[Tensor, int]:
-    """Compute the FC closure via incremental SpMM with delta tracking.
+    """Compute the FC closure via SpMM.
 
-    Same I/O contract as :func:`grounder.fc.fc.run_forward_chaining`
-    so callers can swap implementations with no API change. Falls
-    back is the responsibility of the caller — rules whose
-    ``classify_rule`` result is ``UNSUPPORTED`` (or any rule with
-    ``num_body >= 3``) are skipped here; combine with the staged
-    FCDynamic if you need to cover those.
+    Two iteration strategies:
+
+    * ``complete=True`` (default) — True Datalog I*. At every step,
+      body0 AND body1 read from ACCUMULATED matrices (base ∪ all
+      provable atoms so far). Slower per step (O(nnz_accum²) for
+      MATMUL) but correct under recursion: rules of the form
+      ``h(X,Y) :- h(X,Z), p(Y,Z)`` (where the head predicate also
+      appears in body0) need accumulated body0 to pair newly-derived
+      head atoms with existing body1 atoms.
+    * ``complete=False`` — incremental delta tracking. body0 reads
+      ``base_mats`` only; body1 reads ``delta_mats`` at step >0.
+      ~5× faster per step but UNDER-COUNTS on recursive rule sets.
+      Use only when you know body0 predicates never appear in any
+      head (i.e., the rule graph is acyclic between body0 and head).
+
+    Same I/O contract as :func:`grounder.fc.fc.run_forward_chaining`.
+    Rules whose ``classify_rule`` result is ``UNSUPPORTED`` (or any
+    rule with ``num_body >= 3``) are skipped — combine with the
+    staged FCDynamic to cover those.
 
     Args:
-        compiled_rules: list of ``RulePattern`` (must expose
-            ``head_pred_idx``, ``head_var0``, ``head_var1``,
-            ``num_body``, and ``body_patterns[i]['arg0_binding'/...]``).
-        facts_idx: ``[F, 3]`` tensor of fact triples (pred, subj, obj).
+        compiled_rules: list of ``RulePattern``.
+        facts_idx: ``[F, 3]`` fact triples (pred, subj, obj).
         num_entities: total entity count.
         num_predicates: total predicate count.
-        depth: hard cap on FC iterations (the loop also exits early
-            when no new atoms are derived).
-        device: target device for the returned hash tensor. Sparse
-            ops run on the device of the input matrices; for very
-            large closures CPU is usually the right choice.
+        depth: hard cap on FC iterations (loop exits early at fixpoint).
+        device: target device for the returned hash tensor.
+        complete: True I* mode (default) vs delta-incremental.
+        verbose: print per-step progress.
 
     Returns:
-        ``(sorted_hashes, n_provable)`` — the same format as
+        ``(sorted_hashes, n_provable)`` — same format as
         :func:`grounder.fc.fc.run_forward_chaining`.
     """
-    three_body = [
+    # 3-body chain rules are supported via MATMUL3 (classify_rule
+    # returns SpMMOp.MATMUL3). 4+ body rules are still UNSUPPORTED
+    # and skipped per-rule in the inner loop.
+    four_plus = [
         i for i, cr in enumerate(compiled_rules)
-        if getattr(cr, "num_body", 0) >= 3
+        if getattr(cr, "num_body", 0) >= 4
     ]
-    if three_body:
-        raise ValueError(
-            f"SpMM FC does not support num_body >= 3 (rules at "
-            f"indices {three_body}). Fall back to the staged "
-            f"FCDynamic for these rule sets.")
+    if four_plus and verbose:
+        print(f"    [SpMM] {len(four_plus)} rules with num_body >= 4 "
+              f"will be skipped (UNSUPPORTED)")
 
     t0 = time.time()
     E = num_entities
@@ -721,124 +830,209 @@ def run_forward_chaining_spmm(
         print(f"    [SpMM] {n_unsupported}/{len(rule_descs)} rules "
               f"UNSUPPORTED (skipped — fall back to FCDynamic if needed)")
 
+    # Predicates that appear as body0 (need accumulation in `complete`
+    # mode so recursive rules see their own derivations).
+    body0_preds: set = set()
     body1_preds: set = set()
-    needs_delta_T: set = set()
+    needs_T: set = set()      # predicates needing a transpose cache
     for desc in rule_descs:
+        if desc.op == SpMMOp.UNSUPPORTED:
+            continue
+        body0_preds.add(desc.pred_A)
         if desc.op in (SpMMOp.MATMUL, SpMMOp.ELEM_AND):
             body1_preds.add(desc.pred_B)
+        if desc.op == SpMMOp.MATMUL3:
+            # 3-body chain: pred_B and pred_C are both consumed.
+            body1_preds.add(desc.pred_B)
+            body1_preds.add(desc.pred_C)
+        if desc.op == SpMMOp.TRANSPOSE:
+            needs_T.add(desc.pred_A)
+        if desc.op == SpMMOp.MATMUL and desc.transpose_A:
+            needs_T.add(desc.pred_A)
         if desc.op == SpMMOp.MATMUL and desc.transpose_B:
-            needs_delta_T.add(desc.pred_B)
+            needs_T.add(desc.pred_B)
 
     base_mats_T: Dict[int, Tensor] = {}
-    for desc in rule_descs:
-        if desc.op == SpMMOp.TRANSPOSE or (
-                desc.op == SpMMOp.MATMUL and desc.transpose_A):
-            p = desc.pred_A
-            if p not in base_mats_T and p in base_mats:
-                base_mats_T[p] = _transpose_csr(base_mats[p], E)
-        if desc.op == SpMMOp.MATMUL and desc.transpose_B:
-            p = desc.pred_B
-            if p not in base_mats_T and p in base_mats:
-                base_mats_T[p] = _transpose_csr(base_mats[p], E)
+    for p in needs_T:
+        if p in base_mats:
+            base_mats_T[p] = _transpose_csr(base_mats[p], E)
 
     pred_boundaries = torch.arange(P + 1, dtype=torch.long) * E2
 
     provable_hashes = torch.zeros(0, dtype=torch.long)
-    delta_mats: Dict[int, Tensor] = {}
-    delta_mats_T: Dict[int, Tensor] = {}
 
-    for step in range(depth):
-        new_hashes_list: List[Tensor] = []
-        n_ph = provable_hashes.shape[0]
+    if complete:
+        # ── True I* mode: accumulated body0 AND body1 each step ──
+        # Track ALL predicates that appear as body0 or body1.
+        tracked_preds: set = body0_preds | body1_preds
+        accum_mats: Dict[int, Tensor] = dict(base_mats)
+        accum_mats_T: Dict[int, Tensor] = dict(base_mats_T)
+        # Restrict accum tracking to predicates actually consumed.
+        accum_mats = {p: m for p, m in accum_mats.items() if p in tracked_preds}
 
-        for desc in rule_descs:
-            if desc.op == SpMMOp.UNSUPPORTED:
-                continue
+        for step in range(depth):
+            new_hashes_list: List[Tensor] = []
+            n_ph = provable_hashes.shape[0]
 
-            # COPY / TRANSPOSE produce identical output every step;
-            # apply them only at step 0.
-            if desc.op in (SpMMOp.COPY, SpMMOp.TRANSPOSE) and step > 0:
-                continue
-
-            if step == 0:
+            for desc in rule_descs:
+                if desc.op == SpMMOp.UNSUPPORTED:
+                    continue
+                # Re-evaluate every step — body0 mats grow via
+                # accumulation, so COPY/TRANSPOSE outputs can change.
                 result = apply_spmm_rule(
-                    desc, base_mats, base_mats, E,
+                    desc, accum_mats, accum_mats, E,
                     fact_hashes, num_facts, provable_hashes,
-                    base_mats_T=base_mats_T, all_mats_T=base_mats_T)
+                    base_mats_T=accum_mats_T, all_mats_T=accum_mats_T)
+                if result is None:
+                    continue
+                h = _csr_to_hashes(result, desc.head_pred, E, E2)
+                if h is None:
+                    continue
+                if n_ph > 0:
+                    pos = torch.searchsorted(provable_hashes, h)
+                    valid = pos < n_ph
+                    clamped = torch.clamp(pos, 0, max(n_ph - 1, 0))
+                    already = valid & (provable_hashes[clamped] == h)
+                    h = h[~already]
+                    if h.numel() == 0:
+                        continue
+                new_hashes_list.append(h)
+
+            if not new_hashes_list:
+                break
+
+            all_new = torch.unique(torch.cat(new_hashes_list))
+            if provable_hashes.numel() > 0:
+                n_ph = provable_hashes.shape[0]
+                pos = torch.searchsorted(provable_hashes, all_new)
+                valid = pos < n_ph
+                clamped = torch.clamp(pos, 0, max(n_ph - 1, 0))
+                already = valid & (provable_hashes[clamped] == all_new)
+                added = all_new[~already]
             else:
-                if desc.op in (SpMMOp.MATMUL, SpMMOp.ELEM_AND):
-                    result = apply_spmm_rule(
-                        desc, delta_mats, base_mats, E,
-                        fact_hashes, num_facts, provable_hashes,
-                        base_mats_T=base_mats_T, all_mats_T=delta_mats_T)
-                elif desc.op in (SpMMOp.CASE_A, SpMMOp.EXIST_AND):
+                added = all_new
+
+            if added.numel() == 0:
+                break
+
+            provable_hashes = _sorted_merge(provable_hashes, added)
+
+            # Rebuild accum_mats for tracked predicates by combining
+            # base + all provable atoms of pred p (step's running
+            # closure for that predicate).
+            starts = torch.searchsorted(provable_hashes, pred_boundaries[:-1])
+            ends = torch.searchsorted(provable_hashes, pred_boundaries[1:])
+            for p in tracked_preds:
+                s = int(starts[p].item())
+                e = int(ends[p].item())
+                if p in base_mats:
+                    base_coo = base_mats[p].to_sparse_coo().coalesce()
+                    base_idx = base_coo.indices()
+                    base_local = base_idx[0] * E + base_idx[1] if base_idx.shape[1] > 0 else torch.zeros(0, dtype=torch.long)
+                else:
+                    base_local = torch.zeros(0, dtype=torch.long)
+                if e > s:
+                    new_local = provable_hashes[s:e] - p * E2
+                else:
+                    new_local = torch.zeros(0, dtype=torch.long)
+                merged = (torch.cat([base_local, new_local])
+                          if base_local.numel() and new_local.numel()
+                          else (base_local if base_local.numel() else new_local))
+                if merged.numel() == 0:
+                    continue
+                merged_sorted = merged.sort().values
+                if p in needs_T:
+                    accum_mats[p], accum_mats_T[p] = \
+                        _build_csr_and_transpose(merged_sorted, E)
+                else:
+                    accum_mats[p] = _build_csr_from_local_hashes(
+                        merged_sorted, E)
+
+            if verbose:
+                print(f"    [SpMM] step {step}: +{added.numel()} atoms "
+                      f"(total {provable_hashes.numel()})")
+    else:
+        # ── Incremental delta mode (faster, but undercounts on
+        #    recursive rules where body0 == head_pred for any rule) ──
+        delta_mats: Dict[int, Tensor] = {}
+        delta_mats_T: Dict[int, Tensor] = {}
+        for step in range(depth):
+            new_hashes_list = []
+            n_ph = provable_hashes.shape[0]
+
+            for desc in rule_descs:
+                if desc.op == SpMMOp.UNSUPPORTED:
+                    continue
+                if desc.op in (SpMMOp.COPY, SpMMOp.TRANSPOSE) and step > 0:
+                    continue
+                if step == 0:
                     result = apply_spmm_rule(
                         desc, base_mats, base_mats, E,
                         fact_hashes, num_facts, provable_hashes,
-                        base_mats_T=base_mats_T)
+                        base_mats_T=base_mats_T, all_mats_T=base_mats_T)
                 else:
+                    if desc.op in (SpMMOp.MATMUL, SpMMOp.ELEM_AND):
+                        result = apply_spmm_rule(
+                            desc, delta_mats, base_mats, E,
+                            fact_hashes, num_facts, provable_hashes,
+                            base_mats_T=base_mats_T, all_mats_T=delta_mats_T)
+                    elif desc.op in (SpMMOp.CASE_A, SpMMOp.EXIST_AND):
+                        result = apply_spmm_rule(
+                            desc, base_mats, base_mats, E,
+                            fact_hashes, num_facts, provable_hashes,
+                            base_mats_T=base_mats_T)
+                    else:
+                        continue
+                if result is None:
                     continue
+                h = _csr_to_hashes(result, desc.head_pred, E, E2)
+                if h is None:
+                    continue
+                if n_ph > 0:
+                    pos = torch.searchsorted(provable_hashes, h)
+                    valid = pos < n_ph
+                    clamped = torch.clamp(pos, 0, max(n_ph - 1, 0))
+                    already = valid & (provable_hashes[clamped] == h)
+                    h = h[~already]
+                    if h.numel() == 0:
+                        continue
+                new_hashes_list.append(h)
 
-            if result is None:
-                continue
-
-            h = _csr_to_hashes(result, desc.head_pred, E, E2)
-            if h is None:
-                continue
-
-            if n_ph > 0:
-                pos = torch.searchsorted(provable_hashes, h)
+            if not new_hashes_list:
+                break
+            all_new = torch.unique(torch.cat(new_hashes_list))
+            if provable_hashes.numel() > 0:
+                n_ph = provable_hashes.shape[0]
+                pos = torch.searchsorted(provable_hashes, all_new)
                 valid = pos < n_ph
                 clamped = torch.clamp(pos, 0, max(n_ph - 1, 0))
-                already = valid & (provable_hashes[clamped] == h)
-                h = h[~already]
-                if h.numel() == 0:
-                    continue
-
-            new_hashes_list.append(h)
-
-        if not new_hashes_list:
-            break
-
-        all_new = torch.unique(torch.cat(new_hashes_list))
-
-        if provable_hashes.numel() > 0:
-            n_ph = provable_hashes.shape[0]
-            pos = torch.searchsorted(provable_hashes, all_new)
-            valid = pos < n_ph
-            clamped = torch.clamp(pos, 0, max(n_ph - 1, 0))
-            already = valid & (provable_hashes[clamped] == all_new)
-            added = all_new[~already]
-        else:
-            added = all_new
-
-        if added.numel() == 0:
-            break
-
-        provable_hashes = _sorted_merge(provable_hashes, added)
-
-        # Build delta sparse matrices for body1 predicates only (the
-        # only ones the next step actually reads from).
-        delta_mats.clear()
-        delta_mats_T.clear()
-        starts = torch.searchsorted(added, pred_boundaries[:-1])
-        ends = torch.searchsorted(added, pred_boundaries[1:])
-
-        for p in body1_preds:
-            s = int(starts[p].item())
-            e = int(ends[p].item())
-            if s >= e:
-                continue
-            new_local = added[s:e] - p * E2
-            if p in needs_delta_T:
-                delta_mats[p], delta_mats_T[p] = _build_csr_and_transpose(
-                    new_local, E)
+                already = valid & (provable_hashes[clamped] == all_new)
+                added = all_new[~already]
             else:
-                delta_mats[p] = _build_csr_from_local_hashes(new_local, E)
+                added = all_new
+            if added.numel() == 0:
+                break
+            provable_hashes = _sorted_merge(provable_hashes, added)
 
-        if verbose:
-            print(f"    [SpMM] step {step}: +{added.numel()} atoms "
-                  f"(total {provable_hashes.numel()})")
+            delta_mats.clear()
+            delta_mats_T.clear()
+            starts = torch.searchsorted(added, pred_boundaries[:-1])
+            ends = torch.searchsorted(added, pred_boundaries[1:])
+            for p in body1_preds:
+                s = int(starts[p].item())
+                e = int(ends[p].item())
+                if s >= e:
+                    continue
+                new_local = added[s:e] - p * E2
+                if p in needs_T:
+                    delta_mats[p], delta_mats_T[p] = \
+                        _build_csr_and_transpose(new_local, E)
+                else:
+                    delta_mats[p] = _build_csr_from_local_hashes(
+                        new_local, E)
+            if verbose:
+                print(f"    [SpMM] step {step}: +{added.numel()} atoms "
+                      f"(total {provable_hashes.numel()})")
 
     n_provable = int(provable_hashes.numel())
     elapsed = time.time() - t0

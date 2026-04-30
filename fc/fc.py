@@ -1181,14 +1181,15 @@ def run_forward_chaining(
         n_provable: Number of provable atoms (0 if none).
     """
     if method == "spmm":
-        # SpMM doesn't support num_body >= 3 — auto-fallback so callers
-        # don't have to know which rule sets are 3-body.
+        # SpMM supports 1-body, 2-body, and 3-body chain rules.
+        # 4+ body rules in the rule set are UNSUPPORTED and silently
+        # skipped — fall back to staged for those if you need them.
         from grounder.fc.spmm import run_forward_chaining_spmm
-        if not any(getattr(cr, "num_body", 0) >= 3 for cr in compiled_rules):
+        if not any(getattr(cr, "num_body", 0) >= 4 for cr in compiled_rules):
             return run_forward_chaining_spmm(
                 compiled_rules, facts_idx, num_entities, num_predicates,
                 depth=depth, device=device)
-        # Fall through to staged for 3-body rule sets.
+        # Fall through to staged for 4+ body rule sets.
 
     fc = FCDynamic(compiled_rules, facts_idx, num_entities, num_predicates,
                    device,
