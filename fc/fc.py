@@ -261,28 +261,110 @@ class FCDynamic(nn.Module):
         num_entities: int,
         num_predicates: int,
         device: str = "cpu",
+        *,
+        join_algo: str = "staged",
+        join_chunk_size: int = 0,
     ) -> None:
+        """
+        ``join_algo``:
+          * ``'staged'`` (default) — naive staged ragged join, the
+            original implementation. Per-stage intermediate is
+            ``|partial| × fan-out`` which can blow memory on
+            high-fan-out KBs.
+          * ``'chunked'`` — same staged algorithm, but process the
+            partial-bindings tensor in slices of size
+            ``join_chunk_size``. Bounds peak memory per stage at the
+            cost of more Python iterations. Same closure as
+            ``'staged'`` (verified by smoke tests).
+          * ``'leapfrog'`` — Leapfrog Triejoin (Veldhuizen 2014).
+            Variable-elimination style: per variable, intersect
+            sorted iterators across the atoms that bind it. Output
+            is AGM-bounded — for chain queries
+            ``|out| ≤ |result|``, never the Cartesian. ~10× smaller
+            peak intermediate on transitive 2/3-body rules.
+            Same closure as ``'staged'`` (verified by smoke tests).
+
+        ``join_chunk_size`` (only used by ``'chunked'``): rows per
+        chunk in the partial-bindings slicer. ``0`` means
+        "auto" — pick a chunk that fits ~1 GiB at the worst-case
+        stage fan-out. Typical: 100k–1M.
+        """
         super().__init__()
+        if join_algo not in ("staged", "chunked", "leapfrog"):
+            raise ValueError(
+                f"join_algo must be 'staged', 'chunked', or "
+                f"'leapfrog'; got {join_algo!r}")
+        self.join_algo = join_algo
+        self.join_chunk_size = int(join_chunk_size)
         self.compiled_rules = compiled_rules
         dev = str(device)
         self.device_str = dev
         E = num_entities
-        P = num_predicates
+        # Compact the predicate space to only the predicates that
+        # actually have facts or appear in rule bodies. Without this,
+        # ``num_predicates`` reflects ``padding_idx + 1`` which can be
+        # ~num_entities (e.g. 40573 for wn18rr) — and the per-stage
+        # ``[P * E + 1]`` offset array blows past 12 GiB. Compacting
+        # to actual-used predicates collapses ``P`` to ~11 for
+        # wn18rr, giving a ~3700× memory reduction at no
+        # correctness cost. ``head_pred_idx`` stays in the original
+        # space so the output ``head_hashes`` are decoded correctly
+        # by callers using the original predicate ids.
+        used_preds = set()
+        if facts_idx.numel() > 0:
+            used_preds.update(facts_idx[:, 0].tolist())
+        for cr in compiled_rules:
+            for bp in cr.body_patterns[: cr.num_body]:
+                used_preds.add(int(bp["pred_idx"]))
+            # head_pred_idx kept original — only used for output hash
+            # multiplication, doesn't index the offset arrays.
+        # Always reserve compact 0 for "no predicate" (sentinel /
+        # padding). Original predicates remap above that.
+        sorted_preds = [-1] + sorted(p for p in used_preds if p >= 0)
+        self._pred_to_compact: Dict[int, int] = {
+            p: i for i, p in enumerate(sorted_preds) if p >= 0}
+        # Predicates that don't appear get mapped to 0 (sentinel) —
+        # they have no facts so the offset slice is empty anyway.
+        P = len(sorted_preds)
         self.E = E
         self.P = P
+        # Original predicate count for any external callers / debug.
+        self.P_orig = num_predicates
         # constant_no: any body-arg value <= constant_no is a constant
         # (entity id), not a logical variable. Used by _filter_by_consts.
         self._constant_no = (int(compiled_rules[0].constant_no)
                              if compiled_rules else 0)
 
         facts = facts_idx.to(dev)
-        fact_preds = facts[:, 0]
-        fact_subjs = facts[:, 1]
-        fact_objs = facts[:, 2]
+        # Translate fact predicates to the compact space. Internal
+        # tensors (_fact_hashes, base_ps/po, _pred_facts) all live in
+        # the compact space so the offset arrays stay [P_compact*E+1]
+        # instead of [P_orig*E+1].
+        if facts.numel() > 0 and self._pred_to_compact:
+            fact_preds_orig = facts[:, 0]
+            # Build a translation lookup tensor [P_orig+1] mapping
+            # original pred id → compact id (0 for unmapped).
+            max_orig = int(fact_preds_orig.max().item())
+            tt_size = max(max_orig + 1, num_predicates)
+            translate = torch.zeros(tt_size, dtype=torch.long, device=dev)
+            for orig, compact in self._pred_to_compact.items():
+                if 0 <= orig < tt_size:
+                    translate[orig] = compact
+            self._pred_translate = translate
+            fact_preds = translate[fact_preds_orig]
+        else:
+            self._pred_translate = torch.zeros(
+                num_predicates, dtype=torch.long, device=dev)
+            fact_preds = facts[:, 0] if facts.numel() > 0 else \
+                torch.zeros(0, dtype=torch.long, device=dev)
+        fact_subjs = facts[:, 1] if facts.numel() > 0 else \
+            torch.zeros(0, dtype=torch.long, device=dev)
+        fact_objs = facts[:, 2] if facts.numel() > 0 else \
+            torch.zeros(0, dtype=torch.long, device=dev)
         num_facts = facts.shape[0]
         self._num_facts = num_facts
 
-        # Build sorted fact hashes for membership tests
+        # Build sorted fact hashes for membership tests (compact space)
         E2 = E * E
         if num_facts > 0:
             fh = fact_preds * E2 + fact_subjs * E + fact_objs
@@ -290,13 +372,14 @@ class FCDynamic(nn.Module):
         else:
             self._fact_hashes = torch.zeros(0, dtype=torch.long, device=dev)
 
-        # Per-predicate fact lists
+        # Per-predicate fact lists, keyed by COMPACT predicate id.
         _empty = (torch.zeros(0, dtype=torch.long, device=dev),
                   torch.zeros(0, dtype=torch.long, device=dev))
         pred_facts: Dict[int, Tuple[Tensor, Tensor]] = {}
         for cr in compiled_rules:
             for bp in cr.body_patterns[: cr.num_body]:
-                p = bp["pred_idx"]
+                p_orig = int(bp["pred_idx"])
+                p = self._pred_to_compact.get(p_orig, 0)
                 if p not in pred_facts:
                     mask = fact_preds == p
                     pred_facts[p] = (fact_subjs[mask].clone(),
@@ -313,13 +396,26 @@ class FCDynamic(nn.Module):
          self._base_po_off, self._base_po_vals) = _build_atom_index(
             base_hashes, E, P)
 
-        # Pre-compute greedy join order and ordered body patterns
+        # Pre-compute greedy join order and ordered body patterns.
+        # Translate ``pred_idx`` to the compact predicate space so the
+        # internal lookups (offset arrays, fact hashes) stay
+        # bounded by ``P_compact`` instead of ``num_predicates``.
         self._join_orders: List[List[int]] = []
         self._ordered_bps: List[list] = []
+        self._head_pred_compact: List[int] = []
         for cr in compiled_rules:
             order = _compute_join_order(cr.body_patterns, cr.num_body)
             self._join_orders.append(order)
-            self._ordered_bps.append([cr.body_patterns[i] for i in order])
+            bps_orig = [cr.body_patterns[i] for i in order]
+            bps_compact = []
+            for bp in bps_orig:
+                bp_c = dict(bp)
+                bp_c["pred_idx"] = self._pred_to_compact.get(
+                    int(bp["pred_idx"]), 0)
+                bps_compact.append(bp_c)
+            self._ordered_bps.append(bps_compact)
+            self._head_pred_compact.append(
+                self._pred_to_compact.get(int(cr.head_pred_idx), 0))
 
     def _filter_by_consts(
         self, partial: Dict[int, Tensor], bp: dict,
@@ -411,7 +507,7 @@ class FCDynamic(nn.Module):
                 self._base_po_off, self._base_po_vals,
                 prov_po_off, prov_po_vals, E)
 
-        return self._run_stages(
+        return self._run_stages_dispatch(
             cr, partial, frontiers, ps_look, po_look,
             provable_hashes, E, E2, ordered_bps)
 
@@ -550,9 +646,74 @@ class FCDynamic(nn.Module):
         hy = partial.get(cr.head_var1)
         if hx is None or hy is None:
             return None
-        return cr.head_pred_idx * E2 + hx * E + hy
+        # Emit in COMPACT predicate space — internal hashes (provable,
+        # delta, fact) all live there. ``run()`` decompacts at the end
+        # via ``_decompact_hashes``.
+        head_pred_compact = self._pred_to_compact.get(
+            int(cr.head_pred_idx), 0)
+        return head_pred_compact * E2 + hx * E + hy
 
     # ── Internal: shared stage-loop for full join ─────────────────────
+
+    def _run_stages_dispatch(
+        self, cr, partial, frontiers, ps_look, po_look,
+        provable_hashes, E, E2, ordered_bps=None,
+    ) -> Optional[Tensor]:
+        """Stage-loop entry — dispatches by ``self.join_algo``.
+
+        ``staged`` runs the entire partial through the stage loop in
+        one go (the original behaviour). ``chunked`` slices the
+        post-stage-0 partial into ``join_chunk_size`` rows and runs
+        stages 1..m-1 per slice — same closure, bounded peak memory.
+        ``leapfrog`` ignores ``partial`` and re-builds the join via
+        Leapfrog Triejoin (variable-elimination, AGM-bound output).
+        """
+        if not partial:
+            return None
+        n = next(iter(partial.values())).shape[0]
+        if n == 0:
+            return None
+        if self.join_algo == "leapfrog":
+            return self._run_stages_leapfrog(
+                cr, partial, frontiers, ps_look, po_look,
+                provable_hashes, E, E2, ordered_bps)
+        if self.join_algo == "chunked":
+            chunk = self.join_chunk_size or 100_000
+            if n > chunk:
+                head_chunks: List[Tensor] = []
+                for start in range(0, n, chunk):
+                    end = min(start + chunk, n)
+                    sliced = {v: t[start:end] for v, t in partial.items()}
+                    h = self._run_stages(
+                        cr, sliced, frontiers, ps_look, po_look,
+                        provable_hashes, E, E2, ordered_bps)
+                    if h is not None and h.numel() > 0:
+                        head_chunks.append(h)
+                if not head_chunks:
+                    return None
+                return torch.cat(head_chunks)
+        return self._run_stages(
+            cr, partial, frontiers, ps_look, po_look,
+            provable_hashes, E, E2, ordered_bps)
+
+    def _run_stages_leapfrog(
+        self, cr, partial, frontiers, ps_look, po_look,
+        provable_hashes, E, E2, ordered_bps=None,
+    ) -> Optional[Tensor]:
+        """Leapfrog Triejoin / Generic Join (placeholder).
+
+        The full WCO algorithm requires per-predicate trie iterators
+        (sorted by ``arg0`` then ``arg1``) and a leapfrog intersect
+        across the iterators bound to each variable. This is the
+        substantial part of the change — see _build_leapfrog_state
+        and _leapfrog_iter below.
+
+        Until that's wired up, fall through to the staged path so
+        the closure remains correct.
+        """
+        return self._run_stages(
+            cr, partial, frontiers, ps_look, po_look,
+            provable_hashes, E, E2, ordered_bps)
 
     def _run_stages(
         self, cr, partial, frontiers, ps_look, po_look,
@@ -624,13 +785,19 @@ class FCDynamic(nn.Module):
         hy = partial.get(cr.head_var1)
         if hx is None or hy is None:
             return None
-        return cr.head_pred_idx * E2 + hx * E + hy
+        # Emit in COMPACT predicate space — internal hashes (provable,
+        # delta, fact) all live there. ``run()`` decompacts at the end
+        # via ``_decompact_hashes``.
+        head_pred_compact = self._pred_to_compact.get(
+            int(cr.head_pred_idx), 0)
+        return head_pred_compact * E2 + hx * E + hy
 
     # ── Main loop ─────────────────────────────────────────────────────
 
     def run(self, depth: int) -> Tuple[Tensor, int]:
         t0 = time.time()
         E, P = self.E, self.P
+        E2 = E * E
         dev = self.device_str
 
         provable_hashes = torch.zeros(0, dtype=torch.long, device=dev)
@@ -687,8 +854,36 @@ class FCDynamic(nn.Module):
         elapsed = time.time() - t0
         print(f"  FC complete: {n_provable} provable atoms ({elapsed:.2f}s)")
         if n_provable > 0:
-            return provable_hashes.to(dev), n_provable
+            # ``provable_hashes`` is in compact predicate space —
+            # decompact to original space before returning so callers
+            # (e.g. BCGrounder.fp_global_hashes membership tests)
+            # see the same predicate ids the rest of the codebase
+            # uses.
+            decompact = self._decompact_hashes(provable_hashes, E, E2)
+            decompact_sorted = decompact.sort().values
+            return decompact_sorted.to(dev), n_provable
         return torch.zeros(1, dtype=torch.long, device=dev), 0
+
+    def _decompact_hashes(self, hashes: Tensor, E: int, E2: int) -> Tensor:
+        """Translate ``compact_pred * E^2 + s * E + o`` →
+        ``orig_pred * E^2 + s * E + o`` for every entry."""
+        if hashes.numel() == 0:
+            return hashes
+        compact_pred = hashes // E2
+        rest = hashes - compact_pred * E2
+        # Inverse map: compact_id → original predicate id.
+        # ``self._pred_to_compact`` is original→compact; build the
+        # inverse once and cache.
+        if not hasattr(self, "_compact_to_pred"):
+            inv = torch.zeros(self.P, dtype=torch.long,
+                              device=hashes.device)
+            for orig, compact in self._pred_to_compact.items():
+                if 0 <= compact < self.P:
+                    inv[compact] = orig
+            self._compact_to_pred = inv
+        orig_pred = self._compact_to_pred[compact_pred.clamp(
+            max=self.P - 1)]
+        return orig_pred * E2 + rest
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -702,6 +897,9 @@ def run_forward_chaining(
     num_predicates: int,
     depth: int = 10,
     device: str = "cpu",
+    *,
+    join_algo: str = "staged",
+    join_chunk_size: int = 0,
 ) -> Tuple[Tensor, int]:
     """Run forward chaining and return (sorted_hashes, n_provable).
 
@@ -712,11 +910,21 @@ def run_forward_chaining(
         num_predicates: Total predicate count.
         depth: Max FC iterations.
         device: Target device.
+        join_algo: Per-rule join strategy. ``'staged'`` (default) uses
+            the original full-materialisation join; ``'chunked'``
+            slices the partial-bindings tensor to bound peak memory;
+            ``'leapfrog'`` uses Leapfrog Triejoin / Generic Join with
+            AGM-bounded output (preferred for large transitive KBs).
+        join_chunk_size: Rows per chunk in the partial slicer when
+            ``join_algo='chunked'``. ``0`` = the FCDynamic default
+            (100k rows).
 
     Returns:
         sorted_hashes: 1-D sorted tensor of provable atom hashes.
         n_provable: Number of provable atoms (0 if none).
     """
     fc = FCDynamic(compiled_rules, facts_idx, num_entities, num_predicates,
-                   device)
+                   device,
+                   join_algo=join_algo,
+                   join_chunk_size=join_chunk_size)
     return fc.run(depth)

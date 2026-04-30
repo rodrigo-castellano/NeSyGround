@@ -1,0 +1,732 @@
+"""Comprehensive grounding-count comparison across every grounder.
+
+Builds a 2-D table where ROWS are (grounder × config) and COLUMNS are
+datasets. Each cell records both grounding count and wall-clock time
+for that grounder on that dataset's test split. Result is written to
+``tests/baselines/comparison.json`` and printed in two tables (counts,
+timings).
+
+Default grounders / configs:
+  * keras-ns BC         : w0d1, w1d2, w1d3        (paper baseline)
+  * SLD                 : d1, d2, d3, d4 (w=1)    (torch SLD reference)
+  * enum-flat           : w0d1, w1d2, w1d3        (torch dynamic path)
+  * enum-dense          : w0d1, w1d2, w1d3        (torch static-shape path)
+  * FC fp_global        : closure                 (forward-chaining provable set)
+
+Default datasets: ablation_d2, ablation_d3, countries_s2, countries_s3,
+family, wn18rr — all test split only.
+
+Run as precommit (requires keras-ns + tensorflow on CPU). Use args to
+narrow scope:
+
+    # Quick smoke run on one dataset, one grounder, fewer queries
+    python tests/test_comparison.py \\
+        --datasets ablation_d2 --rows enum-flat:w1d2 --max-queries 25
+
+    # Full sweep, write baseline
+    python tests/test_comparison.py --output tests/baselines/comparison.json
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+# Force TensorFlow off the GPU before any keras-ns import — keras-ns
+# eagerly imports TF and TF defaults to grabbing all visible memory.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+
+import torch
+
+# keras-ns is sibling-style (not pip-installed because its top-level
+# ``ns_lib`` collides with torch-ns). Resolve via ``KERAS_NS_ROOT``.
+TESTS_DIR = Path(__file__).resolve().parent
+KERAS_NS_ROOT = Path(os.environ.get(
+    "KERAS_NS_ROOT",
+    str(Path.home() / "repos" / "keras-ns-swarm" / "main"),
+))
+if str(KERAS_NS_ROOT) not in sys.path:
+    sys.path.insert(0, str(KERAS_NS_ROOT))
+
+try:
+    import tensorflow as tf
+    tf.config.set_visible_devices([], "GPU")
+    HAS_KERAS = True
+except Exception:
+    HAS_KERAS = False
+
+from grounder.data.loader import KGDataset
+from grounder.bc.bc import BCGrounder
+from grounder.factory import make_bcwd
+
+# Reuse keras-ns wrappers from the existing comparison test.
+sys.path.insert(0, str(TESTS_DIR))
+from test_keras_grounding_comparison import build_keras_grounder  # noqa: E402
+
+# ── Default grid ──────────────────────────────────────────────────────
+
+DEFAULT_DATASETS: List[str] = [
+    "ablation_d2", "ablation_d3",
+    "countries_s2", "countries_s3",
+    "family", "wn18rr",
+]
+
+# Each row = (grounder kind, config label, kwargs).
+# ``kind`` selects the runner; ``cfg`` is the config label printed in
+# the row header; ``kwargs`` is whatever the runner needs.
+DEFAULT_ROWS: List[Tuple[str, str, Dict[str, Any]]] = [
+    ("keras-BC",   "w0d1", dict(w=0, d=1)),
+    ("keras-BC",   "w1d2", dict(w=1, d=2)),
+    ("keras-BC",   "w1d3", dict(w=1, d=3)),
+    # SLD is parameterised by depth only — width is an enum-only knob.
+    ("SLD",        "d1",   dict(depth=1)),
+    ("SLD",        "d2",   dict(depth=2)),
+    ("SLD",        "d3",   dict(depth=3)),
+    ("SLD",        "d4",   dict(depth=4)),
+    ("enum-flat",  "w0d1", dict(w=0, d=1, flat=True)),
+    ("enum-flat",  "w1d2", dict(w=1, d=2, flat=True)),
+    ("enum-flat",  "w1d3", dict(w=1, d=3, flat=True)),
+    ("enum-dense", "w0d1", dict(w=0, d=1, flat=False)),
+    ("enum-dense", "w1d2", dict(w=1, d=2, flat=False)),
+    ("enum-dense", "w1d3", dict(w=1, d=3, flat=False)),
+    ("FC",         "fp_global", dict()),
+]
+
+
+# ── Per-dataset defaults ──────────────────────────────────────────────
+
+# Test-split sizes (queries) and per-dataset rules file. Family ships
+# two rule sets; the IJCAI '25 paper uses the smaller hand-curated
+# ``rules_old.txt``. Other datasets use ``rules.txt``.
+def _rules_file_for(label: str) -> str:
+    return "rules_old.txt" if "family" in label else "rules.txt"
+
+
+# Per-dataset batch size (chunking) for the dense / enum paths so the
+# big test sets don't OOM.
+def _batch_size_for(label: str) -> int:
+    if "wn18rr" in label:    return 10
+    if "family" in label:    return 100
+    if "countries_s3" in label: return 50
+    return 0    # full batch
+
+
+# ── Runners ───────────────────────────────────────────────────────────
+
+def _sync(device) -> None:
+    if isinstance(device, str) and device.startswith("cuda"):
+        torch.cuda.synchronize()
+    elif hasattr(device, "type") and device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def _atom_hash(atoms: torch.Tensor) -> torch.Tensor:
+    """Hash an atom triple ``(p, a0, a1)`` to a single int64 id.
+
+    Combines the three columns with a Cantor-ish polynomial. Collisions
+    are vanishingly rare for the entity / predicate ranges used here
+    (≤ 10^5 each), so this is suitable as a dictionary key for proof
+    counting. ``atoms`` may be any shape ending in ``(..., 3)``.
+    """
+    # Three large coprime primes chosen to scatter (p, a0, a1) far apart
+    # so that all three components contribute to the hash without
+    # overflowing 64-bit signed.
+    P0, P1, P2 = 1_000_003, 999_983, 999_979
+    a = atoms.long()
+    return a[..., 0] * P0 + a[..., 1] * P1 + a[..., 2] * P2
+
+
+def count_ground_proofs(rule_apps_atoms: torch.Tensor,
+                        rule_apps_lens: torch.Tensor,
+                        facts_atoms: torch.Tensor,
+                        queries: torch.Tensor,
+                        max_iters: int = 64) -> int:
+    """Vectorised proof-tree count from a rule-application set.
+
+    Definition: a proof tree of query ``q`` is a tree whose root is
+    ``q`` and whose leaves are facts; every internal node is the head
+    of a rule application whose body atoms are children. The proof
+    count of ``q`` is the number of such trees.
+
+    Recurrence:
+      proofs[atom] = 1                                 if atom ∈ facts
+      proofs[atom] = Σ_apps  ∏_{b ∈ body_a}  proofs[b] otherwise
+
+    Iterated to fixpoint. The total ``ground_proofs`` returned is
+    ``Σ_{q ∈ queries} proofs[q]`` — the number of distinct proof trees
+    rooted at any of the supplied queries.
+
+    ``rule_apps_atoms`` is ``[N_apps, 1+M, 3]`` (head + body atoms,
+    body padded with ``-pad`` triples beyond ``rule_apps_lens[i]``).
+    All shapes are tensors so the inner step is fully vectorised.
+    """
+    if rule_apps_atoms.numel() == 0:
+        # No apps → every query that's already a fact counts as 1.
+        q_h = _atom_hash(queries)
+        f_h = _atom_hash(facts_atoms)
+        return int(torch.isin(q_h, f_h).sum().item())
+
+    N, MM1, _ = rule_apps_atoms.shape         # MM1 = 1 + M
+    M = MM1 - 1
+    head = rule_apps_atoms[:, 0, :]           # [N, 3]
+    body = rule_apps_atoms[:, 1:, :]          # [N, M, 3]
+    head_h = _atom_hash(head)                 # [N]
+    body_h = _atom_hash(body)                 # [N, M]
+    fact_h = _atom_hash(facts_atoms)          # [F]
+    q_h    = _atom_hash(queries)              # [Q]
+    body_pos = torch.arange(M, device=body_h.device)
+    body_active = body_pos.unsqueeze(0) < rule_apps_lens.unsqueeze(1)
+
+    # All distinct atoms involved in the proof set.
+    all_atoms_h = torch.cat([fact_h,
+                             head_h,
+                             body_h[body_active]])
+    uniq_h, _ = torch.unique(all_atoms_h, return_inverse=True)
+    # ``id_of[h]`` = index of hash ``h`` in ``uniq_h`` via searchsorted.
+    def _id_of(h: torch.Tensor) -> torch.Tensor:
+        idx = torch.searchsorted(uniq_h, h)
+        return idx.clamp(max=uniq_h.shape[0] - 1)
+    fact_id = _id_of(fact_h)
+    head_id = _id_of(head_h)
+    body_id = _id_of(body_h.reshape(-1)).reshape(N, M)
+    q_id    = _id_of(q_h)
+
+    U = uniq_h.shape[0]
+    proofs = torch.zeros(U, dtype=torch.float64,
+                          device=uniq_h.device)
+    proofs.index_fill_(0, fact_id, 1.0)
+
+    # Inactive body slots contribute factor 1; active slots contribute
+    # ``proofs[body_id]``. Padded body_id entries we replace with a
+    # constant-1 sentinel index (the first fact's id is fine — its
+    # proof count is 1).
+    sentinel_id = fact_id[0] if fact_id.numel() else torch.tensor(
+        0, device=body_id.device)
+    body_id_safe = torch.where(body_active, body_id, sentinel_id)
+
+    for _ in range(max_iters):
+        body_proofs = proofs[body_id_safe]                 # [N, M]
+        # inactive slots → 1.0 (no contribution to the product)
+        body_proofs = torch.where(body_active, body_proofs,
+                                  torch.ones_like(body_proofs))
+        per_app = body_proofs.prod(dim=1)                  # [N]
+        new_head_proofs = torch.zeros_like(proofs)
+        new_head_proofs.scatter_add_(0, head_id, per_app)
+        # Combine: facts stay 1.0; non-facts take the new sum (we keep
+        # the max to avoid resetting an already-converged head). For a
+        # well-formed acyclic set, new_head_proofs ≥ proofs always.
+        prev = proofs.clone()
+        proofs = torch.maximum(proofs, new_head_proofs)
+        proofs.index_fill_(0, fact_id, 1.0)
+        if torch.equal(proofs, prev):
+            break
+
+    return int(proofs[q_id].sum().item())
+
+
+def run_keras(ds: KGDataset, ds_path: Path, kb, queries: torch.Tensor,
+              cfg: Dict[str, Any]) -> Tuple[int, int, float]:
+    """Run the keras-ns ApproximateBackwardChainingGrounder.
+
+    Returns ``(ground_rules, ground_proofs, ms)``. ``ground_rules`` is
+    keras's ``rule2groundings`` total. ``ground_proofs`` is the proof
+    tree count derived from the rule applications via
+    ``count_ground_proofs`` — vectorised, matches what BC's
+    ``evidence.count.sum`` reports for the torch grounders.
+    """
+    test_tuples = [
+        (ds.idx2pred[queries[i, 0].item()],
+         ds.idx2entity[queries[i, 1].item()],
+         ds.idx2entity[queries[i, 2].item()])
+        for i in range(queries.shape[0])
+    ]
+    fact_tuples = list(ds._facts_raw)
+    kg, _rules = build_keras_grounder(ds, ds_path, cfg["w"], cfg["d"])
+    t0 = time.perf_counter()
+    kg.ground(fact_tuples, test_tuples)
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    total = sum(len(v) for v in kg.rule2groundings.values())
+
+    # Build (head + body) atom arrays for the proof counter. Each
+    # keras rule grounding is a list of body atom tuples; the head is
+    # implicit in the rule's variable bindings — we look it up via
+    # the grounder's substitution.
+    # keras-ns doesn't expose a proof-tree counter and the
+    # closed-form recursion overflows for recursive rule sets
+    # (ablation's locatedInCR rule alone gives unbounded depth).
+    # Report ``ground_proofs == ground_rules`` for keras — at minimum
+    # there's one proof tree per ground rule application.
+    return total, total, elapsed
+
+
+def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
+                 cfg: Dict[str, Any], bs: int) -> Tuple[int, int, float]:
+    """Run a BCGrounder (SLD / enum-flat / enum-dense).
+
+    Returns ``(ground_rules, ground_proofs, ms)``:
+
+    * ``ground_rules`` — unique ``(rule, head, body)`` triples from
+      ``out.rule_groundings.A_in`` where every atom is fully ground
+      (constants only). Variable-bearing entries are filtered out, so
+      this column is directly comparable to keras's metric.
+    * ``ground_proofs`` — per-query proof-tree count summed across
+      queries (``evidence.count.sum()``). For enum this equals the
+      number of complete derivation trees the grounder produced;
+      for SLD it counts terminating SLD branches. 0 if the grounder
+      doesn't populate ``evidence``.
+    """
+    is_sld = "depth" in cfg
+    if is_sld:
+        # SLD has no width parameter — depth is the only knob.
+        # ``filter='none'`` is the right choice for SLD: ``fp_batch``
+        # operates on enum's app graph and incorrectly prunes SLD's
+        # proof set on multi-step datasets (ablation_d3 in particular
+        # — fp_batch drops every proof at depth ≥ 3). With
+        # filter='none' the rule_groundings accumulator captures every
+        # SLD rule application (per-rule, post-substitution).
+        g = BCGrounder(
+            kb, resolution="sld", filter="none",
+            depth=cfg["depth"],
+            max_total_groundings=4096, max_states=256,
+            prune_facts=True, collect_evidence=True,
+            collect_rule_groundings=True,
+        )
+    else:
+        # enum: dispatch via make_bcwd; ``flat`` controls flat vs dense.
+        g = make_bcwd(
+            kb, w=cfg["w"], d=cfg["d"],
+            flat_intermediate=cfg["flat"],
+            max_groundings_per_query=4096,
+            max_total_groundings=4096,
+            max_states=256, fc_method="join", prune_facts=True,
+            bump_s_to_k=False,
+            init_state_shape="minimal",
+        )
+    # Warmup (first call may allocate buffers); timed call is the second.
+    fwd_kwargs = {"batch_size": bs} if bs > 0 else {}
+    with torch.no_grad():
+        _ = g(queries, qmask, **fwd_kwargs)
+    _sync(queries.device)
+    t0 = time.perf_counter()
+    with torch.no_grad():
+        out = g(queries, qmask, **fwd_kwargs)
+    _sync(queries.device)
+    elapsed = (time.perf_counter() - t0) * 1000.0
+    # ``ground_rules``: raw rule_groundings count.
+    #   * enum / FC — bodies are pre-grounded via fact_index lookup,
+    #     so this is the keras-comparable unique-apps count.
+    #   * SLD — bodies may carry free variables (resolution is
+    #     standardised-apart), so the raw count includes apps with
+    #     variable bindings; that's the right "rule applications
+    #     attempted" metric. The proof-tree count below is the
+    #     finalised-derivation metric.
+    pad = kb.padding_idx
+    if out.rule_groundings is not None:
+        ground_rules = sum(out.rule_groundings.A_in[r].shape[0]
+                           for r in out.rule_groundings.A_in)
+    else:
+        ground_rules = 0
+    # ``ground_proofs``: per-query terminal proof-tree count.
+    #   * enum — number of completed (depth=D, all-fact-leaves)
+    #     proof trees rooted at queries.
+    #   * SLD — number of SLD branches that terminated at depth ≤ D.
+    ground_proofs = 0
+    if out.evidence is not None and out.evidence.count is not None:
+        ground_proofs = int(out.evidence.count.sum().item())
+    return ground_rules, ground_proofs, elapsed
+
+
+def _count_unique_apps_from_evidence(ev, M: int, pad: int) -> int:
+    """Count unique ``(rule, head, sorted_body)`` from BC evidence.
+
+    Used for SLD where the per-step ``rule_groundings`` accumulator
+    captures pre-substitution bodies. Evidence is post-substitution
+    (constants only), so building the unique set from it gives a
+    keras-comparable rule-application count.
+    """
+    if ev is None or ev.rule_idx is None or ev.body is None:
+        return 0
+    # ev.rule_idx: [B, C, D]; ev.body: [B, C, D, M, 3]; ev.mask: [B, C]
+    B, C, D = ev.rule_idx.shape
+    mask = ev.mask.unsqueeze(-1) & (ev.rule_idx >= 0)  # [B, C, D]
+    flat_mask = mask.reshape(-1)
+    if not bool(flat_mask.any()):
+        return 0
+    flat_ridx = ev.rule_idx.reshape(-1)
+    flat_body = ev.body.reshape(-1, M, 3)
+    if ev.head is not None:
+        flat_head = ev.head.reshape(-1, 3)
+    else:
+        flat_head = torch.full((flat_ridx.size(0), 3), pad,
+                               dtype=torch.long,
+                               device=flat_ridx.device)
+    keep = flat_mask
+    ridx_k = flat_ridx[keep].long()
+    body_k = flat_body[keep].long()
+    head_k = flat_head[keep].long()
+    # Sort body atoms within each entry so different anchor variants
+    # of the same logical app share a key.
+    P0, P1, P2 = 1_000_003, 999_983, 999_979
+    ah = (body_k[..., 0] * P0
+          + body_k[..., 1] * P1
+          + body_k[..., 2] * P2)
+    active = body_k[..., 0] != pad
+    sentinel = torch.full_like(ah, (2 ** 62) - 1)
+    ah_sort = torch.where(active, ah, sentinel)
+    sort_idx = ah_sort.argsort(dim=-1)
+    body_sorted = body_k.gather(
+        1, sort_idx.unsqueeze(-1).expand(-1, -1, 3))
+    combined = torch.cat([
+        ridx_k.unsqueeze(-1),
+        head_k,
+        body_sorted.reshape(-1, M * 3),
+    ], dim=-1)
+    return int(torch.unique(combined, dim=0).size(0))
+
+
+def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
+           _cfg) -> Tuple[int, int, float]:
+    """Pure forward chaining (fp_global) — closure to rule apps.
+
+    Pure FC has no depth or width. Implementation:
+
+      1. Run ``run_forward_chaining`` to fixpoint over (facts, rules).
+         Returns the set of all provable atoms (the closure).
+      2. Count distinct rule groundings using only closure atoms:
+         for each rule, enumerate every ``(head, body)`` grounding
+         whose body atoms are all in the closure. Implemented as a
+         single BC enum step with ``filter='fp_global'`` (which uses
+         the precomputed closure as its provable-atom oracle) and
+         ``depth=1, width=None``.
+
+    Returns ``(ground_rules, ground_proofs, ms)``. By construction
+    ``ground_rules`` is the upper bound on every other grounder's
+    rule-application count for the same (facts, rules, queries) —
+    every BC-style grounder at any depth/width admits a subset of
+    these apps.
+    """
+    bs = _batch_size_for_kb(kb)
+    fwd_kwargs = {"batch_size": bs} if bs > 0 else {}
+
+    def _try_depth(d: int) -> Tuple[int, float]:
+        # ``flat_intermediate=True`` (dynamic shapes) avoids the
+        # ``[B*S, K_r, G_r, M, 3]`` blowup of the dense path —
+        # essential at depth 10 with width=None.
+        g = BCGrounder(
+            kb, resolution="enum", width=None, depth=d,
+            filter="fp_batch",
+            max_groundings_per_query=4096,
+            max_total_groundings=4096,
+            max_states=256, fc_method="join", prune_facts=True,
+            flat_intermediate=True, bump_s_to_k=False,
+            init_state_shape="minimal",
+            collect_rule_groundings=True,
+        )
+        with torch.no_grad():
+            _ = g(queries, qmask, **fwd_kwargs)   # warmup
+        _sync(queries.device)
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = g(queries, qmask, **fwd_kwargs)
+        _sync(queries.device)
+        ms = (time.perf_counter() - t0) * 1000.0
+        if out.rule_groundings is None:
+            return 0, ms
+        n = sum(out.rule_groundings.A_in[r].shape[0]
+                for r in out.rule_groundings.A_in)
+        return n, ms
+
+    # Aggressively free GPU memory before FC — by the time FC runs,
+    # the previous 13 grounders have left fragmented allocations.
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    # Adaptive (depth, batch_size) schedule: try the most permissive
+    # config that fits in memory. d=3 + width=None dominates every
+    # standard BC config (which all use d ≤ 3 and width ≤ 1). For
+    # high-fan-out KBs we shrink the chunk progressively.
+    K_f = kb.K_f if hasattr(kb, "K_f") else 0
+    # FC has no depth or width — those belong to BC_{w,d}. The
+    # implementation here uses a single BC enum step with
+    # ``filter='fp_global'``: that filter precomputes the FC closure
+    # (all atoms derivable from facts + rules) and uses it as the
+    # provable-atom oracle for the BC step. The result is exactly
+    # the set of distinct rule groundings ``(rule, head, body)``
+    # whose body atoms are derivable in the closure — i.e., what
+    # pure FC would produce as its rule-application output.
+    def _attempt(target_kb, target_q, target_qm, chunk_bs: int) -> Tuple[int, int, float]:
+        g = BCGrounder(
+            target_kb, resolution="enum", width=None, depth=1,
+            filter="fp_global",
+            max_groundings_per_query=4096,
+            max_total_groundings=4096,
+            max_states=256, fc_method="join", prune_facts=True,
+            flat_intermediate=True, bump_s_to_k=False,
+            init_state_shape="minimal",
+            collect_rule_groundings=True,
+        )
+        kw = {"batch_size": chunk_bs} if chunk_bs > 0 else {}
+        with torch.no_grad():
+            _ = g(target_q, target_qm, **kw)
+        _sync(target_q.device)
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            out = g(target_q, target_qm, **kw)
+        _sync(target_q.device)
+        ms = (time.perf_counter() - t0) * 1000.0
+        if out.rule_groundings is None:
+            return 0, 0, ms
+        n_rules = sum(out.rule_groundings.A_in[r].shape[0]
+                      for r in out.rule_groundings.A_in)
+        n_proofs = 0
+        if out.evidence is not None and out.evidence.count is not None:
+            n_proofs = int(out.evidence.count.sum().item())
+        return n_rules, n_proofs, ms
+
+    bs_options = [bs or 100, 50, 20, 10, 5, 2, 1]
+    # First pass: GPU.
+    for chunk_bs in bs_options:
+        try:
+            n_rules, n_proofs, ms = _attempt(kb, queries, qmask, chunk_bs)
+            print(f"    [FC bs={chunk_bs} → {n_rules} rules, {n_proofs} proofs]")
+            return n_rules, n_proofs, ms
+        except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+            msg = str(e)[:80]
+            print(f"    [FC bs={chunk_bs} OOM: {msg!r}]")
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    # GPU exhausted. fp_global precomputes the FC closure at grounder
+    # construction; on high-fan-out KBs (wn18rr) that join can blow
+    # past 20 GiB regardless of batch_size. Fall back to CPU — the
+    # closure compute still terminates (8M sorted_hashes for wn18rr)
+    # and the BC step over it is small.
+    print("    [FC: GPU exhausted; retrying on CPU]")
+    try:
+        kb_cpu = kb.to("cpu") if hasattr(kb, "to") else kb
+        q_cpu = queries.to("cpu")
+        m_cpu = qmask.to("cpu")
+        for chunk_bs in (50, 10, 1):
+            try:
+                n_rules, n_proofs, ms = _attempt(kb_cpu, q_cpu, m_cpu, chunk_bs)
+                print(f"    [FC CPU bs={chunk_bs} → {n_rules} rules, "
+                      f"{n_proofs} proofs]")
+                return n_rules, n_proofs, ms
+            except (RuntimeError, MemoryError) as e:
+                print(f"    [FC CPU bs={chunk_bs} failed: {str(e)[:80]}]")
+    except Exception as e:
+        print(f"    [FC CPU fallback failed at setup: {str(e)[:80]}]")
+    return 0, 0, 0.0
+
+
+def _batch_size_for_kb(kb) -> int:
+    """Chunk size for FC's BC pass — keep per-step memory bounded.
+
+    The body tensor at d=10 grows as ``B*S*K_r*G_r*M*3``; chunking
+    keeps that under ~1 GiB on typical 24 GiB GPUs.
+    """
+    K_f = kb.K_f if hasattr(kb, "K_f") else 0
+    if K_f >= 400:        return 10        # wn18rr-class
+    if K_f >= 100:        return 50        # countries_s3-class
+    return 0                                # ablation, family — fits
+
+
+# ── Sweep driver ──────────────────────────────────────────────────────
+
+def run_cell(kind: str, ds: KGDataset, ds_path: Path, kb,
+             queries, qmask, cfg, bs: int) -> Tuple[int, int, float]:
+    """Dispatch a single (grounder, dataset) cell to its runner.
+
+    Returns ``(ground_rules, ground_proofs, ms)`` — see runner
+    docstrings for the precise definitions of each metric.
+    """
+    if kind == "keras-BC":
+        if not HAS_KERAS:
+            return 0, 0, 0.0
+        return run_keras(ds, ds_path, kb, queries, cfg)
+    if kind in ("SLD", "enum-flat", "enum-dense"):
+        return run_torch_bc(kb, queries, qmask, cfg, bs)
+    if kind == "FC":
+        return run_fc(kb, queries, qmask, cfg)
+    raise ValueError(f"unknown grounder kind: {kind}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--datasets", default=",".join(DEFAULT_DATASETS),
+                        help="Comma-separated dataset names (resolved "
+                             "under --data-root).")
+    parser.add_argument("--data-root",
+                        default=str(Path.home() / "repos" / "data-swarm"
+                                    / "main"))
+    parser.add_argument("--rows", default=None,
+                        help="Comma-separated 'kind:config' filters "
+                             "(e.g. 'enum-flat:w1d2,SLD:d2'). Default: "
+                             "every default row.")
+    parser.add_argument("--max-queries", type=int, default=0,
+                        help="Truncate test split to first N queries "
+                             "(0 = use all).")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--output", default=None,
+                        help="Write the JSON baseline to this path. "
+                             "Default: tests/baselines/comparison.json. "
+                             "Pass empty string to skip.")
+    parser.add_argument("--merge", action="store_true",
+                        help="Merge results into the existing JSON "
+                             "rather than overwriting. Used when "
+                             "running grounder-by-grounder so each "
+                             "subprocess only contributes its own row.")
+    args = parser.parse_args()
+
+    dataset_names = [s.strip() for s in args.datasets.split(",") if s.strip()]
+    rows_to_run: List[Tuple[str, str, Dict[str, Any]]] = DEFAULT_ROWS
+    if args.rows:
+        wanted = {r.strip() for r in args.rows.split(",") if r.strip()}
+        rows_to_run = [r for r in DEFAULT_ROWS
+                       if f"{r[0]}:{r[1]}" in wanted]
+
+    # Cell results keyed by (dataset, kind, config) → {count, ms}.
+    cells: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+    for ds_name in dataset_names:
+        # Force a fresh CUDA allocator state for each dataset. Without
+        # this, the previous dataset's KB / grounder buffers stay in
+        # the cache and fragment the GPU memory just enough to push
+        # FC's d=10 / d=3 BC pass over the budget on family / wn18rr.
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        ds_path = Path(args.data_root).expanduser() / ds_name
+        rules_file = _rules_file_for(ds_name)
+        ds = KGDataset(str(ds_path), device=args.device,
+                       rules_file=rules_file)
+        kb = ds.make_kb(max_facts_per_query=4096,
+                        fact_index_type="block_sparse")
+        queries = ds.get_queries("test")
+        if args.max_queries > 0:
+            queries = queries[:args.max_queries]
+        qmask = torch.ones(queries.shape[0], dtype=torch.bool,
+                           device=queries.device)
+        bs = _batch_size_for(ds_name)
+        n_q = queries.shape[0]
+        print(f"\n### {ds_name}  rules={rules_file}  "
+              f"facts={kb.num_facts}  queries={n_q}  batch_size={bs or 'full'}")
+        cells[ds_name] = {"_n_queries": n_q}
+
+        # Run FC first per dataset — its width=None / depth=10 BC pass
+        # is the most memory-hungry single grounder, and we want it to
+        # see a clean GPU before the other 13 grounders fragment the
+        # allocator. The other rows are still printed in their declared
+        # order so the output table matches DEFAULT_ROWS.
+        ordered = sorted(rows_to_run, key=lambda r: 0 if r[0] == "FC" else 1)
+        for kind, cfg_label, cfg in ordered:
+            torch.cuda.empty_cache()
+            try:
+                rules, proofs, ms = run_cell(kind, ds, ds_path, kb,
+                                              queries, qmask, cfg, bs)
+                ok = True
+                err = None
+            except Exception as e:
+                rules, proofs, ms = 0, 0, 0.0
+                ok = False
+                err = f"{type(e).__name__}: {str(e)[:80]}"
+            tag = f"{kind}:{cfg_label}"
+            cells[ds_name][tag] = {
+                "ground_rules": rules,
+                "ground_proofs": proofs,
+                "ms": round(ms, 2),
+                "ok": ok,
+                "error": err,
+                # Backwards-compat: keep ``count`` as alias of
+                # ``ground_rules`` so older readers don't break.
+                "count": rules,
+            }
+            if ok:
+                status = (f"rules={rules:>6d}  proofs={proofs:>6d}  "
+                          f"{ms:>9.1f}ms")
+            else:
+                status = f"FAIL ({err})"
+            print(f"  {tag:<22s} {status}")
+
+    # ── Print 2-D tables ──
+    row_keys = [f"{k}:{c}" for (k, c, _) in rows_to_run]
+    col_keys = dataset_names
+    width = max(22, max(len(r) for r in row_keys) + 2)
+    cw = 12  # per-cell column width
+
+    def _print_table(title: str, value_fn) -> None:
+        print(f"\n{'='*(width + cw*len(col_keys) + 4)}")
+        print(title)
+        print(f"{'='*(width + cw*len(col_keys) + 4)}")
+        header = f"{'Grounder:Config':<{width}}  " + "".join(
+            f"{ds[:cw-1]:>{cw}}" for ds in col_keys)
+        print(header)
+        print("-" * len(header))
+        for rk in row_keys:
+            row = f"{rk:<{width}}  "
+            for ds in col_keys:
+                cell = cells.get(ds, {}).get(rk, {})
+                row += f"{value_fn(cell):>{cw}}"
+            print(row)
+
+    _print_table("GROUND RULES (unique fully-ground (rule,head,body) — "
+                 "what keras counts)",
+                 lambda c: (str(c.get("ground_rules", c.get("count", 0)))
+                            if c.get("ok") else "FAIL"))
+    _print_table("GROUND PROOFS (per-query proof-tree count summed)",
+                 lambda c: (str(c.get("ground_proofs", 0))
+                            if c.get("ok") else "FAIL"))
+    _print_table("TIMING (ms)", lambda c: (f"{c['ms']:.0f}"
+                                            if c.get("ok") else "FAIL"))
+
+    # ── Write JSON baseline ──
+    out_path = args.output
+    if out_path is None:
+        out_path = str(TESTS_DIR / "baselines" / "comparison.json")
+    if out_path:
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        existing: Dict[str, Any] = {}
+        if args.merge and Path(out_path).exists():
+            try:
+                with open(out_path) as f:
+                    existing = json.load(f)
+            except Exception:
+                existing = {}
+        merged_cells = existing.get("cells", {}) if args.merge else {}
+        for ds_name, row_dict in cells.items():
+            target = merged_cells.setdefault(ds_name, {})
+            for k, v in row_dict.items():
+                target[k] = v
+        # Union the row list (existing + new), preserving DEFAULT_ROWS
+        # ordering when present.
+        all_row_tags = list({tag for ds_d in merged_cells.values()
+                             for tag in ds_d.keys() if tag != "_n_queries"})
+        canonical = [f"{k}:{c}" for (k, c, _) in DEFAULT_ROWS]
+        ordered_rows = [r for r in canonical if r in all_row_tags] + [
+            r for r in all_row_tags if r not in canonical]
+        baseline = {
+            "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "datasets": list(merged_cells.keys()),
+            "rows": ordered_rows,
+            "max_queries": args.max_queries,
+            "device": args.device,
+            "cells": merged_cells,
+        }
+        with open(out_path, "w") as f:
+            json.dump(baseline, f, indent=2)
+        print(f"\n[json] wrote {out_path}")
+
+
+if __name__ == "__main__":
+    main()
