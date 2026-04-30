@@ -598,7 +598,55 @@ class FCDynamic(nn.Module):
                     return in_f | (vp & (provable_hashes[cp] == qh))
                 return in_f
 
-        # Stages 1..m-1 in join order
+        # Run stages 1..m-1, dispatched by join_algo. Chunking the
+        # post-stage-0 partial keeps ``_apply_rule_anchored``'s peak
+        # memory bounded on big closures (wn18rr step ≥ 1).
+        return self._run_stages_anchored_dispatch(
+            cr, partial, frontiers, ordered_bps, m,
+            ps_look, po_look, case_a_found, E, E2)
+
+    def _run_stages_anchored_dispatch(
+        self, cr, partial, frontiers, ordered_bps, m,
+        ps_look, po_look, case_a_found, E, E2,
+    ) -> Optional[Tensor]:
+        """Dispatch entry for the anchored stage loop.
+
+        ``staged`` runs once over the full partial; ``chunked`` slices
+        it. Same closure either way; chunked bounds peak memory.
+        """
+        if not partial:
+            return None
+        n = next(iter(partial.values())).shape[0]
+        if n == 0:
+            return None
+        if self.join_algo == "chunked":
+            chunk = self.join_chunk_size or 100_000
+            if n > chunk:
+                head_chunks: List[Tensor] = []
+                for start in range(0, n, chunk):
+                    end = min(start + chunk, n)
+                    sliced = {v: t[start:end] for v, t in partial.items()}
+                    h = self._run_stages_anchored(
+                        cr, sliced, frontiers, ordered_bps, m,
+                        ps_look, po_look, case_a_found, E, E2)
+                    if h is not None and h.numel() > 0:
+                        head_chunks.append(h)
+                if not head_chunks:
+                    return None
+                return torch.cat(head_chunks)
+        return self._run_stages_anchored(
+            cr, partial, frontiers, ordered_bps, m,
+            ps_look, po_look, case_a_found, E, E2)
+
+    def _run_stages_anchored(
+        self, cr, partial, frontiers, ordered_bps, m,
+        ps_look, po_look, case_a_found, E, E2,
+    ) -> Optional[Tensor]:
+        """Anchored stage loop (stages 1..m-1) for one chunk of the
+        partial bindings tensor. Same logic as the original inline
+        loop in ``_apply_rule_anchored`` — extracted so the chunked
+        dispatcher can call it per slice.
+        """
         for k in range(1, m):
             bpk = ordered_bps[k]
             pred_k = bpk["pred_idx"]
