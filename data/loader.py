@@ -22,8 +22,12 @@ import torch
 from torch import Tensor
 
 
-# Regex for atoms: pred(arg0,arg1)
-_ATOM_RE = re.compile(r"(\w+)\(([^,]+),([^)]+)\)")
+# Regex for atoms: pred(arg0,arg1). Predicates may contain slashes and
+# dots (e.g. ``/people/person/place_of_birth``) so the predicate-name
+# group must accept those — ``\w+`` would silently truncate to the
+# last word before the paren and break parity with fact predicates
+# parsed by ``_parse_triples`` (which uses rfind("(")).
+_ATOM_RE = re.compile(r"([\w/.]+)\(([^,]+),([^)]+)\)")
 # Variable detection: single lowercase letter OR uppercase-starting name
 _VAR_PATTERN_LOWER = re.compile(r"^[a-z]$")
 _VAR_PATTERN_UPPER = re.compile(r"^[A-Z]")
