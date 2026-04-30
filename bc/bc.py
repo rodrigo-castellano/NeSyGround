@@ -104,6 +104,17 @@ class BCGrounder(nn.Module):
         # to ``[B*S_max, K_r, G_r, M, 3]`` — fits high-fan-out KBs at
         # the cost of truncating at packing. Default True (no-loss).
         bump_s_to_k: bool = True,
+        # ``init_state_shape``:
+        #   "minimal" (default) — depth-0 state has shape ``[B, 1, ...]``;
+        #     only one slot per query is allocated. DpRL-friendly: lets
+        #     callers stop after step 0 with the smallest possible
+        #     buffer.
+        #   "full" — depth-0 state has shape ``[B, S, ...]`` from the
+        #     start, with only slot 0 valid. NS-friendly: every step
+        #     sees the same shape, so a single compiled graph covers
+        #     all depths (no d=0 specialization). Recommended when
+        #     ``compile_mode`` is set.
+        init_state_shape: str = "minimal",
     ) -> None:
         super().__init__()
         self.kb = kb
@@ -120,6 +131,13 @@ class BCGrounder(nn.Module):
         if filter is None:
             filter = "fp_batch" if resolution == "enum" else "none"
         self.filter_mode = filter
+        # Compile mode is opt-in (default None = eager). The dense
+        # ``enum`` path is the right pairing for ``'reduce-overhead'``
+        # (static shapes, CUDA-graph capture); the flat path stays
+        # eager because its ``torch.nonzero`` produces dynamic shapes
+        # incompatible with reduce-overhead. Multi-grounder sweeps
+        # should NOT enable compile globally — torch's CUDA-graph
+        # weakref bookkeeping accumulates across grounders.
         self.compile_mode = compile_mode
         self.hooks = hooks or []
         self.fact_hook = fact_hook
@@ -156,6 +174,11 @@ class BCGrounder(nn.Module):
         self._pack_dedup = pack_dedup
         self._collect_rule_groundings = collect_rule_groundings
         self._bump_s_to_k = bump_s_to_k
+        if init_state_shape not in ("minimal", "full"):
+            raise ValueError(
+                f"init_state_shape must be 'minimal' or 'full', "
+                f"got {init_state_shape!r}")
+        self._init_state_shape = init_state_shape
         # Paper BC_{w,d,u} convention: u (= w_last_depth) defaults to 0.
         # All body atoms at the last (= terminal) step must be facts;
         # any rule application with leftover unknown leaves is dropped
@@ -281,18 +304,20 @@ class BCGrounder(nn.Module):
             # init_enum may recompute S/C — override shared values.
             self.S = meta["S"]
             # Optional bump to ensure intermediate-step packing keeps every
-            # valid child. ``S = max(S, K)`` is a conservative *no-loss*
-            # cap when ``depth>1, width>0`` — intermediates can produce up
-            # to K children per state. Skipping the bump keeps the per-step
-            # ``[B*S, K_r, G_r, M, 3]`` allocation bounded, which is the
-            # difference between "fast" and "OOM" on high-fan-out KBs
-            # (wn18rr, family at depth 3) — but trades some apps when the
-            # actual valid children at any intermediate exceed S.
-            # Default keeps the bump for backwards-compat; pass
-            # ``bump_s_to_k=False`` to opt out.
+            # valid child. The previous ``S = max(S, K)`` used the
+            # *budget* ``K = min(K_r * max_groundings_per_query,
+            # max_total_groundings)`` — which on small KBs is much
+            # larger than the actual per-state children count
+            # ``K_r * min(K_f, max_groundings_per_query)``. That overshoot
+            # exploded the dense ``[B*S, K_r, G_r, M, 3]`` allocation
+            # to GB-scale on ablation/countries even though only ~80
+            # children per state are actually possible.
+            # Bound by the realistic per-state max instead.
             if (self._bump_s_to_k and self.depth > 1
                     and self.width is not None and self.width > 0):
-                self.S = max(self.S, self.K)
+                K_v = meta.get("K_v", 0) or 0
+                K_actual = max(self.K_r * K_v, 1)
+                self.S = max(self.S, min(self.K, K_actual))
             self.C = meta["C"]
             # (C may be overridden by resolution-specific init)
             self.any_dual = meta["any_dual"]
@@ -695,14 +720,42 @@ class BCGrounder(nn.Module):
         for a single forward to fit in VRAM. ``rule_groundings``
         accumulators span chunks and dedup once at the end.
 
-        When ``batch_size`` is ``None`` the full batch is processed in
-        one forward (the default).
+        When ``batch_size`` is ``None``:
+          * compile_mode is None      → full batch in one forward.
+          * compile_mode is set       → auto-default to a chunk size
+            small enough to keep the per-chunk CUDA-graph buffers
+            bounded. The dense compiled path with
+            ``init_state_shape='full'`` allocates intermediate tensors
+            of shape ``[B*S, K_r, G_r, M, 3]`` which scales linearly
+            with B; chunking keeps peak memory roughly constant.
         """
         N = queries.size(0)
+        if batch_size is None and self.compile_mode is not None:
+            batch_size = self._auto_batch_size(N)
         if batch_size is not None and 0 < batch_size < N:
             return self._forward_chunked(
                 queries, query_mask, batch_size, **init_kwargs)
         return self._forward_one_batch(queries, query_mask, **init_kwargs)
+
+    def _auto_batch_size(self, N: int) -> int:
+        """Pick a chunk size for compile mode based on per-chunk memory.
+
+        Heuristic: ``[B*S, K_r, G_r, M, 3]`` body tensor (the dominant
+        intermediate at d=0 with ``init_state_shape='full'``) should
+        stay below ~1 GB to leave room for the rest of the graph and
+        for CUDA-graph private pools. ``B = 1e9 / (S*K_r*G_r*M*3*8)``.
+        """
+        if self.resolution != "enum":
+            return N      # only the enum dense path needs chunking
+        S = self.S
+        K_r = getattr(self, "K_r", 1) or 1
+        G_r = getattr(self, "G_r", 1) or 1
+        M = max(self.kb.M, 1)
+        # bytes per body element = 8 (long); 3 args per atom
+        per_query_bytes = S * K_r * G_r * M * 3 * 8
+        budget = 1_000_000_000   # ~1 GB
+        B_max = max(1, budget // max(per_query_bytes, 1))
+        return min(N, int(B_max))
 
     def _forward_chunked(
         self, queries: Tensor, query_mask: Tensor,
@@ -790,14 +843,44 @@ class BCGrounder(nn.Module):
             evidence = None
 
         # State: concat trimmed proof_goals / state_valid / top_ridx.
+        # The flat path produces dynamic S_out per chunk, so chunks may
+        # have different inner shape on dim=1 (state) and beyond. Pad
+        # each chunk to the max-inner-shape before cat. Padding is at
+        # ``padding_idx`` for atoms / ``-1`` for ridx / ``False`` for
+        # masks / ``0`` for indices — same conventions as ``init_states``
+        # / ``pack_states_flat``'s placeholders.
         states = [o.state for o in chunk_outputs]
+        pad = self.kb.padding_idx
+        def _pad_to(t: Tensor, target_inner: List[int], pad_val) -> Tensor:
+            # t shape: [B, *inner]. target_inner is the desired inner.
+            cur = list(t.shape[1:])
+            if cur == target_inner:
+                return t
+            out = torch.full(
+                (t.size(0), *target_inner), pad_val,
+                dtype=t.dtype, device=t.device)
+            slices = (slice(None),) + tuple(slice(0, c) for c in cur)
+            out[slices] = t
+            return out
+        _attr_pad = {
+            "proof_goals": pad,
+            "state_valid": False,
+            "top_ridx": -1,
+            "next_var_indices": 0,
+        }
         def _state_cat(attr):
-            parts = []
+            parts_raw = []
             for s, n in zip(states, chunk_sizes):
                 t = getattr(s, attr)
                 if t is None:
                     return None
-                parts.append(t[:n])
+                parts_raw.append(t[:n])
+            # Compute max inner shape across chunks
+            max_inner: List[int] = []
+            for d in range(1, parts_raw[0].dim()):
+                max_inner.append(max(p.size(d) for p in parts_raw))
+            pad_val = _attr_pad.get(attr, 0)
+            parts = [_pad_to(p, max_inner, pad_val) for p in parts_raw]
             return torch.cat(parts, dim=0)
         state = ProofState(
             proof_goals=_state_cat("proof_goals"),
@@ -1000,8 +1083,14 @@ class BCGrounder(nn.Module):
         # M_work: working buffer for the current depth's body atoms.
         M_work = 1 if not self.collect_evidence else M
 
+        # ``init_state_shape``:
+        #   "minimal" — S_init=1; smallest possible buffer at d=0.
+        #   "full"    — S_init=self.S; same shape as d>=1 so a single
+        #               compiled graph covers every depth.
+        S_init = 1 if self._init_state_shape == "minimal" else self.S
+
         proof_goals = torch.full(
-            (B, 1, G, 3), pad, dtype=torch.long, device=dev)
+            (B, S_init, G, 3), pad, dtype=torch.long, device=dev)
         if initial_goals is not None:
             M_in = initial_goals.shape[1]
             proof_goals[:, 0, :M_in, :] = initial_goals
@@ -1009,19 +1098,25 @@ class BCGrounder(nn.Module):
             proof_goals[:, 0, 0, :] = queries
         # M-sized working buffer (current depth's rule body atoms)
         grounding_body = torch.full(
-            (B, 1, M_work, 3), pad, dtype=torch.long, device=dev)
+            (B, S_init, M_work, 3), pad, dtype=torch.long, device=dev)
         # Structured accumulator: [B, S, D, M, 3] — one slot per depth
         acc_D = 1 if not self.collect_evidence else D
         acc_M = 1 if not self.collect_evidence else M
         accumulated_body = torch.full(
-            (B, 1, acc_D, acc_M, 3), pad, dtype=torch.long, device=dev)
-        body_count = torch.zeros(B, 1, acc_D, dtype=torch.long, device=dev)
+            (B, S_init, acc_D, acc_M, 3), pad, dtype=torch.long, device=dev)
+        body_count = torch.zeros(B, S_init, acc_D, dtype=torch.long, device=dev)
         ridx_per_depth = torch.full(
-            (B, 1, acc_D), -1, dtype=torch.long, device=dev)
+            (B, S_init, acc_D), -1, dtype=torch.long, device=dev)
         head_per_depth = torch.full(
-            (B, 1, acc_D, 3), pad, dtype=torch.long, device=dev)
-        top_ridx = torch.full((B, 1), -1, dtype=torch.long, device=dev)
-        state_valid = query_mask.unsqueeze(1)
+            (B, S_init, acc_D, 3), pad, dtype=torch.long, device=dev)
+        top_ridx = torch.full((B, S_init), -1, dtype=torch.long, device=dev)
+        if S_init == 1:
+            state_valid = query_mask.unsqueeze(1)              # [B, 1]
+        else:
+            # Only slot 0 carries the active query; slots 1.. are inactive.
+            state_valid = torch.zeros(
+                B, S_init, dtype=torch.bool, device=dev)
+            state_valid[:, 0] = query_mask
 
         if next_var_indices is None:
             E = self.kb.constant_no + 1
@@ -1061,16 +1156,18 @@ class BCGrounder(nn.Module):
         if self.kb.num_rules == 0:
             return states
 
-        # Compiled fast path (all depths; skip last enum step which needs width=0,
-        # and skip flat intermediate steps which have data-dependent shapes).
+        # Compiled fast path. The flat path is gated off because its
+        # ``torch.nonzero`` produces dynamic shapes incompatible with
+        # ``mode='reduce-overhead'``. The dense path compiles every
+        # depth, including the last — the ``d == depth-1`` branches in
+        # ``resolve_enum_step`` / ``_postprocess`` are static at trace
+        # time, so dynamo just specialises an additional graph for
+        # them. With ``init_state_shape='full'`` every depth shares the
+        # same shape, so the compile cache holds **one** graph regardless
+        # of depth.
         if self._compiled:
-            last_enum_step = (
-                self.resolution == "enum"
-                and d == self.depth - 1
-                and self.width is not None
-            )
             flat_step = getattr(self, "_flat_intermediate", False)
-            if not last_enum_step and not flat_step:
+            if not flat_step:
                 return self._step_compiled(states, d)
 
         # Capture the goal being resolved at this depth (= head atom)
@@ -1296,10 +1393,16 @@ class BCGrounder(nn.Module):
         state_valid: Tensor,       # [B, S]
         active_mask: Tensor,       # [B, S]
         states: Dict[str, Tensor],
-        d: int,
+        d,                                  # int (eager) or 0-dim Tensor (compiled)
+        is_last=None,                       # Optional[Tensor] (compiled path)
         use_hooks: bool = True,
     ) -> ResolvedChildren:
-        """Dispatch to resolution strategy. Returns ResolvedChildren."""
+        """Dispatch to resolution strategy. Returns ResolvedChildren.
+
+        ``d`` is a Python int when called from the eager step loop, and
+        a 0-dim long tensor when called from the compiled step. The
+        ``resolve_enum_step`` downstream accepts both shapes.
+        """
         fh = self.fact_hook if use_hooks else None
         rh = self.rule_hook if use_hooks else None
 
@@ -1335,7 +1438,7 @@ class BCGrounder(nn.Module):
             return resolve_enum_step(
                 queries, remaining, grounding_body, state_valid, active_mask,
                 fact_index=self.kb.fact_index,
-                d=d, depth=self.depth, width=self.width,
+                d=d, depth=self.depth, width=self.width, is_last=is_last,
                 M=self.kb.M, padding_idx=self.kb.padding_idx,
                 G_r=self.G_r, K=self.K,
                 any_dual=self.any_dual,
@@ -1539,17 +1642,43 @@ class BCGrounder(nn.Module):
         else:
             write_atoms = new_atoms
         write_mask = has_new_body[:, :, None, None]  # [B, S_out, 1, 1]
-        acc[:, :, d, :, :] = torch.where(write_mask, write_atoms,
-                                          acc[:, :, d, :, :])
-
-        # f. Write current rule index at depth d
-        ridx[:, :, d] = torch.where(has_new_body, sync.current_ridx,
-                                     ridx[:, :, d])
-
-        # g. Update per-depth body count at depth d
-        new_active = (write_atoms[:, :, :, 0] != pad)  # [B, S_out, M_acc]
-        new_lens = new_active.long().sum(dim=-1)       # [B, S_out]
-        bc[:, :, d] = torch.where(has_new_body, new_lens, bc[:, :, d])
+        # ``d`` may be a Python int (eager) or a 0-dim long tensor
+        # (compiled). For the compiled path we use a one-hot
+        # broadcast-mask along the D dimension so the write becomes a
+        # plain ``torch.where`` (no indexed scatter) — that keeps the
+        # graph depth-agnostic and shareable across all d values.
+        if isinstance(d, torch.Tensor):
+            D_acc = acc.shape[2]
+            d_arange = torch.arange(D_acc, device=dev)
+            is_slot = (d_arange == d).view(1, 1, D_acc, 1, 1)   # [1,1,D,1,1]
+            write_atoms_b = write_atoms.unsqueeze(2)             # [B,S,1,M,3]
+            write_mask_b = write_mask.unsqueeze(2)               # [B,S,1,1,1]
+            acc = torch.where(
+                is_slot & write_mask_b, write_atoms_b, acc)
+            # Write ridx and bc at slot d via the same trick:
+            #   ridx[:, :, d] ← where(has_new_body, current_ridx, ridx[:, :, d])
+            is_slot_2d = (d_arange == d).view(1, 1, D_acc)
+            ridx = torch.where(
+                is_slot_2d & has_new_body.unsqueeze(-1),
+                sync.current_ridx.unsqueeze(-1).expand(-1, -1, D_acc),
+                ridx,
+            )
+            new_active = (write_atoms[:, :, :, 0] != pad)
+            new_lens = new_active.long().sum(dim=-1)             # [B, S_out]
+            bc = torch.where(
+                is_slot_2d & has_new_body.unsqueeze(-1),
+                new_lens.unsqueeze(-1).expand(-1, -1, D_acc),
+                bc,
+            )
+        else:
+            # Eager fast path — Python int slice.
+            acc[:, :, d, :, :] = torch.where(write_mask, write_atoms,
+                                             acc[:, :, d, :, :])
+            ridx[:, :, d] = torch.where(has_new_body, sync.current_ridx,
+                                        ridx[:, :, d])
+            new_active = (write_atoms[:, :, :, 0] != pad)
+            new_lens = new_active.long().sum(dim=-1)
+            bc[:, :, d] = torch.where(has_new_body, new_lens, bc[:, :, d])
 
         # h. Gather and write head_per_depth at depth d
         hpi = parent_map[:, :, None, None].expand(-1, -1, D_dim, 3)
@@ -1568,8 +1697,17 @@ class BCGrounder(nn.Module):
             sel_flat = sel_parent.reshape(B * S_out, 1, 3)
             sel_flat = apply_substitutions(sel_flat, subs_flat, pad)
             sel_parent = sel_flat.reshape(B, S_out, 3)
-            head[:, :, d, :] = torch.where(
-                has_new_body.unsqueeze(-1), sel_parent, head[:, :, d, :])
+            if isinstance(d, torch.Tensor):
+                d_arange_h = torch.arange(D_dim, device=dev)
+                is_slot_h = (d_arange_h == d).view(1, 1, D_dim, 1)
+                head = torch.where(
+                    is_slot_h & has_new_body.view(B, S_out, 1, 1),
+                    sel_parent.unsqueeze(2),
+                    head,
+                )
+            else:
+                head[:, :, d, :] = torch.where(
+                    has_new_body.unsqueeze(-1), sel_parent, head[:, :, d, :])
 
         states["accumulated_body"] = acc
         states["body_count"] = bc
@@ -1835,6 +1973,17 @@ class BCGrounder(nn.Module):
         T = rule_idx.size(0)
         if T == 0:
             return None
+        # Drop sentinel rows (rule_idx == -1) inserted by the per-step
+        # path to keep ``_collect_r2g_tensor`` host-sync-free. One sync
+        # here at finalize amortises across all steps.
+        keep = rule_idx >= 0
+        if not bool(keep.any()):
+            return None
+        if not bool(keep.all()):
+            rule_idx = rule_idx[keep]
+            head = head[keep]
+            body = body[keep]
+            T = rule_idx.size(0)
         M = body.size(1)
         device = rule_idx.device
         # Encode each row as a single comparable tensor for unique:
@@ -2062,33 +2211,32 @@ class BCGrounder(nn.Module):
                         (head, tuple(sorted(body))))
 
     def _postprocess(self, states: Dict[str, Tensor], sync: SyncParams,
-                     d: int = 0) -> Dict[str, Tensor]:
+                     d, is_last=None) -> Dict[str, Tensor]:
         """Full postprocess: prune goals + sync accumulated + collect groundings.
 
-        Used by the non-compiled path. The compiled path splits this into
-        _postprocess_goals (inside compiled) + _sync_and_collect (outside).
-
-        When ``collect_evidence=False``, skips grounding collection (proof_goals
-        are the final output, not evidence).
-
-        Args:
-            states: Current proof states dict.
-            sync: SyncParams from _pack (parent_map, winning_subs, etc.).
-            d: Current depth index (for structured accumulation).
+        ``d`` is a Python int when called from the eager step loop,
+        and a 0-dim long tensor when called from the compiled step.
+        ``is_last`` is None in eager (computed from ``d`` directly) and
+        a 0-dim bool tensor in compiled mode.
         """
         states = self._postprocess_goals(states)
         states = self._sync_accumulated(states, sync, d)
-        # Last step + w_last_depth>0: leftover ground unknowns in proof_goals
-        # would block terminal collection. The body atoms are already in
-        # accumulated_body; clear proof_goals so the rule application is
-        # emitted (matches keras-ns prune_incomplete_proofs=False semantics).
-        # Static `d == self.depth - 1` and Python-int comparison are
-        # specialized at trace time — compile-safe.
-        if (d == self.depth - 1 and self._w_last_depth is not None
-                and self._w_last_depth > 0):
+        # Last step + w_last_depth>0: leftover ground unknowns in
+        # proof_goals would block terminal collection. The body atoms
+        # are already in accumulated_body; clear proof_goals so the
+        # rule application is emitted (matches keras-ns
+        # prune_incomplete_proofs=False semantics).
+        if self._w_last_depth is not None and self._w_last_depth > 0:
             pad = self.kb.padding_idx
-            states["proof_goals"] = torch.full_like(
-                states["proof_goals"], pad)
+            if is_last is not None:
+                # Compiled: tensor select.
+                cleared = torch.full_like(states["proof_goals"], pad)
+                states["proof_goals"] = torch.where(
+                    is_last, cleared, states["proof_goals"])
+            elif d == self.depth - 1:
+                # Eager: Python int branch.
+                states["proof_goals"] = torch.full_like(
+                    states["proof_goals"], pad)
         if self.collect_evidence:
             states = self._collect_groundings(states)
         return states
@@ -2132,44 +2280,61 @@ class BCGrounder(nn.Module):
     # ==================================================================
 
     def _fn_step_for_depth(self, d: int):
-        """Get or lazily compile the step function for depth d.
+        """Get the (single, depth-agnostic) compiled step function.
 
-        Static-shape compile: ``dynamic=False``. The grounder is built to
-        run with a stable batch size and stable per-step buffers (S, K),
-        so ``mode='reduce-overhead'`` can build a CUDA graph and replay
-        it at sub-millisecond cost. Callers that need to process more
-        queries than fit in a single CUDA-graph-friendly batch should
-        pass ``batch_size=B`` to ``forward()``; the grounder will then
-        chunk queries and replay the same compiled graph per chunk.
+        Static-shape compile: ``dynamic=False``. With
+        ``init_state_shape='full'`` every depth has the same input
+        shape, and ``d`` enters as a 0-dim tensor (not a Python int)
+        so dynamo doesn't specialise the graph on ``d``'s value. One
+        graph covers every depth; ``self._fn_steps_by_depth[0]`` is
+        the cache slot.
+
+        With ``init_state_shape='minimal'`` (DpRL-friendly), d=0 has
+        ``S_in=1`` while d≥1 has ``S_in=max_states``; those two
+        shapes still need separate graphs, so the cache holds at most
+        2 entries (keyed by ``S_in``).
         """
-        if d not in self._fn_steps_by_depth:
-            import functools
-            fn = functools.partial(self._step_impl, d=d)
-            self._fn_steps_by_depth[d] = torch.compile(
-                fn, fullgraph=True, mode=self.compile_mode,
+        # Cache key: state shape kind. 'full' → one shape for all d.
+        # 'minimal' → d=0 differs from d>=1.
+        if self._init_state_shape == "full" or d > 0:
+            key = "main"
+        else:
+            key = "init"
+        if key not in self._fn_steps_by_depth:
+            import torch._dynamo as _dynamo
+            if getattr(_dynamo.config, "recompile_limit", 0) < 64:
+                _dynamo.config.recompile_limit = 64
+            self._fn_steps_by_depth[key] = torch.compile(
+                self._step_impl, fullgraph=True, mode=self.compile_mode,
                 dynamic=False,
             )
-        return self._fn_steps_by_depth[d]
+        return self._fn_steps_by_depth[key]
 
     def _step_compiled(self, states: Dict, d: int = 0) -> Dict[str, Tensor]:
-        """Compiled step: dict <-> raw tensors."""
+        """Compiled step: dict <-> raw tensors.
+
+        ``d`` is converted to a 0-dim long tensor and ``is_last`` to a
+        0-dim bool tensor before entering the compiled region — this
+        keeps the graph structure depth-agnostic, so a single compile
+        replays for every depth.
+        """
         if self._clone_between_steps:
             states = {k: v.clone() if isinstance(v, Tensor) else v
                       for k, v in states.items()}
 
-        # Use per-depth compiled function (d is a trace-time constant)
         fn = self._fn_step_for_depth(d)
+        dev = states["proof_goals"].device
+        # d → 0-dim long tensor; is_last → 0-dim bool tensor. Both are
+        # treated as data-dependent inputs by dynamo (no specialisation
+        # on their value), so changing d/is_last between calls reuses
+        # the same compiled graph.
+        d_t = torch.tensor(d, dtype=torch.long, device=dev)
+        is_last_t = torch.tensor(
+            d == self.depth - 1, dtype=torch.bool, device=dev)
 
-        (states["grounding_body"], states["accumulated_body"],
-         states["body_count"], states["ridx_per_depth"],
-         states["head_per_depth"],
-         states["proof_goals"],
-         states["top_ridx"], states["state_valid"],
-         states["next_var_indices"],
-         states["collected_body"], states["collected_mask"],
-         states["collected_ridx"],
-         states["collected_bcount"],
-         states["collected_head"]) = fn(
+        (gb, ab, bc, rpd, hpd, pg, tr, sv, nvi,
+         cb, cm, cr, cbc, chh,
+         step_ridx, step_head, step_body, step_valid) = fn(
             states["grounding_body"], states["accumulated_body"],
             states["body_count"], states["ridx_per_depth"],
             states["head_per_depth"],
@@ -2180,7 +2345,47 @@ class BCGrounder(nn.Module):
             states["collected_ridx"],
             states["collected_bcount"],
             states["collected_head"],
+            d_t, is_last_t,
         )
+        # Clone every output to detach from the CUDA-graph-managed
+        # private pool. Without this, the next ``fn`` replay overwrites
+        # the buffers while the outer Python still holds references in
+        # the ``states`` dict, raising "accessing tensor output of
+        # CUDAGraphs that has been overwritten by a subsequent run".
+        states["grounding_body"]   = gb.clone()
+        states["accumulated_body"] = ab.clone()
+        states["body_count"]       = bc.clone()
+        states["ridx_per_depth"]   = rpd.clone()
+        states["head_per_depth"]   = hpd.clone()
+        states["proof_goals"]      = pg.clone()
+        states["top_ridx"]         = tr.clone()
+        states["state_valid"]      = sv.clone()
+        states["next_var_indices"] = nvi.clone()
+        states["collected_body"]   = cb.clone()
+        states["collected_mask"]   = cm.clone()
+        states["collected_ridx"]   = cr.clone()
+        states["collected_bcount"] = cbc.clone()
+        states["collected_head"]   = chh.clone()
+        # Pre-pack rule app collection: append the just-emitted (orig_ridx,
+        # head, sorted_body) tuples to the running r2g accumulators. Use
+        # the same sentinel-ridx convention as the eager
+        # ``_collect_r2g_tensor`` so neither path forces a per-step host
+        # sync; the single ``keep = rule_idx >= 0`` sync happens once at
+        # ``_finalize_r2g_tensor``. The tensors are cloned to detach
+        # from the CUDA graph output buffers — the next step replays the
+        # graph and overwrites them, which would corrupt the
+        # accumulators.
+        if self._collect_rule_groundings:
+            pad = self.kb.padding_idx
+            active = step_body[..., 0] != pad
+            has_body = active.any(dim=-1)
+            keep = step_valid & has_body & (step_ridx >= 0)
+            ridx_out = torch.where(
+                keep, step_ridx.long(),
+                step_ridx.new_full((), -1, dtype=torch.long))
+            self._r2g_acc_rule.append(ridx_out.clone())
+            self._r2g_acc_head.append(step_head.long().clone())
+            self._r2g_acc_body.append(step_body.long().clone())
         return states
 
     def _step_impl(
@@ -2199,10 +2404,21 @@ class BCGrounder(nn.Module):
         collected_ridx: Tensor,
         collected_bcount: Tensor,
         collected_head: Tensor,
-        d: int = 0,
+        d_t: Tensor,
+        is_last_t: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
-               Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-        """Raw tensor step for torch.compile -- same phases as clean path."""
+               Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
+               Tensor, Tensor, Tensor, Tensor]:
+        """Raw tensor step for torch.compile -- same phases as clean path.
+
+        Returns the 14 state tensors plus 4 pre-pack rule-application
+        tensors used by ``_step_compiled`` to populate the r2g
+        accumulators (orig rule index, head, sorted body, valid mask).
+        Capturing this data INSIDE the compiled region but appending to
+        the Python list OUTSIDE it lets intermediate-step rule
+        applications survive ``_pack``'s S-truncation — without any
+        ``.item()`` / data-dependent indexing inside the compiled graph.
+        """
         states = {
             "grounding_body": grounding_body,
             "accumulated_body": accumulated_body,
@@ -2220,16 +2436,51 @@ class BCGrounder(nn.Module):
             "collected_head": collected_head,
         }
 
-        # SELECT -> RESOLVE -> SEARCH FILTERS -> HOOKS -> PACK -> POSTPROCESS
+        # SELECT -> RESOLVE -> SEARCH FILTERS -> HOOKS -> [collect r2g] -> PACK -> POSTPROCESS
         queries, remaining, active_mask = self._select(states)
         resolved = self._resolve(
             queries, remaining, grounding_body, state_valid,
-            active_mask, states, d=d, use_hooks=False,
+            active_mask, states, d=d_t, is_last=is_last_t, use_hooks=False,
         )
         resolved = self._apply_search_filters(resolved)
         resolved = self._apply_hooks(resolved, states)
+
+        # Capture pre-pack rule application data for r2g collection.
+        # The compiled path is gated to dense ResolvedChildren (flat path
+        # is forced eager at ``step``), so this branch is always taken
+        # when ``_step_compiled`` runs. Mirrors ``_collect_r2g_tensor``'s
+        # canonicalisation (variant→orig + sort body atoms) but stays
+        # compile-safe: only tensor ops, no .item()/.tolist(), no
+        # data-dependent indexing. The eager wrapper applies the
+        # validity mask via boolean indexing (compile-unfriendly) and
+        # appends the kept rows to ``_r2g_acc_*``.
+        M_collect = self.kb.M
+        pad_collect = self.kb.padding_idx
+        rule_goals_c = resolved.rule_goals[..., :M_collect, :]   # [B, S, K_r, M, 3]
+        sub_ridx_c = resolved.sub_rule_idx                       # [B, S, K_r]
+        rule_succ_c = resolved.rule_success                      # [B, S, K_r]
+        K_r_c = sub_ridx_c.size(-1)
+        v2o_c = self._variant_to_orig_t                          # [num_variants]
+        sub_ridx_orig_c = v2o_c[sub_ridx_c.clamp(min=0)]
+        P1, P2, P3 = 1_000_003, 999_983, 999_979
+        atom_h_c = (rule_goals_c[..., 0].long() * P1
+                    + rule_goals_c[..., 1].long() * P2
+                    + rule_goals_c[..., 2].long() * P3)
+        active_atom_c = rule_goals_c[..., 0] != pad_collect
+        sentinel_c = torch.full_like(atom_h_c, (2 ** 62) - 1)
+        ah_for_sort_c = torch.where(active_atom_c, atom_h_c, sentinel_c)
+        sort_idx_c = ah_for_sort_c.argsort(dim=-1)
+        body_sorted_c = rule_goals_c.gather(
+            -2, sort_idx_c.unsqueeze(-1).expand(-1, -1, -1, -1, 3))
+        sel_c = proof_goals[:, :, 0, :]                          # [B, S, 3]
+        head_c = sel_c.unsqueeze(2).expand(-1, -1, K_r_c, -1)    # [B, S, K_r, 3]
+        step_ridx = sub_ridx_orig_c.reshape(-1)
+        step_head = head_c.reshape(-1, 3)
+        step_body = body_sorted_c.reshape(-1, M_collect, 3)
+        step_valid = rule_succ_c.reshape(-1)
+
         states, sync = self._pack(resolved, states)
-        states = self._postprocess(states, sync, d)
+        states = self._postprocess(states, sync, d_t, is_last_t)
 
         return (states["grounding_body"], states["accumulated_body"],
                 states["body_count"], states["ridx_per_depth"],
@@ -2240,7 +2491,8 @@ class BCGrounder(nn.Module):
                 states["collected_body"], states["collected_mask"],
                 states["collected_ridx"],
                 states["collected_bcount"],
-                states["collected_head"])
+                states["collected_head"],
+                step_ridx, step_head, step_body, step_valid)
 
     # ==================================================================
     # Provability

@@ -206,9 +206,11 @@ def resolve_enum_step(
     active_mask: Tensor,       # [B, S]
     *,
     fact_index,
-    d: int,
+    d,                         # int (eager) or 0-dim Tensor (compiled)
     depth: int,
     width: Optional[int],
+    is_last=None,              # Optional[Tensor] (compiled path provides
+                               #  ``d == depth-1`` as a 0-dim bool)
     M: int,
     padding_idx: int,
     G_r: int,
@@ -296,20 +298,48 @@ def resolve_enum_step(
     pad = padding_idx
     dev = queries.device
 
+    # ``d`` is a Python int when called from the eager step loop, and a
+    # 0-dim long tensor when called from the compiled step. Compute
+    # ``is_last`` consistently:
+    #   - eager: a Python bool (specialised at trace time → static
+    #     ``width_d``, static ``head_pred_mask_d``);
+    #   - compiled: ``is_last`` is a 0-dim bool tensor passed in by the
+    #     caller, so ``width_d`` becomes a 0-dim long tensor and the
+    #     head-pred prune is gated by ``is_last`` inside the filter.
+    if is_last is None:
+        # Eager path — d is a Python int.
+        is_last_static = (d == depth - 1)
+    else:
+        is_last_static = None        # tensor branch handled downstream
+
     # 1. Width: last step uses w_last_depth (default 0 = all body atoms
     #    must be facts) so proof_goals become empty and collection works.
-    width_d = width
-    if d == depth - 1 and width is not None:
-        width_d = w_last_depth
+    if is_last_static is not None:
+        width_d = w_last_depth if (is_last_static and width is not None) else width
+    else:
+        # Compiled: tensor select between ``width`` and ``w_last_depth``.
+        if width is None:
+            width_d = None
+        else:
+            width_d = torch.where(
+                is_last,
+                torch.tensor(w_last_depth, dtype=torch.long, device=dev),
+                torch.tensor(width, dtype=torch.long, device=dev),
+            )
 
     # 1b. Head-pred prune is only meaningful when an unknown body atom
-    #     could later be proved by some rule — i.e. at intermediate steps.
-    #     At the last step (no further depth), pass None to admit unknowns
+    #     could later be proved by some rule — i.e. at intermediate
+    #     steps. At the last step (no further depth), admit unknowns
     #     regardless of their predicate, matching keras-ns
-    #     prune_incomplete_proofs=False semantics for terminal collection.
-    head_pred_mask_d: Optional[Tensor] = (
-        None if d == depth - 1 else head_pred_mask
-    )
+    #     prune_incomplete_proofs=False semantics. In compiled mode the
+    #     tensor mask is always passed; the filter uses ``is_last`` to
+    #     conditionally skip the prune.
+    if is_last_static is not None:
+        head_pred_mask_d: Optional[Tensor] = (
+            None if is_last_static else head_pred_mask
+        )
+    else:
+        head_pred_mask_d = head_pred_mask     # always pass; filter gates
 
     # ── Flat intermediate path (zero grounding loss) ──
     if flat_intermediate and fv_enum_pred is not None and V >= 1:
@@ -346,6 +376,7 @@ def resolve_enum_step(
         check_arg_source_a=check_arg_source_a,
         head_pred_mask=head_pred_mask_d,
         G_r=G_r, M=M, width=width_d,
+        is_last=is_last,
         has_dual=has_dual,
         enum_pred_b=enum_pred_b,
         enum_bound_binding_b=enum_bound_binding_b,
@@ -472,7 +503,8 @@ def resolve_enum(
     head_pred_mask: Optional[Tensor],   # [P] bool, None to skip head-pred prune
     G_r: int,                     # groundings per rule
     M: int,                       # max body atoms
-    width: Optional[int],         # width bound (None=∞)
+    width: Optional[int],         # width bound (None=∞); int OR 0-dim Tensor
+    is_last: Optional[Tensor] = None,   # 0-dim bool tensor (compiled path)
     has_dual: Optional[Tensor] = None,
     enum_pred_b: Optional[Tensor] = None,
     enum_bound_binding_b: Optional[Tensor] = None,
@@ -600,7 +632,7 @@ def resolve_enum(
 
     mask_a = _apply_enum_filters(
         body_a, exists_a, body_active, active_mask, cmask_a,
-        queries, G_r, width, head_pred_mask,
+        queries, G_r, width, head_pred_mask, is_last=is_last,
     )
 
     # ── Direction B (dual anchoring) ──
@@ -629,7 +661,7 @@ def resolve_enum(
 
         mask_b = _apply_enum_filters(
             body_b, exists_b, body_active_b, active_mask, cmask_b,
-            queries, G_use_b, width, head_pred_mask,
+            queries, G_use_b, width, head_pred_mask, is_last=is_last,
         )
 
         # Exclude fully proven from B (avoid A duplicates)
@@ -1154,8 +1186,14 @@ def _apply_enum_filters(
     cand_mask: Tensor,        # [B, K_r, G_r]
     queries: Tensor,          # [B, 3]
     G_r: int,
-    width: Optional[int],
+    width,                    # int (eager) or 0-dim Tensor (compiled), or None
     head_pred_mask: Optional[Tensor],   # [P] bool, None to skip head-pred prune
+    *,
+    is_last: Optional[Tensor] = None,   # 0-dim bool tensor (compiled path)
+                                        # — when True, skip head-pred prune
+                                        # and force the all-exist branch
+                                        # (matches eager ``head_pred_mask=None``
+                                        # + ``width==0`` semantics).
 ) -> Tensor:
     """Apply width filtering, query exclusion, and head predicate pruning.
 
@@ -1164,6 +1202,10 @@ def _apply_enum_filters(
     Pass ``head_pred_mask=None`` to disable the unprovable-unknown filter
     (matches keras-ns ``prune_incomplete_proofs=False``). Used at the last
     proof step, where there is no further depth to prove unknowns at.
+
+    In the compiled path the caller passes ``head_pred_mask`` as a tensor
+    and ``is_last`` as a 0-dim bool — the head-pred prune is gated via
+    ``torch.where(is_last, ...)`` instead of a Python ``if``.
     """
     B, K_r = active_mask.shape
     M = body_atoms.shape[3]
@@ -1196,9 +1238,26 @@ def _apply_enum_filters(
             head_pred_ok = head_pred_mask[safe_pred_vals]
             unknown_ok = exists | head_pred_ok
             all_ok = (unknown_ok | ~body_active_exp).all(dim=-1)
+            if is_last is not None:
+                # Skip the prune at the last step (matches the eager
+                # ``head_pred_mask=None`` branch).
+                all_ok = torch.where(
+                    is_last, torch.ones_like(all_ok), all_ok)
             mask = mask & all_ok
 
-        if width == 0:
+        # ``width == 0`` triggers the strict all-exist branch (every
+        # body atom must be a fact). When ``width`` is a tensor, gate
+        # the branch on ``is_last`` so it fires only at the last step
+        # (which is where ``width_d == w_last_depth == 0`` for u=0 in
+        # the compiled path).
+        if isinstance(width, torch.Tensor):
+            if is_last is not None:
+                all_exist = (exists | ~body_active_exp).all(dim=-1)
+                # Apply strict branch only when is_last (mirrors the
+                # eager ``width_d == 0 and last step``).
+                strict_mask = mask & all_exist
+                mask = torch.where(is_last, strict_mask, mask)
+        elif width == 0:
             all_exist = (exists | ~body_active_exp).all(dim=-1)
             mask = mask & all_exist
 
@@ -1268,17 +1327,36 @@ def _resolve_enum_step_flat(
         None if d == depth - 1 else head_pred_mask
     )
 
-    # 1. Flatten queries
-    flat_q = queries.reshape(N, 3)
-    flat_valid = (active_mask & state_valid).reshape(N)
+    # 1. Flatten queries — full [N, 3] view first.
+    flat_q_full = queries.reshape(N, 3)
+    flat_valid_full = (active_mask & state_valid).reshape(N)
+
+    # 1b. Compact to active rows only (Option C: dynamic-shape compaction).
+    # The flat path is always eager (the compiled path is gated to dense),
+    # so dropping invalid rows is a pure win — every downstream tensor
+    # sized [N, K_r, ...] becomes [N_eff, K_r, ...] with N_eff = active
+    # state count. When all queries are active (typical at depth 0), the
+    # nonzero-then-index pair reduces to a no-op aside from one O(N)
+    # boolean scan; the saving at depth>=1 (where state_valid sparsity is
+    # high) more than pays for it.
+    active_pos = torch.nonzero(
+        flat_valid_full, as_tuple=False).squeeze(1)        # [N_eff]
+    N_eff = active_pos.size(0)
+    if N_eff == 0:
+        G_body = grounding_body.shape[2]
+        return _empty_flat_resolved(B, S, G, G_body, pad, dev)
+    flat_q = flat_q_full[active_pos]                       # [N_eff, 3]
     qp, qs, qo = flat_q[:, 0], flat_q[:, 1], flat_q[:, 2]
 
-    # 2. Rule clustering (same as dense path)
-    active_idx = pred_rule_indices[qp]              # [N, K_r]
+    # 2. Rule clustering (same as dense path) — over compacted rows.
+    active_idx = pred_rule_indices[qp]                     # [N_eff, K_r]
     K_r = active_idx.size(1)
-    amask = pred_rule_mask[qp] & flat_valid.unsqueeze(1)
+    # All compacted rows are valid by construction, so the per-(state,K_r)
+    # mask reduces to ``pred_rule_mask`` (which K_r slots correspond to
+    # a real rule for the query's predicate).
+    amask = pred_rule_mask[qp]                             # [N_eff, K_r]
     has_free_q = has_free[active_idx]
-    num_body_q = num_body_atoms[active_idx]          # [N, K_r]
+    num_body_q = num_body_atoms[active_idx]                # [N_eff, K_r]
 
     # Gather per-free-var metadata
     fv_pred_q = fv_enum_pred[active_idx]
@@ -1286,9 +1364,9 @@ def _resolve_enum_step_flat(
     fv_dir_q = fv_enum_direction[active_idx]
     fv_valid_q = fv_enum_valid[active_idx]
 
-    # 3. Flat Cartesian enumeration (zero waste)
+    # 3. Flat Cartesian enumeration (zero waste) over compacted rows
     flat_source, flat_br_idx, flat_b_idx = _enumerate_cartesian_flat(
-        N, K_r, qs, qo,
+        N_eff, K_r, qs, qo,
         fv_pred_q, fv_bound_q, fv_dir_q, fv_valid_q,
         has_free_q, amask, fact_index,
         V=V,
@@ -1307,13 +1385,16 @@ def _resolve_enum_step_flat(
     dep_bpreds = (body_preds_dep if body_preds_dep is not None
                   else body_preds)
 
-    # Map flat_br_idx to (n, r) for gathering rule metadata
-    flat_n_idx = flat_br_idx // K_r  # [T] — which N query
-    flat_r_idx = flat_br_idx % K_r   # [T] — which K_r rule
+    # Map flat_br_idx to (n_eff, r) for gathering rule metadata.
+    # ``n_eff`` indexes the compacted rows; convert back to the full
+    # [B*S] index via ``active_pos`` only at the boundary where
+    # b_idx / s_idx for the dense state layout are needed.
+    flat_n_idx_eff = flat_br_idx // K_r  # [T] — compacted query index
+    flat_r_idx = flat_br_idx % K_r       # [T] — which K_r rule
 
     # Gather per-entry arg_source and body_preds
-    # dep_src: [R_total, M, 2], active_idx: [N, K_r] → per (n,r): active_idx[n,r]
-    rule_global_idx = active_idx[flat_n_idx, flat_r_idx]  # [T] — global rule index
+    # dep_src: [R_total, M, 2], active_idx: [N_eff, K_r] → per (n,r): active_idx[n,r]
+    rule_global_idx = active_idx[flat_n_idx_eff, flat_r_idx]  # [T] — global rule index
     check_flat = dep_src[rule_global_idx]                  # [T, M, 2]
     bpreds_flat = dep_bpreds[rule_global_idx]              # [T, M]
     nbody_flat = num_body_atoms[rule_global_idx]           # [T]
@@ -1330,9 +1411,9 @@ def _resolve_enum_step_flat(
     flat_body = flat_body.masked_fill(~body_active.unsqueeze(-1), pad)
 
     # 7. Filters
-    # Need original queries [N, 3] indexed by flat_n_idx
+    # Need queries [N_eff, 3] indexed by flat_n_idx_eff (compacted index).
     fmask = _apply_filters_flat(
-        flat_body, flat_exists, flat_n_idx, nbody_flat,
+        flat_body, flat_exists, flat_n_idx_eff, nbody_flat,
         flat_q, width_d, head_pred_mask_d, M)
 
     # 8. Extract surviving entries
@@ -1344,7 +1425,10 @@ def _resolve_enum_step_flat(
         return _empty_flat_resolved(B, S, G, G_body, pad, dev)
 
     surv_body = flat_body[surv_idx]                    # [T_surv, M, 3]
-    surv_n_idx = flat_n_idx[surv_idx]                  # [T_surv]
+    surv_n_idx_eff = flat_n_idx_eff[surv_idx]          # [T_surv] — compacted
+    # Map compacted index back to full [B*S] index for the dense
+    # b/s decomposition expected by the downstream pack.
+    surv_n_idx = active_pos[surv_n_idx_eff]            # [T_surv]
     surv_rule_idx = rule_global_idx[surv_idx]          # [T_surv]
     surv_r_local = flat_r_idx[surv_idx]                # [T_surv] — K_r position
 
@@ -1356,8 +1440,8 @@ def _resolve_enum_step_flat(
     # on small workloads (~5 tensor ops per step).
 
     # 9. Build flat goals [T_surv, G, 3] — body atoms + remaining parent goals
-    surv_b_idx = surv_n_idx // S       # [T_surv] — batch index
-    surv_s_idx = surv_n_idx % S        # [T_surv] — state index
+    surv_b_idx = surv_n_idx // S       # [T_surv] — batch index (full N)
+    surv_s_idx = surv_n_idx % S        # [T_surv] — state index (full N)
 
     # Build flat_goals: [T_surv, G, 3]
     flat_goals = torch.full(

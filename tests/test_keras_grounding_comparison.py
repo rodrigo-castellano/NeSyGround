@@ -1,12 +1,52 @@
 """Compare grounding counts between keras-ns and any torch-ns grounder.
 
-Per-query comparison for filter='none', full-batch for filter='fp_batch'.
-Supports any dataset with domain2constants.txt and arrow-format rules.
+Goal: confirm torch-ns produces the same per-rule grounding counts as
+keras-ns on every cell of the IJCAI '25 paper grid (datasets × BC_w_d
+configs), and report timing per cell. Per-query comparison for
+filter='none', full-batch for filter='fp_batch'. Supports any dataset
+with domain2constants.txt and arrow-format rules.
+
+What this test does
+-------------------
+
+For each (dataset, config, path) cell:
+
+  1. Build the keras-ns grounder, run on the test split (or train+valid
+     +test for small datasets — see ``_default_splits``), record per-
+     rule grounding counts and wall-clock.
+  2. Build the torch-ns grounder with the matching ``BC_{w,d,u=0}``
+     parametrisation via ``make_bcwd``; run with the same query set,
+     record per-rule counts and wall-clock for the steady-state call
+     (one warmup is excluded).
+  3. Diff per-rule counts. ``Match: YES`` when they're identical.
+
+The two ``path`` flavours of the torch grounder:
+
+  * ``flat`` — the dynamic ``_resolve_enum_step_flat`` path. Body atoms
+    survive without padding; pack truncation only kicks in when valid
+    children > S=256 per query, which is rare in practice. Always
+    eager (``torch.nonzero`` produces dynamic shapes incompatible with
+    ``compile_mode='reduce-overhead'``).
+  * ``dense`` — the static-shape ``[B*S, K_r, G_r, M, 3]`` path that's
+    the right pairing for ``compile_mode='reduce-overhead'`` (CUDA-graph
+    capture). Allocates a fixed rectangle per step and pays for it on
+    big KBs (family / wn18rr at scale).
+
+Both run eager by default in this test (``compile_mode=None``); the
+sweep needs that for cross-grounder safety — torch's CUDA-graph
+``cudagraph_trees`` weakref bookkeeping accumulates state across
+grounder instances and trips an internal assert after a few cells.
+Single-cell benchmarks can pass ``--compile-mode reduce-overhead`` to
+turn it on for one specific grounder.
 
 Usage:
-    cd torch-ns
-    PYTHONPATH=. python -m pytest grounder/tests/test_keras_grounding_comparison.py -v -s
-    PYTHONPATH=. python grounder/tests/test_keras_grounding_comparison.py  # standalone
+    # Full sweep, both paths, eager:
+    PYTHONPATH=. python tests/test_keras_grounding_comparison.py \\
+        --datasets ablation_d2,ablation_d3,countries_s2,countries_s3,family,wn18rr \\
+        --configs w0d1,w1d2,w1d3 --paths flat,dense --device cuda
+
+    # Same as above as pytest:
+    PYTHONPATH=. python -m pytest tests/test_keras_grounding_comparison.py -v -s
 """
 from __future__ import annotations
 
@@ -197,6 +237,7 @@ def build_torch_grounder(
     flat: bool = True, all_anchors: bool = False,
     filt: Optional[str] = None, S_max: int = 256, C: int = 4096,
     G_r: int = 4096, bump_s_to_k: bool = True,
+    compile_mode: Optional[str] = None,
 ) -> BCGrounder:
     """Build the paper's BC_{w,d} grounder via ``make_bcwd``.
 
@@ -204,12 +245,18 @@ def build_torch_grounder(
     default (``'none'`` for d=1,w>0; ``'fp_batch'`` otherwise).
     Pass an explicit ``filt`` to test a specific filter.
 
-    ``bump_s_to_k=True`` (default) keeps the no-loss ``S = max(S_max, K)``
-    bump at depth>1, width>0 — slow on high-fan-out KBs.
-    ``False`` keeps ``S = S_max`` (fast, accepts truncation).
+    ``bump_s_to_k`` controls the per-state pack budget:
+      * ``True`` — ``S = max(S_max, min(K, K_r * K_v))`` so all valid
+        per-state children fit in the pack output (no truncation).
+        Pre-bump-fix this used the budget ``K`` directly which on
+        small KBs overshot the realistic per-state child count by
+        50× and OOMed; the current ``min(K, K_r*K_v)`` cap keeps
+        ``S`` realistic.
+      * ``False`` — ``S = S_max`` (= 256). Faster but truncates at
+        scale on high-fan-out KBs, undercounting unique apps.
     """
-    return make_bcwd(
-        kb, w=width, d=depth,
+    kwargs = dict(
+        kb=kb, w=width, d=depth,
         flat_intermediate=flat,
         filter=filt,
         max_groundings_per_query=G_r,
@@ -217,7 +264,20 @@ def build_torch_grounder(
         max_states=S_max,
         fc_method="join", prune_facts=True,
         bump_s_to_k=bump_s_to_k,
+        # init_state_shape:
+        #   "minimal" (default, DpRL-friendly) — d=0 has S_in=1.
+        #   "full"  — d=0 has S_in=max_states; needed for single-graph
+        #              compile but blows memory on full-batch sweeps.
+        # Use "full" only when we explicitly compile.
+        init_state_shape=("full" if compile_mode else "minimal"),
     )
+    # Explicitly pass compile_mode (defaults to None = eager). Without
+    # this the BCGrounder auto-pick would set 'reduce-overhead' for the
+    # dense path, which breaks multi-grounder sweeps via the torch
+    # cudagraph_trees weakref assert. Pass --compile-mode reduce-overhead
+    # for single-cell benchmarks.
+    kwargs["compile_mode"] = compile_mode
+    return make_bcwd(**kwargs)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -237,17 +297,32 @@ def compare_groundings(
     S_max: int = 256,
     C: int = 4096,
     split: str = "test",
+    splits: Optional[List[str]] = None,
     verbose: bool = True,
     max_queries: int = 0,
     G_r: int = 4096,
     batch_size: Optional[int] = None,
     bump_s_to_k: bool = True,
+    compile_mode: Optional[str] = None,
 ) -> dict:
     """Compare keras-ns vs torch-ns grounding counts.
 
     Returns dict with per-query counts and summary.
+
+    ``splits`` overrides ``split`` when provided: queries are concatenated
+    across all listed splits ("train" / "valid" / "test"). Useful when the
+    test split is too small to be representative — most ablation /
+    countries datasets only ship a few hundred test triples but many
+    thousand train triples.
     """
-    test = ds.get_queries(split)
+    if splits is None:
+        splits = [split]
+    parts: List[Tensor] = []
+    for s in splits:
+        parts.append(ds.get_queries(s))
+    test = torch.cat([p for p in parts if p.numel() > 0], dim=0) \
+        if any(p.numel() > 0 for p in parts) \
+        else torch.empty(0, 3, dtype=torch.long, device=ds.device)
     if max_queries > 0:
         test = test[:max_queries]
     B = test.size(0)
@@ -293,7 +368,8 @@ def compare_groundings(
     g = build_torch_grounder(kb, width, depth, flat=flat,
                               all_anchors=all_anchors, filt=filt,
                               S_max=S_max, C=C, G_r=G_r,
-                              bump_s_to_k=bump_s_to_k)
+                              bump_s_to_k=bump_s_to_k,
+                              compile_mode=compile_mode)
 
     # Count torch's UNIQUE rule applications (matches keras's
     # ``len(rule2groundings[r])``): out.rule_groundings.A_in[r] holds
@@ -379,38 +455,78 @@ def compare_groundings(
             torch_per_depth_rule = _depth_rule_counts_from_evidence(
                 out, keras_rules, variant_to_orig=v2o)
         except (RuntimeError, MemoryError) as exc:
-            # Per-query fallback (slower but bounded memory).
-            print(f"  [batched OOM: {type(exc).__name__}; falling back "
-                  f"to per-query]", flush=True)
-            with torch.no_grad():
-                _ = g(test[:1], qmask[:1])  # warmup at B=1
-            _sync(test.device)
-            torch_ms = 0.0
-            torch_per_query = []
-            for i in range(B):
-                q = test[i:i+1]
-                qm = torch.ones(1, dtype=torch.bool, device=q.device)
-                _sync(q.device)
-                t0 = time.perf_counter()
-                with torch.no_grad():
-                    out_i = g(q, qm)
-                _sync(q.device)
-                torch_ms += (time.perf_counter() - t0) * 1000.0
-                cnt = (sum(out_i.rule_groundings.A_in[r].shape[0]
-                            for r in out_i.rule_groundings.A_in)
-                       if out_i.rule_groundings is not None else 0)
-                torch_per_query.append(cnt)
-                if out_i.rule_groundings is not None:
-                    for ri, r in enumerate(keras_rules):
-                        if ri in out_i.rule_groundings.A_in:
-                            torch_per_rule[r.name] += int(
-                                out_i.rule_groundings.A_in[ri].shape[0])
-            torch_total = sum(torch_per_query)
+            # Halve batch_size and retry — per-query fallback would
+            # double-count duplicates across queries (no cross-query
+            # dedup) and is wrong for ``fp_batch`` which prunes against
+            # the merged-batch app set, not per-query.
+            torch.cuda.empty_cache()
+            cur_bs = batch_size if batch_size else max(1, B)
+            success = False
+            while cur_bs > 1 and not success:
+                cur_bs = max(1, cur_bs // 2)
+                print(f"  [batched OOM: {type(exc).__name__}; retrying "
+                      f"with batch_size={cur_bs}]", flush=True)
+                try:
+                    with torch.no_grad():
+                        _ = g(test, qmask, batch_size=cur_bs)
+                    _sync(test.device)
+                    t0 = time.perf_counter()
+                    with torch.no_grad():
+                        out = g(test, qmask, batch_size=cur_bs)
+                    _sync(test.device)
+                    torch_ms = (time.perf_counter() - t0) * 1000.0
+                    torch_total = (sum(out.rule_groundings.A_in[r].shape[0]
+                                       for r in out.rule_groundings.A_in)
+                                   if out.rule_groundings is not None else 0)
+                    torch_per_query = [torch_total]
+                    if out.rule_groundings is not None:
+                        for ri, r in enumerate(keras_rules):
+                            if ri in out.rule_groundings.A_in:
+                                torch_per_rule[r.name] = int(
+                                    out.rule_groundings.A_in[ri].shape[0])
+                    v2o = getattr(g, "_variant_to_orig", None)
+                    torch_per_depth_rule = _depth_rule_counts_from_evidence(
+                        out, keras_rules, variant_to_orig=v2o)
+                    success = True
+                except (RuntimeError, MemoryError) as exc2:
+                    exc = exc2
+                    torch.cuda.empty_cache()
+            if not success:
+                # Last-resort per-query fallback. Inflates the count for
+                # any rule app that fires for multiple queries (common
+                # for cross-query body atoms), but at least returns a
+                # finite number rather than crashing.
+                print(f"  [exhausted batch_size retries; per-query "
+                      f"fallback — count will OVER-count duplicate "
+                      f"(rule, head, body) tuples across queries]",
+                      flush=True)
+                torch_ms = 0.0
+                torch_per_query = []
+                for i in range(B):
+                    q = test[i:i+1]
+                    qm = torch.ones(1, dtype=torch.bool, device=q.device)
+                    _sync(q.device)
+                    t0 = time.perf_counter()
+                    with torch.no_grad():
+                        out_i = g(q, qm)
+                    _sync(q.device)
+                    torch_ms += (time.perf_counter() - t0) * 1000.0
+                    cnt = (sum(out_i.rule_groundings.A_in[r].shape[0]
+                                for r in out_i.rule_groundings.A_in)
+                           if out_i.rule_groundings is not None else 0)
+                    torch_per_query.append(cnt)
+                    if out_i.rule_groundings is not None:
+                        for ri, r in enumerate(keras_rules):
+                            if ri in out_i.rule_groundings.A_in:
+                                torch_per_rule[r.name] += int(
+                                    out_i.rule_groundings.A_in[ri].shape[0])
+                torch_total = sum(torch_per_query)
 
     # ── Report ──
     speedup = (keras_ms / torch_ms) if torch_ms > 0 else float("inf")
     result = {
         "config": f"w{width}d{depth}",
+        "n_queries": B,
         "keras_total": keras_total,
         "torch_total": torch_total,
         "keras_per_rule": keras_per_rule,
@@ -508,8 +624,11 @@ def main():
                              "names (e.g. ~/repos/data-swarm/main).")
     parser.add_argument("--configs", default="w0d1,w1d2,w1d3",
                         help="Comma-separated w<W>d<D> configs")
-    parser.add_argument("--flat", action="store_true", default=True)
-    parser.add_argument("--no-flat", dest="flat", action="store_false")
+    parser.add_argument("--flat", action="store_true", default=True,
+                        help="Deprecated — use ``--paths flat`` "
+                             "(default) or ``--paths flat,dense``.")
+    parser.add_argument("--no-flat", dest="flat", action="store_false",
+                        help="Deprecated — use ``--paths dense``.")
     parser.add_argument("--all-anchors", action="store_true")
     # BC_{w,d} default filter is keras-prune-aligned per (d, w):
     #   d=1, w>0 → 'none'       (keras prune_incomplete_proofs=False)
@@ -520,25 +639,62 @@ def main():
     parser.add_argument("--s-max", type=int, default=256)
     parser.add_argument("--C", type=int, default=4096)
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--max-queries", type=int, default=0,
-                        help="Truncate test split to first N queries (0 = all).")
+    parser.add_argument("--max-queries", type=int, default=-1,
+                        help="Truncate to first N queries. -1 = per-dataset "
+                             "default (use the full default split set for "
+                             "every dataset). 0 = no cap (all queries from "
+                             "the chosen splits, equivalent to -1).")
+    parser.add_argument("--splits", default=None,
+                        help="Comma-separated splits to use for queries (e.g. "
+                             "'test', 'train,valid,test'). Default: per-dataset "
+                             "(family/wn18rr=test only; countries/ablation="
+                             "train,valid,test).")
     parser.add_argument("--G-r", type=int, default=4096,
                         help="max_groundings_per_query in BCGrounder.")
     parser.add_argument("--rules-file", default="rules.txt",
                         help="Rules filename inside dataset dir. Paper "
                              "numbers for family use 'rules_old.txt' "
                              "(47 rules vs 143 in rules.txt).")
-    parser.add_argument("--batch-size", type=int, default=0,
+    parser.add_argument("--batch-size", type=int, default=-1,
                         help="BCGrounder.forward(batch_size=...) chunk "
-                             "size. 0 = full batch in one forward.")
+                             "size. 0 = full batch in one forward. -1 = "
+                             "per-dataset default (countries_s3 chunks at "
+                             "50 to dodge an at-scale bug + OOM at V=2; "
+                             "all others run full batch).")
+    parser.add_argument("--bump-s", default=None,
+                        choices=["true", "false"],
+                        help="Force ``bump_s_to_k`` to True/False. "
+                             "Default (omitted) uses per-dataset choice: "
+                             "True for ablation_*/countries_s2 (small K, "
+                             "fits memory, no truncation), False for "
+                             "countries_s3/family/wn18rr (high K, would "
+                             "OOM with bump=True; accept some pack "
+                             "truncation).")
     parser.add_argument("--no-bump-s", action="store_true",
-                        help="Disable the ``S = max(S_max, K)`` bump for "
-                             "depth>1, width>0. Default keeps the bump "
-                             "for no-loss parity. Disable for speed on "
-                             "high-fan-out KBs (wn18rr, family at d=3).")
+                        help="Shorthand for ``--bump-s false``.")
+    parser.add_argument("--paths", default="flat",
+                        help="Comma-separated paths to compare per cell: "
+                             "'flat' (default), 'dense', or 'flat,dense' "
+                             "to run both and emit two rows per cell so "
+                             "you can see keras vs flat vs dense counts "
+                             "+ timings side-by-side.")
+    parser.add_argument("--compile-mode", default=None,
+                        help="Pass to BCGrounder. Typical: "
+                             "'reduce-overhead' (CUDA-graph capture, "
+                             "static shapes only). Only affects the "
+                             "dense path; flat path is forced eager. "
+                             "First call compiles (slow, in warmup); "
+                             "second call replays the graph at sub-ms.")
     parser.add_argument("--csv", default=None,
                         help="Write the cross-dataset summary table as CSV "
                              "to this path (in addition to stdout).")
+    parser.add_argument(
+        "--json", default=None,
+        help="Write the cross-dataset summary table as JSON to this path "
+             "(default: tests/baselines/comparison.json — pass empty "
+             "string to disable). One record per (dataset, config, "
+             "path) row with all fields from the printed table plus "
+             "the per-rule counts.")
     args = parser.parse_args()
 
     # ── Resolve dataset list ──
@@ -572,6 +728,62 @@ def main():
     # ``rules.txt``. Allow explicit override via ``--rules-file``.
     explicit_rules_file = (args.rules_file != "rules.txt")
 
+    # ── Per-dataset defaults ──
+    # Each dataset has its own memory profile (driven by K_r, K_f, V).
+    # The defaults below pick splits, max_queries, batch_size, and
+    # bump_s_to_k so the sweep finishes without OOM and reports real
+    # parity numbers. Override any of them on the command line:
+    #   --splits / --max-queries / --batch-size / --bump-s / --no-bump-s
+    #
+    # Splits choice: family / wn18rr have thousands of test triples,
+    # plenty for parity; countries_* and ablation_* have only ~25
+    # test triples, so we exercise on train+valid+test combined.
+    def _default_splits(label: str) -> List[str]:
+        if "family" in label or "wn18rr" in label:
+            return ["test"]
+        # countries_s2/s3, ablation_d2/d3, and any other small dataset
+        return ["train", "valid", "test"]
+
+    def _default_max_queries(label: str) -> int:
+        # All datasets use their full default split set: family / wn18rr
+        # use the full test split; countries_*/ablation_* use the full
+        # train+valid+test combined set.
+        return 0
+
+    def _default_bump_s(label: str) -> bool:
+        # ``bump_s_to_k=True`` widens pack output to ``S = max(S, K)``
+        # so all valid children survive (no-loss). The resulting
+        # ``[B*S, K_r, G_r, M, 3]`` allocation is fine on small KBs but
+        # OOMs at scale on family / wn18rr / countries_s3 (high K_r or
+        # high K_f). For those, default off and accept the S=256 pack
+        # truncation; the flat path doesn't have this issue at all.
+        if ("ablation" in label or
+                "countries_s2" in label):
+            return True
+        return False
+
+    def _default_batch_size(label: str) -> int:
+        # Picked to keep peak memory under ~5 GiB on a 24 GiB card with
+        # ``max_states=256``, ``G_r=4096``. Above these thresholds the
+        # dense / flat intermediate tensors OOM (or, when partial OOMs
+        # leave stale buffers, produce silently wrong counts at full
+        # batch). The chunk merger applies the final fp_batch pruning
+        # to the union of chunk apps, so the result equals what a
+        # full-batch run would have produced.
+        if "wn18rr" in label:
+            return 10           # K_f=473, K_r=16 — heaviest per-query;
+                                # 2924 queries × bc13 needs small chunks
+                                # to avoid the chunk-merger memory pile-up
+        if "family" in label:
+            return 100          # K_r=16 — moderate; 5626 queries
+        if "countries_s3" in label:
+            return 50           # V=2, K_r=7 — already known scale issue
+        return 0                # ablation_*, countries_s2 — fits full batch
+
+    explicit_splits = (
+        [s.strip() for s in args.splits.split(",") if s.strip()]
+        if args.splits is not None else None)
+
     all_rows: List[Dict[str, Any]] = []
     for ds_label, ds_path in dataset_paths:
         if explicit_rules_file:
@@ -582,10 +794,31 @@ def main():
             rules_file = "rules.txt"
         ds, kb = load_dataset(str(ds_path), device=args.device,
                               rules_file=rules_file)
+        ds_splits = explicit_splits or _default_splits(ds_label)
+        ds_max_q = (args.max_queries if args.max_queries >= 0
+                    else _default_max_queries(ds_label))
+        ds_batch_size = (args.batch_size if args.batch_size >= 0
+                         else _default_batch_size(ds_label))
+        # Resolve bump_s_to_k per dataset (tri-state): explicit
+        # --bump-s/--no-bump-s overrides per-dataset default.
+        if args.bump_s == "true":
+            ds_bump_s = True
+        elif args.bump_s == "false" or args.no_bump_s:
+            ds_bump_s = False
+        else:
+            ds_bump_s = _default_bump_s(ds_label)
+        # Paths to evaluate ('flat', 'dense', or both).
+        ds_paths = [p.strip() for p in args.paths.split(",") if p.strip()]
+        if not ds_paths:
+            ds_paths = ["flat"]
         print(f"\n{'#'*78}")
         print(f"Dataset: {ds_label} (rules={rules_file})")
         print(f"  facts={kb.num_facts}, rules={kb.num_rules}, M={kb.M}, "
               f"K_f={kb.K_f}, K_r={kb.K_r}")
+        print(f"  splits={ds_splits}  max_queries="
+              f"{'all' if ds_max_q == 0 else ds_max_q}  "
+              f"batch_size={'full' if ds_batch_size == 0 else ds_batch_size}  "
+              f"bump_s={ds_bump_s}  paths={ds_paths}")
         print(f"{'#'*78}")
 
         for width, depth in configs:
@@ -593,18 +826,26 @@ def main():
             # Anything else is an explicit override (kept for testing a
             # specific filter regardless of (d, w)).
             filt = None if args.filter == "auto" else args.filter
-            r = compare_groundings(
-                ds, kb, ds_path, width, depth,
-                flat=args.flat, all_anchors=args.all_anchors,
-                filt=filt, S_max=args.s_max, C=args.C,
-                max_queries=args.max_queries,
-                G_r=args.G_r,
-                batch_size=(args.batch_size if args.batch_size > 0 else None),
-                bump_s_to_k=not args.no_bump_s,
-            )
-            r["dataset"] = ds_label
-            r["rules_file"] = rules_file
-            all_rows.append(r)
+            for path in ds_paths:
+                flat_for_path = (path == "flat")
+                # Free GPU memory between configs / paths.
+                torch.cuda.empty_cache()
+                r = compare_groundings(
+                    ds, kb, ds_path, width, depth,
+                    flat=flat_for_path, all_anchors=args.all_anchors,
+                    filt=filt, S_max=args.s_max, C=args.C,
+                    splits=ds_splits,
+                    max_queries=ds_max_q,
+                    G_r=args.G_r,
+                    batch_size=(ds_batch_size if ds_batch_size > 0 else None),
+                    bump_s_to_k=ds_bump_s,
+                    compile_mode=args.compile_mode,
+                )
+                r["dataset"] = ds_label
+                r["rules_file"] = rules_file
+                r["splits"] = ",".join(ds_splits)
+                r["path"] = path
+                all_rows.append(r)
 
     # Cross-dataset summary table — counts on the left, timing on the
     # right. ``K(ms)`` is the keras full-batch wall-clock; ``T(ms)`` is
@@ -612,11 +853,12 @@ def main():
     # filter='none', full-batch otherwise). ``Speedup`` is
     # ``keras_ms / torch_ms`` — values >1 mean torch is faster.
     width_w = max(20, max(len(r["dataset"]) for r in all_rows) + 2)
-    print(f"\n{'='*100}")
+    print(f"\n{'='*116}")
     print("CROSS-DATASET SUMMARY")
-    print(f"{'='*100}")
+    print(f"{'='*116}")
     header = (
-        f"{'Dataset':<{width_w}} {'Config':<6} {'Keras':>7} {'Torch':>7}"
+        f"{'Dataset':<{width_w}} {'Config':<6} {'Path':<5} {'#Q':>4} "
+        f"{'Keras':>7} {'Torch':>7}"
         f" {'Diff':>6} {'Match':>5}   {'K(ms)':>8} {'T(ms)':>8} "
         f"{'Speedup':>8}"
     )
@@ -627,6 +869,8 @@ def main():
                        else "inf")
         print(
             f"{r['dataset']:<{width_w}} {r['config']:<6} "
+            f"{r.get('path','flat'):<5} "
+            f"{r['n_queries']:>4} "
             f"{r['keras_total']:>7} {r['torch_total']:>7} "
             f"{r['diff']:>+6} {'YES' if r['match'] else 'NO':>5}   "
             f"{r['keras_ms']:>8.1f} {r['torch_ms']:>8.1f} "
@@ -638,19 +882,60 @@ def main():
         with open(args.csv, "w", newline="") as f:
             w = _csv.writer(f)
             w.writerow([
-                "dataset", "rules_file", "config",
+                "dataset", "rules_file", "splits", "config", "n_queries",
                 "keras_total", "torch_total", "diff", "match",
                 "keras_ms", "torch_ms", "speedup",
             ])
             for r in all_rows:
                 w.writerow([
-                    r["dataset"], r["rules_file"], r["config"],
+                    r["dataset"], r["rules_file"], r.get("splits", "test"),
+                    r["config"], r["n_queries"],
                     r["keras_total"], r["torch_total"], r["diff"],
                     "YES" if r["match"] else "NO",
                     f"{r['keras_ms']:.2f}", f"{r['torch_ms']:.2f}",
                     f"{r['speedup']:.4f}" if r['speedup'] != float('inf') else "inf",
                 ])
         print(f"\n[csv] wrote {args.csv}")
+
+    # ── JSON baseline write ──
+    # Keep a machine-readable record of every sweep next to the
+    # existing groundings baseline. Default path is
+    # ``tests/baselines/comparison.json``; pass ``--json ""`` to skip.
+    json_path = args.json
+    if json_path is None:
+        json_path = str(TESTS_DIR / "baselines" / "comparison.json")
+    if json_path:
+        import json as _json
+        from datetime import datetime as _dt
+        json_rows: List[Dict[str, Any]] = []
+        for r in all_rows:
+            json_rows.append({
+                "dataset":      r["dataset"],
+                "rules_file":   r["rules_file"],
+                "splits":       r.get("splits", "test"),
+                "path":         r.get("path", "flat"),
+                "config":       r["config"],
+                "n_queries":    r["n_queries"],
+                "keras_total":  r["keras_total"],
+                "torch_total":  r["torch_total"],
+                "diff":         r["diff"],
+                "match":        r["match"],
+                "keras_ms":     round(r["keras_ms"], 3),
+                "torch_ms":     round(r["torch_ms"], 3),
+                "speedup":      (round(r["speedup"], 4)
+                                 if r["speedup"] != float("inf")
+                                 else None),
+                "keras_per_rule": r.get("keras_per_rule", {}),
+                "torch_per_rule": r.get("torch_per_rule", {}),
+            })
+        out = {
+            "generated_at": _dt.utcnow().isoformat(timespec="seconds"),
+            "rows": json_rows,
+        }
+        Path(json_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(json_path, "w") as f:
+            _json.dump(out, f, indent=2)
+        print(f"[json] wrote {json_path}")
 
 
 if __name__ == "__main__":
