@@ -1347,28 +1347,13 @@ def _resolve_enum_step_flat(
     surv_n_idx = flat_n_idx[surv_idx]                  # [T_surv]
     surv_rule_idx = rule_global_idx[surv_idx]          # [T_surv]
     surv_r_local = flat_r_idx[surv_idx]                # [T_surv] — K_r position
-    surv_nbody = nbody_flat[surv_idx]                  # [T_surv]
 
-    # Canonicalize body atom order by per-atom hash. ``all_anchors=True``
-    # creates K_r body-ordering variants per logical rule; without
-    # canonicalisation the surviving variant's body order leaks into
-    # ``flat_goals[:, :M, :]`` and the ``_select`` at depth+1 picks
-    # different first goals for different variants, spawning different
-    # downstream rule firings (compounds through depths).
-    # Padding atoms get a sentinel so they sort to the end.
-    if M > 0:
-        P_C1, P_C2, P_C3 = 1_000_003, 999_983, 999_979
-        atom_pos = torch.arange(M, device=dev).unsqueeze(0)
-        active_canon = atom_pos < surv_nbody.unsqueeze(1)         # [T_surv, M]
-        atom_hash_canon = (surv_body[..., 0].long() * P_C1
-                           + surv_body[..., 1].long() * P_C2
-                           + surv_body[..., 2].long() * P_C3)     # [T_surv, M]
-        sentinel = torch.full_like(atom_hash_canon, (2 ** 62) - 1)
-        atom_hash_for_sort = torch.where(
-            active_canon, atom_hash_canon, sentinel)
-        canon_idx = atom_hash_for_sort.argsort(dim=-1)             # [T_surv, M]
-        surv_body = surv_body.gather(
-            1, canon_idx.unsqueeze(-1).expand(-1, -1, 3))
+    # Body atoms are already in canonical order via ``arg_source_dep`` /
+    # ``body_preds_dep`` (which the ``_PatternVariant`` _orig_body_patterns
+    # propagation makes invariant across anchor variants). The previous
+    # per-step argsort to canonicalise body atom order was redundant
+    # given that fix, so it's removed to save Python-dispatch cycles
+    # on small workloads (~5 tensor ops per step).
 
     # 9. Build flat goals [T_surv, G, 3] — body atoms + remaining parent goals
     surv_b_idx = surv_n_idx // S       # [T_surv] — batch index
