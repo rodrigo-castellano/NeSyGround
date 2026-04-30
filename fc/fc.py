@@ -461,13 +461,204 @@ class FCDynamic(nn.Module):
 
     # ── Full join (step 0) ────────────────────────────────────────────
 
+    def _apply_rule_lftj(
+        self, cr: RulePattern, ordered_bps: list,
+        prov_ps_off: Tensor, prov_ps_vals: Tensor,
+        prov_po_off: Tensor, prov_po_vals: Tensor,
+        provable_hashes: Tensor,
+    ) -> Optional[Tensor]:
+        """Leapfrog Triejoin for full join (step 0).
+
+        Variable elimination order: most-shared variable first
+        (Generic-Join heuristic). For each variable v:
+
+          1. Find an atom A binding v whose other argument is already
+             constrained by ``partial`` (or by a constant in the
+             rule); use ``ps_expand`` / ``po_expand`` against A's
+             facts to get v's candidate set per binding row.
+          2. Apply every other atom binding v as a fact-membership
+             filter. Surviving rows have *all* atoms binding v
+             satisfied — this is the AGM-bound output.
+
+        For binary-atom 2-body chain rules this collapses to the
+        same answer as staged joins; the WCO advantage materialises
+        when 3+ atoms share a variable (triangle-style queries).
+        Same closure as staged on every dataset (verified by smoke
+        test).
+        """
+        E, E2 = self.E, self.E * self.E
+        cno = self._constant_no
+        body = ordered_bps[: cr.num_body]
+        if not body:
+            return None
+
+        # Variable → list of (atom_idx, role) where it appears.
+        var_atoms: Dict[int, List[Tuple[int, int]]] = {}
+        for j, bp in enumerate(body):
+            for role, a in ((0, bp["arg0_var"]), (1, bp["arg1_var"])):
+                if a > cno:        # variable, not constant
+                    var_atoms.setdefault(a, []).append((j, role))
+        if not var_atoms:
+            return None
+
+        # Greedy elimination order: most-shared first, then arbitrary.
+        var_order = sorted(var_atoms.keys(),
+                           key=lambda v: -len(var_atoms[v]))
+
+        def domain(pred_k: int, role: int) -> Tensor:
+            """Sorted unique values at ``role`` of ``pred_k`` across
+            base facts ∪ derived (provable) facts."""
+            s_b, o_b = self._pred_facts.get(pred_k, self._empty)
+            s_p, o_p = _pred_pairs_from_ps(
+                pred_k, prov_ps_off, prov_ps_vals, E)
+            if role == 0:
+                return torch.unique(
+                    torch.cat([s_b, s_p]) if s_p.numel() else s_b)
+            return torch.unique(
+                torch.cat([o_b, o_p]) if o_p.numel() else o_b)
+
+        def ps_lookup(pred_k: int, kv: Tensor):
+            return _ps_expand_combined(
+                pred_k, kv,
+                self._base_ps_off, self._base_ps_vals,
+                prov_ps_off, prov_ps_vals, E)
+
+        def po_lookup(pred_k: int, kv: Tensor):
+            return _po_expand_combined(
+                pred_k, kv,
+                self._base_po_off, self._base_po_vals,
+                prov_po_off, prov_po_vals, E)
+
+        def in_kb(qh: Tensor) -> Tensor:
+            """Is ``qh`` in facts ∪ provable_hashes?"""
+            n_q = qh.shape[0]
+            in_f = torch.zeros(n_q, dtype=torch.bool, device=qh.device)
+            nf = self._num_facts
+            if nf > 0:
+                pos = torch.searchsorted(self._fact_hashes, qh)
+                v = pos < nf
+                cl = pos.clamp(max=max(nf - 1, 0))
+                in_f = v & (self._fact_hashes[cl] == qh)
+            if provable_hashes.numel() > 0:
+                n_ph = provable_hashes.shape[0]
+                pos_p = torch.searchsorted(provable_hashes, qh)
+                v_p = pos_p < n_ph
+                cl_p = pos_p.clamp(max=max(n_ph - 1, 0))
+                return in_f | (v_p & (provable_hashes[cl_p] == qh))
+            return in_f
+
+        partial: Dict[int, Tensor] = {}
+        for v in var_order:
+            atoms_with_v = var_atoms[v]
+
+            # Find a "seed" atom — one whose other argument is bound
+            # by ``partial`` or is a rule constant. That gives a tight
+            # iterator for v.
+            seed = None
+            for j, role in atoms_with_v:
+                bp = body[j]
+                other_role = 1 - role
+                other_var = (bp["arg0_var"] if other_role == 0
+                             else bp["arg1_var"])
+                if other_var in partial or other_var <= cno:
+                    seed = (j, role, other_var, other_role)
+                    break
+
+            if seed is None:
+                # No atom has a bound other-arg ⇒ first variable
+                # of the elimination. Seed from the smallest
+                # per-role domain.
+                best = min(atoms_with_v,
+                           key=lambda jr: domain(
+                               body[jr[0]]["pred_idx"], jr[1]).numel())
+                j, role = best
+                v_dom = domain(body[j]["pred_idx"], role)
+                if v_dom.numel() == 0:
+                    return None
+                partial[v] = v_dom
+                # Don't process other atoms with v as filters yet —
+                # they'll need bindings of OTHER vars first.
+                continue
+
+            j, role, other_var, other_role = seed
+            bp = body[j]
+            if other_var <= cno:
+                # ``other_var`` is a constant — single-value seed.
+                const_vals = torch.tensor(
+                    [int(other_var)], dtype=torch.long,
+                    device=self.device_str)
+                source_arr = const_vals
+                map_back = False
+            else:
+                source_arr = partial[other_var]
+                map_back = True
+
+            if other_role == 0:
+                ri, v_vals = ps_lookup(bp["pred_idx"], source_arr)
+            else:
+                ri, v_vals = po_lookup(bp["pred_idx"], source_arr)
+            if ri.numel() == 0:
+                return None
+
+            # Expand partial: row k goes to ri[k] in input partial,
+            # with v = v_vals[k].
+            if map_back:
+                partial = {t: arr[ri] for t, arr in partial.items()}
+            partial[v] = v_vals
+
+            # Apply remaining atoms binding v as filters.
+            for j2, role2 in atoms_with_v:
+                if j2 == j:
+                    continue
+                bp2 = body[j2]
+                other_role2 = 1 - role2
+                other_var2 = (bp2["arg0_var"] if other_role2 == 0
+                              else bp2["arg1_var"])
+                if other_var2 in partial:
+                    v_arr = partial[v]
+                    o_arr = partial[other_var2]
+                    sv, ov = (v_arr, o_arr) if role2 == 0 else (o_arr, v_arr)
+                elif other_var2 <= cno:
+                    v_arr = partial[v]
+                    const_t = torch.full_like(
+                        v_arr, int(other_var2))
+                    sv, ov = (v_arr, const_t) if role2 == 0 else (const_t, v_arr)
+                else:
+                    # Other-arg is an unbound variable — defer until
+                    # it's processed. (No filter possible yet.)
+                    continue
+
+                qh = bp2["pred_idx"] * E2 + sv * E + ov
+                ok = in_kb(qh)
+                if not ok.any():
+                    return None
+                partial = {t: arr[ok] for t, arr in partial.items()}
+
+        # All body variables bound; emit head in compact predicate
+        # space (decompacted in run()).
+        hx = partial.get(cr.head_var0)
+        hy = partial.get(cr.head_var1)
+        if hx is None or hy is None:
+            return None
+        head_pred_compact = self._pred_to_compact.get(
+            int(cr.head_pred_idx), 0)
+        return head_pred_compact * E2 + hx * E + hy
+
     def _apply_rule(
         self, cr: RulePattern, ordered_bps: list,
         prov_ps_off: Tensor, prov_ps_vals: Tensor,
         prov_po_off: Tensor, prov_po_vals: Tensor,
         provable_hashes: Tensor,
     ) -> Optional[Tensor]:
-        """Full staged ragged join: all stages use base ∪ provable."""
+        """Full staged ragged join: all stages use base ∪ provable.
+
+        Dispatches to ``_apply_rule_lftj`` when ``join_algo='leapfrog'``.
+        """
+        if self.join_algo == "leapfrog":
+            return self._apply_rule_lftj(
+                cr, ordered_bps,
+                prov_ps_off, prov_ps_vals,
+                prov_po_off, prov_po_vals, provable_hashes)
         E, E2 = self.E, self.E * self.E
         m = cr.num_body
 
@@ -619,7 +810,11 @@ class FCDynamic(nn.Module):
         n = next(iter(partial.values())).shape[0]
         if n == 0:
             return None
-        if self.join_algo == "chunked":
+        # ``leapfrog`` mode also chunks the anchored / staged
+        # post-stage-0 partial — without this the per-iteration
+        # cumulative state on wn18rr's 33M-atom delta saturates the
+        # GPU even though LFTJ is used at step 0.
+        if self.join_algo in ("chunked", "leapfrog"):
             chunk = self.join_chunk_size or 100_000
             if n > chunk:
                 head_chunks: List[Tensor] = []
@@ -725,7 +920,11 @@ class FCDynamic(nn.Module):
             return self._run_stages_leapfrog(
                 cr, partial, frontiers, ps_look, po_look,
                 provable_hashes, E, E2, ordered_bps)
-        if self.join_algo == "chunked":
+        # ``leapfrog`` mode also chunks the anchored / staged
+        # post-stage-0 partial — without this the per-iteration
+        # cumulative state on wn18rr's 33M-atom delta saturates the
+        # GPU even though LFTJ is used at step 0.
+        if self.join_algo in ("chunked", "leapfrog"):
             chunk = self.join_chunk_size or 100_000
             if n > chunk:
                 head_chunks: List[Tensor] = []
