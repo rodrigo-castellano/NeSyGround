@@ -1145,6 +1145,7 @@ def run_forward_chaining(
     depth: int = 10,
     device: str = "cpu",
     *,
+    method: str = "spmm",
     join_algo: str = "staged",
     join_chunk_size: int = 0,
 ) -> Tuple[Tensor, int]:
@@ -1157,19 +1158,38 @@ def run_forward_chaining(
         num_predicates: Total predicate count.
         depth: Max FC iterations.
         device: Target device.
-        join_algo: Per-rule join strategy. ``'staged'`` (default) uses
-            the original full-materialisation join; ``'chunked'``
-            slices the partial-bindings tensor to bound peak memory;
-            ``'leapfrog'`` uses Leapfrog Triejoin / Generic Join with
-            AGM-bounded output (preferred for large transitive KBs).
-        join_chunk_size: Rows per chunk in the partial slicer when
-            ``join_algo='chunked'``. ``0`` = the FCDynamic default
-            (100k rows).
+        method: Forward-chaining strategy.
+            * ``'spmm'`` (default) — semi-naive sparse-matrix-multiplication
+              FC. Per-predicate ``[E, E]`` sparse CSR matrices; rules
+              compile to MATMUL / ELEM_AND / CASE_A / EXIST_AND ops on
+              those matrices with delta-tracked semi-naive iteration.
+              Scales to 100M+ atoms on commodity hardware (validated
+              on fb15k237). Falls back to ``'staged'`` automatically
+              when the rule set has any 3-body rule (SpMM doesn't
+              support those).
+            * ``'staged'`` — staged ragged join (original FCDynamic).
+              Slower per atom and bounded by Python dispatch overhead;
+              use for rule sets with 3+ body atoms or when SpMM
+              classifies a rule as ``UNSUPPORTED``.
+        join_algo: ``staged``-only knob. Per-rule join strategy:
+            ``'staged'`` (default), ``'chunked'``, or ``'leapfrog'``.
+        join_chunk_size: Rows per chunk in the ``staged`` chunked
+            path. ``0`` = the FCDynamic default (100k rows).
 
     Returns:
         sorted_hashes: 1-D sorted tensor of provable atom hashes.
         n_provable: Number of provable atoms (0 if none).
     """
+    if method == "spmm":
+        # SpMM doesn't support num_body >= 3 — auto-fallback so callers
+        # don't have to know which rule sets are 3-body.
+        from grounder.fc.spmm import run_forward_chaining_spmm
+        if not any(getattr(cr, "num_body", 0) >= 3 for cr in compiled_rules):
+            return run_forward_chaining_spmm(
+                compiled_rules, facts_idx, num_entities, num_predicates,
+                depth=depth, device=device)
+        # Fall through to staged for 3-body rule sets.
+
     fc = FCDynamic(compiled_rules, facts_idx, num_entities, num_predicates,
                    device,
                    join_algo=join_algo,
