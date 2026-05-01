@@ -82,7 +82,7 @@ class BCGrounder(nn.Module):
         max_groundings_per_rule: Optional[int] = None,
         # Enum params
         max_groundings_per_query: int = 32,
-        fc_method: str = "join",
+        fc_method: str = "spmm",
         fc_depth: int = 10,
         # Testing/validation enum params (not compile-compatible)
         cartesian_product: bool = False,
@@ -418,9 +418,15 @@ class BCGrounder(nn.Module):
             P = self._P
         if E == 0:
             E = self._E
-        method = getattr(self, 'fc_method', 'dynamic')
-        if method in ("join", "spmm"):
-            method = "dynamic"
+        # ``fc_method`` selects the FC engine: ``'spmm'`` (default —
+        # sparse-matrix-multiplication closure with hybrid mask/single-fire
+        # semi-naive iteration; falls back to staged for any rule with
+        # ``num_body >= 4``) or ``'staged'`` (the original ragged-join
+        # FCDynamic). The legacy alias ``'join'`` is silently mapped to
+        # ``'staged'`` for back-compat.
+        method = getattr(self, 'fc_method', 'spmm')
+        if method == "join":
+            method = "staged"
         fc_depth = getattr(self, 'fc_depth', 10)
         fp_global_tensor, n_fp_global = run_forward_chaining(
             compiled_rules=compiled_rules,
@@ -429,6 +435,7 @@ class BCGrounder(nn.Module):
             num_predicates=P,
             depth=fc_depth,
             device=str(device),
+            method=method,
         )
         self.register_buffer("fp_global_hashes", fp_global_tensor)
         self.register_buffer(

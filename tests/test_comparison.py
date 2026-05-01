@@ -74,7 +74,41 @@ DEFAULT_DATASETS: List[str] = [
     "ablation_d2", "ablation_d3",
     "countries_s2", "countries_s3",
     "family", "wn18rr",
+    # fb15k237 is included for the FC row only — it's the largest
+    # benchmark we run forward-chaining on, used to size-test the SpMM
+    # closure path. The other grounders (BC variants) would either OOM
+    # or not produce meaningful numbers at this scale within a sweep.
+    "fb15k237",
 ]
+
+
+# Datasets that participate in the BC sweep. Datasets outside this set
+# only run the ``FC`` row.
+_BC_SWEEP_DATASETS = {
+    "ablation_d2", "ablation_d3",
+    "countries_s2", "countries_s3",
+    "family", "wn18rr",
+}
+
+
+def _rows_for_dataset(dataset: str, rows):
+    """Filter the row list to those that make sense for a dataset.
+
+    ``fb15k237`` is too big for the BC grounders in this sweep — we
+    only run the FC row to record the closure benchmark.
+    """
+    if dataset not in _BC_SWEEP_DATASETS:
+        return [r for r in rows if r[0] == "FC"]
+    return rows
+
+
+# Per-dataset default for ``--max-queries`` when the user passes 0
+# (= "use full test split"). fb15k237's test split is huge (20k
+# queries); 50 is what other datasets use anyway, and FC's per-query
+# work scales linearly so we want a bounded number.
+_DEFAULT_MAX_QUERIES = {
+    "fb15k237": 50,
+}
 
 # Each row = (grounder kind, config label, kwargs).
 # ``kind`` selects the runner; ``cfg`` is the config label printed in
@@ -303,7 +337,7 @@ def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
             flat_intermediate=cfg["flat"],
             max_groundings_per_query=4096,
             max_total_groundings=4096,
-            max_states=256, fc_method="join", prune_facts=True,
+            max_states=256, fc_method="spmm", prune_facts=True,
             bump_s_to_k=False,
             init_state_shape="minimal",
         )
@@ -317,16 +351,24 @@ def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
         out = g(queries, qmask, **fwd_kwargs)
     _sync(queries.device)
     elapsed = (time.perf_counter() - t0) * 1000.0
-    # ``ground_rules``: raw rule_groundings count.
-    #   * enum / FC — bodies are pre-grounded via fact_index lookup,
-    #     so this is the keras-comparable unique-apps count.
-    #   * SLD — bodies may carry free variables (resolution is
-    #     standardised-apart), so the raw count includes apps with
-    #     variable bindings; that's the right "rule applications
-    #     attempted" metric. The proof-tree count below is the
-    #     finalised-derivation metric.
+    # ``ground_rules``: keras-comparable unique-apps count.
+    #
+    # For enum, ``rule_groundings.A_in[r]`` already contains
+    # post-grounding (rule, head, body) entries; the row count is the
+    # right metric directly.
+    #
+    # For SLD, ``rule_groundings.A_in[r]`` records EVERY SLD branch
+    # — including pre-substitution bodies that still carry free
+    # variables. Counting raw rows over-reports relative to keras
+    # and enum. We instead derive the keras-comparable metric from
+    # ``out.evidence`` (which is post-substitution): build the unique
+    # ``(rule, head, sorted_body)`` set the same way enum's
+    # rule_groundings does internally.
     pad = kb.padding_idx
-    if out.rule_groundings is not None:
+    if is_sld:
+        ground_rules = _count_unique_apps_from_evidence(
+            out.evidence, kb.M, pad)
+    elif out.rule_groundings is not None:
         ground_rules = sum(out.rule_groundings.A_in[r].shape[0]
                            for r in out.rule_groundings.A_in)
     else:
@@ -410,6 +452,16 @@ def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
     every BC-style grounder at any depth/width admits a subset of
     these apps.
     """
+    # For very large KBs (e.g. fb15k237), the BC enum step over the
+    # closure can't fit on a 24 GB GPU even at batch=1 — its dense
+    # tensors are O(B*S*K_r*G_r*M*3) and K_r alone is in the hundreds.
+    # In that regime, skip BCGrounder construction (which would also
+    # try to build a full-depth closure with fc_depth=10) and go
+    # straight to the closure-only fallback at d=3. The threshold here
+    # is conservative: family / wn18rr are well under 100k facts.
+    if kb.num_facts > 200_000:
+        return _fc_closure_only(kb, queries)
+
     bs = _batch_size_for_kb(kb)
     fwd_kwargs = {"batch_size": bs} if bs > 0 else {}
 
@@ -422,7 +474,7 @@ def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
             filter="fp_batch",
             max_groundings_per_query=4096,
             max_total_groundings=4096,
-            max_states=256, fc_method="join", prune_facts=True,
+            max_states=256, fc_method="spmm", prune_facts=True,
             flat_intermediate=True, bump_s_to_k=False,
             init_state_shape="minimal",
             collect_rule_groundings=True,
@@ -468,7 +520,7 @@ def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
             filter="fp_global",
             max_groundings_per_query=4096,
             max_total_groundings=4096,
-            max_states=256, fc_method="join", prune_facts=True,
+            max_states=256, fc_method="spmm", prune_facts=True,
             flat_intermediate=True, bump_s_to_k=False,
             init_state_shape="minimal",
             collect_rule_groundings=True,
@@ -524,7 +576,54 @@ def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
                 print(f"    [FC CPU bs={chunk_bs} failed: {str(e)[:80]}]")
     except Exception as e:
         print(f"    [FC CPU fallback failed at setup: {str(e)[:80]}]")
-    return 0, 0, 0.0
+
+    # Closure-only fallback when both the GPU and CPU BC-enum paths
+    # failed at OOM. Records the SpMM closure size as the FC metric.
+    print("    [FC: BC-enum step infeasible; recording closure-only metric]")
+    return _fc_closure_only(kb, queries)
+
+
+def _fc_closure_only(kb, queries) -> Tuple[int, int, float]:
+    """SpMM forward-chaining closure size as the FC metric, depth-capped.
+
+    Used when the post-closure BC enum step is infeasible (memory or
+    fan-out blows up on the dense path). The returned ``ground_rules``
+    is the **raw provable-atom count** at depth 3 — semantically not
+    the same as the per-query rule-grounding count from the BC enum
+    step, but it's the natural closure-based number for a KB too
+    large for that step. ``ground_proofs`` is recorded as 0 since we
+    don't enumerate proof trees in this path.
+    """
+    import gc
+    try:
+        from grounder.fc.fc import run_forward_chaining
+        from grounder.data.rule_index import compile_rules
+        rules = compile_rules(
+            kb.rule_index.rules_heads_sorted,
+            kb.rule_index.rules_bodies_sorted,
+            kb.rule_index.rule_lens_sorted,
+            kb.fact_index._num_entities)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        device = str(queries.device)
+        t0 = time.perf_counter()
+        # Cap at depth=3 — for fb15k237 the closure is still growing
+        # at d=3 (113M new atoms in step 2) so ``fixpoint`` would blow
+        # past available memory.
+        _, n_atoms = run_forward_chaining(
+            compiled_rules=rules,
+            facts_idx=kb.fact_index.facts_idx,
+            num_entities=kb.fact_index._num_entities,
+            num_predicates=kb.fact_index._num_predicates,
+            depth=3, device=device)
+        _sync(queries.device)
+        ms = (time.perf_counter() - t0) * 1000.0
+        print(f"    [FC closure-only: {n_atoms} provable atoms, {ms:.0f}ms]")
+        return n_atoms, 0, ms
+    except Exception as e:
+        print(f"    [FC closure-only failed: {type(e).__name__}: {str(e)[:80]}]")
+        return 0, 0, 0.0
 
 
 def _batch_size_for_kb(kb) -> int:
@@ -614,8 +713,11 @@ def main() -> None:
         kb = ds.make_kb(max_facts_per_query=4096,
                         fact_index_type="block_sparse")
         queries = ds.get_queries("test")
-        if args.max_queries > 0:
-            queries = queries[:args.max_queries]
+        max_q = args.max_queries
+        if max_q == 0:
+            max_q = _DEFAULT_MAX_QUERIES.get(ds_name, 0)
+        if max_q > 0:
+            queries = queries[:max_q]
         qmask = torch.ones(queries.shape[0], dtype=torch.bool,
                            device=queries.device)
         bs = _batch_size_for(ds_name)
@@ -624,12 +726,18 @@ def main() -> None:
               f"facts={kb.num_facts}  queries={n_q}  batch_size={bs or 'full'}")
         cells[ds_name] = {"_n_queries": n_q}
 
-        # Run FC first per dataset — its width=None / depth=10 BC pass
-        # is the most memory-hungry single grounder, and we want it to
-        # see a clean GPU before the other 13 grounders fragment the
-        # allocator. The other rows are still printed in their declared
-        # order so the output table matches DEFAULT_ROWS.
-        ordered = sorted(rows_to_run, key=lambda r: 0 if r[0] == "FC" else 1)
+        # Run FC LAST per dataset. The fp_global filter side-effect
+        # is to MUTATE the kb's fact_index by augmenting it with the
+        # full FC closure (see ``_build_fp_global_set`` in bc/bc.py).
+        # Any subsequent grounder running on that mutated kb sees
+        # closure-derived atoms as if they were base facts, which both
+        # changes its grounding count and (if the closure spilled to
+        # CPU) leaves the kb's tensors on mixed devices. Order
+        # FC-last so every other grounder runs on the un-mutated kb.
+        # ``torch.cuda.empty_cache()`` between cells keeps the GPU
+        # tidy enough for FC's closure build.
+        ds_rows = _rows_for_dataset(ds_name, rows_to_run)
+        ordered = sorted(ds_rows, key=lambda r: 1 if r[0] == "FC" else 0)
         for kind, cfg_label, cfg in ordered:
             torch.cuda.empty_cache()
             try:
@@ -680,15 +788,24 @@ def main() -> None:
                 row += f"{value_fn(cell):>{cw}}"
             print(row)
 
-    _print_table("GROUND RULES (unique fully-ground (rule,head,body) — "
-                 "what keras counts)",
-                 lambda c: (str(c.get("ground_rules", c.get("count", 0)))
-                            if c.get("ok") else "FAIL"))
-    _print_table("GROUND PROOFS (per-query proof-tree count summed)",
-                 lambda c: (str(c.get("ground_proofs", 0))
-                            if c.get("ok") else "FAIL"))
-    _print_table("TIMING (ms)", lambda c: (f"{c['ms']:.0f}"
-                                            if c.get("ok") else "FAIL"))
+    def _fmt(c, ok_fn):
+        if not c:
+            return "—"
+        if c.get("ok"):
+            return ok_fn(c)
+        return "FAIL"
+
+    _print_table(
+        "GROUND RULES (unique fully-ground (rule,head,body) — "
+        "what keras counts)",
+        lambda c: _fmt(c, lambda c: str(
+            c.get("ground_rules", c.get("count", 0)))))
+    _print_table(
+        "GROUND PROOFS (per-query proof-tree count summed)",
+        lambda c: _fmt(c, lambda c: str(c.get("ground_proofs", 0))))
+    _print_table(
+        "TIMING (ms)",
+        lambda c: _fmt(c, lambda c: f"{c['ms']:.0f}"))
 
     # ── Write JSON baseline ──
     out_path = args.output

@@ -49,11 +49,24 @@ def init_enum(
     Returns dict with 'compiled' (CompiledRules), 'buffers' (tensors to
     register), and scalar config values.
     """
-    # P and E
-    P = getattr(fact_index, "_num_predicates", None)
-    if P is None:
-        P = (int(facts_idx[:, 0].max().item()) + 1
-             if facts_idx.numel() > 0 else 1)
+    # P and E. ``fact_index._num_predicates`` only counts predicates
+    # that appear in facts, but rules can reference predicates that
+    # never appear as facts (e.g. an inverse predicate that's only
+    # ever derived). Take the max across facts AND rule HEADS so the
+    # head predicate mask is sized correctly. Body atoms are NOT
+    # included: ``rules_bodies_sorted`` may contain ``padding_idx``
+    # as a padding marker (rules with fewer body atoms than ``M_max``)
+    # which is not a real predicate and would inflate P unnecessarily
+    # (on wn18rr this would push P from 12 to 40573).
+    P_facts = getattr(fact_index, "_num_predicates", None)
+    if P_facts is None:
+        P_facts = (int(facts_idx[:, 0].max().item()) + 1
+                   if facts_idx.numel() > 0 else 1)
+    P_heads = 0
+    rh = rule_index.rules_heads_sorted
+    if rh.numel() > 0:
+        P_heads = int(rh[:, 0].max().item()) + 1
+    P = max(P_facts, P_heads)
     E = getattr(fact_index, "_num_entities", None)
     if E is None:
         E = (int(max(facts_idx[:, 1].max().item(),

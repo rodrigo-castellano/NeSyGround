@@ -1,12 +1,13 @@
 {
-  "generated_at": "2026-04-30T17:42:26+00:00",
+  "generated_at": "2026-05-01T10:09:03+00:00",
   "datasets": [
     "ablation_d2",
     "ablation_d3",
     "countries_s2",
     "countries_s3",
     "family",
-    "wn18rr"
+    "wn18rr",
+    "fb15k237"
   ],
   "rows": [
     "keras-BC:w0d1",
@@ -32,7 +33,7 @@
       "keras-BC:w0d1": {
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 1.41,
+        "ms": 1.65,
         "ok": true,
         "error": null,
         "count": 0
@@ -40,7 +41,7 @@
       "keras-BC:w1d2": {
         "ground_rules": 118,
         "ground_proofs": 118,
-        "ms": 4.73,
+        "ms": 4.72,
         "ok": true,
         "error": null,
         "count": 118
@@ -48,47 +49,47 @@
       "keras-BC:w1d3": {
         "ground_rules": 377,
         "ground_proofs": 377,
-        "ms": 7.44,
+        "ms": 7.29,
         "ok": true,
         "error": null,
         "count": 377
       },
       "SLD:d1": {
-        "ground_rules": 25,
+        "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 6.8,
+        "ms": 7.54,
         "ok": true,
         "error": null,
-        "count": 25
+        "count": 0
       },
       "SLD:d2": {
-        "ground_rules": 25,
+        "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 12.45,
+        "ms": 12.3,
         "ok": true,
         "error": null,
-        "count": 25
+        "count": 0
       },
       "SLD:d3": {
-        "ground_rules": 102,
+        "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 18.79,
+        "ms": 19.68,
         "ok": true,
         "error": null,
-        "count": 102
+        "count": 0
       },
       "SLD:d4": {
-        "ground_rules": 102,
+        "ground_rules": 106,
         "ground_proofs": 76,
-        "ms": 25.5,
+        "ms": 27.2,
         "ok": true,
         "error": null,
-        "count": 102
+        "count": 106
       },
       "enum-flat:w0d1": {
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.4,
+        "ms": 5.49,
         "ok": true,
         "error": null,
         "count": 0
@@ -96,7 +97,7 @@
       "enum-flat:w1d2": {
         "ground_rules": 118,
         "ground_proofs": 76,
-        "ms": 14.63,
+        "ms": 23.21,
         "ok": true,
         "error": null,
         "count": 118
@@ -104,7 +105,7 @@
       "enum-flat:w1d3": {
         "ground_rules": 377,
         "ground_proofs": 280,
-        "ms": 21.46,
+        "ms": 21.59,
         "ok": true,
         "error": null,
         "count": 377
@@ -112,7 +113,7 @@
       "enum-dense:w0d1": {
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.84,
+        "ms": 5.62,
         "ok": true,
         "error": null,
         "count": 0
@@ -120,7 +121,7 @@
       "enum-dense:w1d2": {
         "ground_rules": 118,
         "ground_proofs": 76,
-        "ms": 14.46,
+        "ms": 14.54,
         "ok": true,
         "error": null,
         "count": 118
@@ -128,7 +129,7 @@
       "enum-dense:w1d3": {
         "ground_rules": 377,
         "ground_proofs": 367,
-        "ms": 23.38,
+        "ms": 23.2,
         "ok": true,
         "error": null,
         "count": 377
@@ -136,7 +137,7 @@
       "FC:fp_global": {
         "ground_rules": 1008,
         "ground_proofs": 84,
-        "ms": 7.53,
+        "ms": 7.27,
         "ok": true,
         "error": null,
         "count": 1008
@@ -147,7 +148,7 @@
       "keras-BC:w0d1": {
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 0.96,
+        "ms": 0.95,
         "ok": true,
         "error": null,
         "count": 0
@@ -155,7 +156,7 @@
       "keras-BC:w1d2": {
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 3.17,
+        "ms": 3.18,
         "ok": true,
         "error": null,
         "count": 0
@@ -163,47 +164,47 @@
       "keras-BC:w1d3": {
         "ground_rules": 252,
         "ground_proofs": 252,
-        "ms": 5.53,
+        "ms": 5.69,
         "ok": true,
         "error": null,
         "count": 252
       },
       "SLD:d1": {
-        "ground_rules": 25,
+        "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 6.38,
+        "ms": 6.55,
         "ok": true,
         "error": null,
-        "count": 25
+        "count": 0
       },
       "SLD:d2": {
-        "ground_rules": 25,
+        "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 12.11,
+        "ms": 12.3,
         "ok": true,
         "error": null,
-        "count": 25
+        "count": 0
       },
       "SLD:d3": {
-        "ground_rules": 105,
+        "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 18.33,
+        "ms": 18.85,
         "ok": true,
         "error": null,
-        "count": 105
+        "count": 0
       },
       "SLD:d4": {
-        "ground_rules": 105,
+        "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 25.5,
+        "ms": 25.73,
         "ok": true,
         "error": null,
-        "count": 105
+        "count": 0
       },
       "enum-flat:w0d1": {
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.07,
+        "ms": 5.11,
         "ok": true,
         "error": null,
         "count": 0
@@ -211,7 +212,7 @@
       "enum-flat:w1d2": {
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 12.22,
+        "ms": 12.52,
         "ok": true,
         "error": null,
         "count": 0
@@ -219,7 +220,7 @@
       "enum-flat:w1d3": {
         "ground_rules": 252,
         "ground_proofs": 46,
-        "ms": 21.21,
+        "ms": 21.07,
         "ok": true,
         "error": null,
         "count": 252
@@ -227,7 +228,7 @@
       "enum-dense:w0d1": {
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.44,
+        "ms": 5.53,
         "ok": true,
         "error": null,
         "count": 0
@@ -235,7 +236,7 @@
       "enum-dense:w1d2": {
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 13.54,
+        "ms": 13.93,
         "ok": true,
         "error": null,
         "count": 0
@@ -243,7 +244,7 @@
       "enum-dense:w1d3": {
         "ground_rules": 252,
         "ground_proofs": 54,
-        "ms": 22.91,
+        "ms": 22.67,
         "ok": true,
         "error": null,
         "count": 252
@@ -251,7 +252,7 @@
       "FC:fp_global": {
         "ground_rules": 987,
         "ground_proofs": 88,
-        "ms": 6.89,
+        "ms": 7.07,
         "ok": true,
         "error": null,
         "count": 987
@@ -262,7 +263,7 @@
       "keras-BC:w0d1": {
         "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 2.56,
+        "ms": 2.55,
         "ok": true,
         "error": null,
         "count": 67
@@ -270,7 +271,7 @@
       "keras-BC:w1d2": {
         "ground_rules": 119,
         "ground_proofs": 119,
-        "ms": 4.0,
+        "ms": 3.92,
         "ok": true,
         "error": null,
         "count": 119
@@ -278,47 +279,47 @@
       "keras-BC:w1d3": {
         "ground_rules": 165,
         "ground_proofs": 165,
-        "ms": 6.04,
+        "ms": 7.74,
         "ok": true,
         "error": null,
         "count": 165
       },
       "SLD:d1": {
-        "ground_rules": 48,
+        "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 6.38,
+        "ms": 6.67,
         "ok": true,
         "error": null,
-        "count": 48
+        "count": 0
       },
       "SLD:d2": {
-        "ground_rules": 48,
+        "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 12.41,
+        "ms": 12.53,
         "ok": true,
         "error": null,
-        "count": 48
+        "count": 67
       },
       "SLD:d3": {
-        "ground_rules": 106,
+        "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 18.67,
+        "ms": 18.95,
         "ok": true,
         "error": null,
-        "count": 106
+        "count": 67
       },
       "SLD:d4": {
-        "ground_rules": 106,
+        "ground_rules": 118,
         "ground_proofs": 145,
-        "ms": 26.06,
+        "ms": 25.57,
         "ok": true,
         "error": null,
-        "count": 106
+        "count": 118
       },
       "enum-flat:w0d1": {
         "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 8.11,
+        "ms": 8.08,
         "ok": true,
         "error": null,
         "count": 67
@@ -326,7 +327,7 @@
       "enum-flat:w1d2": {
         "ground_rules": 119,
         "ground_proofs": 145,
-        "ms": 14.12,
+        "ms": 14.17,
         "ok": true,
         "error": null,
         "count": 119
@@ -334,7 +335,7 @@
       "enum-flat:w1d3": {
         "ground_rules": 165,
         "ground_proofs": 273,
-        "ms": 21.21,
+        "ms": 21.28,
         "ok": true,
         "error": null,
         "count": 165
@@ -342,7 +343,7 @@
       "enum-dense:w0d1": {
         "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 7.1,
+        "ms": 7.34,
         "ok": true,
         "error": null,
         "count": 67
@@ -350,7 +351,7 @@
       "enum-dense:w1d2": {
         "ground_rules": 119,
         "ground_proofs": 145,
-        "ms": 18.83,
+        "ms": 18.68,
         "ok": true,
         "error": null,
         "count": 119
@@ -358,7 +359,7 @@
       "enum-dense:w1d3": {
         "ground_rules": 165,
         "ground_proofs": 311,
-        "ms": 32.61,
+        "ms": 32.0,
         "ok": true,
         "error": null,
         "count": 165
@@ -366,7 +367,7 @@
       "FC:fp_global": {
         "ground_rules": 1296,
         "ground_proofs": 99,
-        "ms": 7.13,
+        "ms": 7.4,
         "ok": true,
         "error": null,
         "count": 1296
@@ -377,7 +378,7 @@
       "keras-BC:w0d1": {
         "ground_rules": 42,
         "ground_proofs": 42,
-        "ms": 37.04,
+        "ms": 35.72,
         "ok": true,
         "error": null,
         "count": 42
@@ -385,7 +386,7 @@
       "keras-BC:w1d2": {
         "ground_rules": 783,
         "ground_proofs": 783,
-        "ms": 202.86,
+        "ms": 203.77,
         "ok": true,
         "error": null,
         "count": 783
@@ -393,47 +394,47 @@
       "keras-BC:w1d3": {
         "ground_rules": 3349,
         "ground_proofs": 3349,
-        "ms": 353.35,
+        "ms": 381.48,
         "ok": true,
         "error": null,
         "count": 3349
       },
       "SLD:d1": {
-        "ground_rules": 72,
+        "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 6.72,
+        "ms": 7.52,
         "ok": true,
         "error": null,
-        "count": 72
+        "count": 0
       },
       "SLD:d2": {
-        "ground_rules": 72,
+        "ground_rules": 1,
         "ground_proofs": 1,
-        "ms": 12.89,
+        "ms": 12.83,
         "ok": true,
         "error": null,
-        "count": 72
+        "count": 1
       },
       "SLD:d3": {
-        "ground_rules": 339,
+        "ground_rules": 42,
         "ground_proofs": 42,
-        "ms": 19.79,
+        "ms": 19.54,
         "ok": true,
         "error": null,
-        "count": 339
+        "count": 42
       },
       "SLD:d4": {
-        "ground_rules": 1494,
+        "ground_rules": 189,
         "ground_proofs": 149,
-        "ms": 27.97,
+        "ms": 32.42,
         "ok": true,
         "error": null,
-        "count": 1494
+        "count": 189
       },
       "enum-flat:w0d1": {
         "ground_rules": 42,
         "ground_proofs": 42,
-        "ms": 8.73,
+        "ms": 9.1,
         "ok": true,
         "error": null,
         "count": 42
@@ -441,7 +442,7 @@
       "enum-flat:w1d2": {
         "ground_rules": 783,
         "ground_proofs": 813,
-        "ms": 21.96,
+        "ms": 21.47,
         "ok": true,
         "error": null,
         "count": 783
@@ -449,7 +450,7 @@
       "enum-flat:w1d3": {
         "ground_rules": 3349,
         "ground_proofs": 2677,
-        "ms": 119.88,
+        "ms": 119.65,
         "ok": true,
         "error": null,
         "count": 3349
@@ -457,7 +458,7 @@
       "enum-dense:w0d1": {
         "ground_rules": 41,
         "ground_proofs": 41,
-        "ms": 8.33,
+        "ms": 9.35,
         "ok": true,
         "error": null,
         "count": 41
@@ -465,7 +466,7 @@
       "enum-dense:w1d2": {
         "ground_rules": 751,
         "ground_proofs": 307,
-        "ms": 38.17,
+        "ms": 38.8,
         "ok": true,
         "error": null,
         "count": 751
@@ -473,7 +474,7 @@
       "enum-dense:w1d3": {
         "ground_rules": 3123,
         "ground_proofs": 577,
-        "ms": 71.46,
+        "ms": 72.9,
         "ok": true,
         "error": null,
         "count": 3123
@@ -481,7 +482,7 @@
       "FC:fp_global": {
         "ground_rules": 4846,
         "ground_proofs": 478,
-        "ms": 9.18,
+        "ms": 9.12,
         "ok": true,
         "error": null,
         "count": 4846
@@ -492,7 +493,7 @@
       "keras-BC:w0d1": {
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 384.64,
+        "ms": 387.27,
         "ok": true,
         "error": null,
         "count": 18071
@@ -500,7 +501,7 @@
       "keras-BC:w1d2": {
         "ground_rules": 34949,
         "ground_proofs": 34949,
-        "ms": 2228.3,
+        "ms": 2238.9,
         "ok": true,
         "error": null,
         "count": 34949
@@ -508,34 +509,34 @@
       "keras-BC:w1d3": {
         "ground_rules": 39414,
         "ground_proofs": 39414,
-        "ms": 6594.89,
+        "ms": 6436.95,
         "ok": true,
         "error": null,
         "count": 39414
       },
       "SLD:d1": {
-        "ground_rules": 25480,
+        "ground_rules": 318,
         "ground_proofs": 318,
-        "ms": 381.49,
+        "ms": 397.82,
         "ok": true,
         "error": null,
-        "count": 25480
+        "count": 318
       },
       "SLD:d2": {
-        "ground_rules": 59090,
+        "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 986.12,
+        "ms": 990.77,
         "ok": true,
         "error": null,
-        "count": 59090
+        "count": 18071
       },
       "SLD:d3": {
-        "ground_rules": 296820,
+        "ground_rules": 18199,
         "ground_proofs": 18206,
-        "ms": 1729.96,
+        "ms": 1762.19,
         "ok": true,
         "error": null,
-        "count": 296820
+        "count": 18199
       },
       "SLD:d4": {
         "ground_rules": 0,
@@ -548,7 +549,7 @@
       "enum-flat:w0d1": {
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 487.45,
+        "ms": 499.18,
         "ok": true,
         "error": null,
         "count": 18071
@@ -556,7 +557,7 @@
       "enum-flat:w1d2": {
         "ground_rules": 34949,
         "ground_proofs": 61604,
-        "ms": 1108.67,
+        "ms": 1132.56,
         "ok": true,
         "error": null,
         "count": 34949
@@ -564,7 +565,7 @@
       "enum-flat:w1d3": {
         "ground_rules": 39414,
         "ground_proofs": 148533,
-        "ms": 2018.01,
+        "ms": 2029.75,
         "ok": true,
         "error": null,
         "count": 39414
@@ -572,7 +573,7 @@
       "enum-dense:w0d1": {
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 457.84,
+        "ms": 471.07,
         "ok": true,
         "error": null,
         "count": 18071
@@ -580,7 +581,7 @@
       "enum-dense:w1d2": {
         "ground_rules": 34950,
         "ground_proofs": 71314,
-        "ms": 4143.95,
+        "ms": 4171.59,
         "ok": true,
         "error": null,
         "count": 34950
@@ -588,7 +589,7 @@
       "enum-dense:w1d3": {
         "ground_rules": 39274,
         "ground_proofs": 135402,
-        "ms": 8571.2,
+        "ms": 8625.6,
         "ok": true,
         "error": null,
         "count": 39274
@@ -596,7 +597,7 @@
       "FC:fp_global": {
         "ground_rules": 153999,
         "ground_proofs": 30493,
-        "ms": 470.49,
+        "ms": 454.48,
         "ok": true,
         "error": null,
         "count": 153999
@@ -607,7 +608,7 @@
       "keras-BC:w0d1": {
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 586.94,
+        "ms": 581.52,
         "ok": true,
         "error": null,
         "count": 1266
@@ -615,7 +616,7 @@
       "keras-BC:w1d2": {
         "ground_rules": 2610,
         "ground_proofs": 2610,
-        "ms": 6488.43,
+        "ms": 7037.3,
         "ok": true,
         "error": null,
         "count": 2610
@@ -623,47 +624,47 @@
       "keras-BC:w1d3": {
         "ground_rules": 4394,
         "ground_proofs": 4394,
-        "ms": 26739.38,
+        "ms": 26584.86,
         "ok": true,
         "error": null,
         "count": 4394
       },
       "SLD:d1": {
-        "ground_rules": 10486,
+        "ground_rules": 1088,
         "ground_proofs": 1088,
-        "ms": 1872.66,
+        "ms": 1724.26,
         "ok": true,
         "error": null,
-        "count": 10486
+        "count": 1088
       },
       "SLD:d2": {
-        "ground_rules": 45301,
+        "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 4168.11,
+        "ms": 4158.51,
         "ok": true,
         "error": null,
-        "count": 45301
+        "count": 1266
       },
       "SLD:d3": {
-        "ground_rules": 242757,
+        "ground_rules": 1369,
         "ground_proofs": 1370,
-        "ms": 6953.91,
+        "ms": 7078.62,
         "ok": true,
         "error": null,
-        "count": 242757
+        "count": 1369
       },
       "SLD:d4": {
-        "ground_rules": 841518,
+        "ground_rules": 2774,
         "ground_proofs": 2276,
-        "ms": 10354.77,
+        "ms": 10351.95,
         "ok": true,
         "error": null,
-        "count": 841518
+        "count": 2774
       },
       "enum-flat:w0d1": {
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 1664.68,
+        "ms": 1714.26,
         "ok": true,
         "error": null,
         "count": 1266
@@ -671,7 +672,7 @@
       "enum-flat:w1d2": {
         "ground_rules": 2610,
         "ground_proofs": 1727,
-        "ms": 3402.35,
+        "ms": 3416.31,
         "ok": true,
         "error": null,
         "count": 2610
@@ -679,7 +680,7 @@
       "enum-flat:w1d3": {
         "ground_rules": 4394,
         "ground_proofs": 2336,
-        "ms": 5936.64,
+        "ms": 5913.51,
         "ok": true,
         "error": null,
         "count": 4394
@@ -687,7 +688,7 @@
       "enum-dense:w0d1": {
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 1581.4,
+        "ms": 1625.89,
         "ok": true,
         "error": null,
         "count": 1266
@@ -695,7 +696,7 @@
       "enum-dense:w1d2": {
         "ground_rules": 2552,
         "ground_proofs": 2018,
-        "ms": 17130.04,
+        "ms": 17204.72,
         "ok": true,
         "error": null,
         "count": 2552
@@ -703,18 +704,29 @@
       "enum-dense:w1d3": {
         "ground_rules": 3828,
         "ground_proofs": 2998,
-        "ms": 35795.66,
+        "ms": 35810.45,
         "ok": true,
         "error": null,
         "count": 3828
       },
       "FC:fp_global": {
-        "ground_rules": 0,
+        "ground_rules": 33489363,
         "ground_proofs": 0,
-        "ms": 0.0,
+        "ms": 1986.79,
         "ok": true,
         "error": null,
-        "count": 0
+        "count": 33489363
+      }
+    },
+    "fb15k237": {
+      "_n_queries": 50,
+      "FC:fp_global": {
+        "ground_rules": 256941207,
+        "ground_proofs": 0,
+        "ms": 240354.68,
+        "ok": true,
+        "error": null,
+        "count": 256941207
       }
     }
   }
