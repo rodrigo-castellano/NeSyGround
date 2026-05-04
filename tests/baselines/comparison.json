@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-01T11:01:59+00:00",
+  "generated_at": "2026-05-04T09:46:11+00:00",
   "datasets": [
     "ablation_d2",
     "ablation_d3",
@@ -31,30 +31,34 @@
     "ablation_d2": {
       "_n_queries": 25,
       "keras-BC:w0d1": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 1.41,
+        "ms": 1.34,
         "ok": true,
         "error": null,
         "count": 0
       },
       "keras-BC:w1d2": {
+        "considered_rules": 118,
         "ground_rules": 118,
         "ground_proofs": 118,
-        "ms": 4.63,
+        "ms": 4.4,
         "ok": true,
         "error": null,
         "count": 118
       },
       "keras-BC:w1d3": {
+        "considered_rules": 377,
         "ground_rules": 377,
         "ground_proofs": 377,
-        "ms": 7.28,
+        "ms": 7.04,
         "ok": true,
         "error": null,
         "count": 377
       },
       "SLD:d1": {
+        "considered_rules": 25,
         "ground_rules": 0,
         "ground_proofs": 0,
         "ms": 7.07,
@@ -63,482 +67,541 @@
         "count": 0
       },
       "SLD:d2": {
+        "considered_rules": 25,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 12.11,
+        "ms": 12.05,
         "ok": true,
         "error": null,
         "count": 0
       },
       "SLD:d3": {
+        "considered_rules": 102,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 18.81,
+        "ms": 18.21,
         "ok": true,
         "error": null,
         "count": 0
       },
       "SLD:d4": {
+        "considered_rules": 102,
         "ground_rules": 106,
         "ground_proofs": 76,
-        "ms": 25.22,
+        "ms": 24.11,
         "ok": true,
         "error": null,
         "count": 106
       },
       "enum-flat:w0d1": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.38,
+        "ms": 5.08,
         "ok": true,
         "error": null,
         "count": 0
       },
       "enum-flat:w1d2": {
+        "considered_rules": 118,
         "ground_rules": 106,
         "ground_proofs": 76,
-        "ms": 13.89,
+        "ms": 13.33,
         "ok": true,
         "error": null,
         "count": 106
       },
       "enum-flat:w1d3": {
+        "considered_rules": 377,
         "ground_rules": 226,
         "ground_proofs": 280,
-        "ms": 21.12,
+        "ms": 19.91,
         "ok": true,
         "error": null,
         "count": 226
       },
       "enum-dense:w0d1": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.48,
+        "ms": 5.21,
         "ok": true,
         "error": null,
         "count": 0
       },
       "enum-dense:w1d2": {
+        "considered_rules": 118,
         "ground_rules": 106,
         "ground_proofs": 76,
-        "ms": 14.21,
+        "ms": 13.85,
         "ok": true,
         "error": null,
         "count": 106
       },
       "enum-dense:w1d3": {
+        "considered_rules": 377,
         "ground_rules": 263,
         "ground_proofs": 367,
-        "ms": 22.74,
+        "ms": 22.11,
         "ok": true,
         "error": null,
         "count": 263
       },
       "FC:fp_global": {
-        "ground_rules": 1008,
+        "considered_rules": 1008,
+        "ground_rules": 84,
         "ground_proofs": 84,
-        "ms": 7.07,
+        "ms": 6.93,
         "ok": true,
         "error": null,
-        "count": 1008
+        "count": 84
       }
     },
     "ablation_d3": {
       "_n_queries": 25,
       "keras-BC:w0d1": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 0.91,
+        "ms": 0.92,
         "ok": true,
         "error": null,
         "count": 0
       },
       "keras-BC:w1d2": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 3.06,
+        "ms": 2.99,
         "ok": true,
         "error": null,
         "count": 0
       },
       "keras-BC:w1d3": {
+        "considered_rules": 252,
         "ground_rules": 252,
         "ground_proofs": 252,
-        "ms": 5.74,
+        "ms": 5.47,
         "ok": true,
         "error": null,
         "count": 252
       },
       "SLD:d1": {
+        "considered_rules": 25,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 6.48,
+        "ms": 6.08,
         "ok": true,
         "error": null,
         "count": 0
       },
       "SLD:d2": {
+        "considered_rules": 25,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 11.94,
+        "ms": 11.53,
         "ok": true,
         "error": null,
         "count": 0
       },
       "SLD:d3": {
+        "considered_rules": 105,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 18.66,
+        "ms": 17.71,
         "ok": true,
         "error": null,
         "count": 0
       },
       "SLD:d4": {
+        "considered_rules": 105,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 25.1,
+        "ms": 23.76,
         "ok": true,
         "error": null,
         "count": 0
       },
       "enum-flat:w0d1": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.16,
+        "ms": 4.88,
         "ok": true,
         "error": null,
         "count": 0
       },
       "enum-flat:w1d2": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 12.15,
+        "ms": 11.54,
         "ok": true,
         "error": null,
         "count": 0
       },
       "enum-flat:w1d3": {
+        "considered_rules": 252,
         "ground_rules": 69,
         "ground_proofs": 46,
-        "ms": 20.68,
+        "ms": 20.0,
         "ok": true,
         "error": null,
         "count": 69
       },
       "enum-dense:w0d1": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.47,
+        "ms": 5.14,
         "ok": true,
         "error": null,
         "count": 0
       },
       "enum-dense:w1d2": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 13.58,
+        "ms": 13.06,
         "ok": true,
         "error": null,
         "count": 0
       },
       "enum-dense:w1d3": {
+        "considered_rules": 252,
         "ground_rules": 80,
         "ground_proofs": 54,
-        "ms": 22.54,
+        "ms": 21.68,
         "ok": true,
         "error": null,
         "count": 80
       },
       "FC:fp_global": {
-        "ground_rules": 987,
+        "considered_rules": 987,
+        "ground_rules": 88,
         "ground_proofs": 88,
-        "ms": 7.1,
+        "ms": 6.65,
         "ok": true,
         "error": null,
-        "count": 987
+        "count": 88
       }
     },
     "countries_s2": {
       "_n_queries": 24,
       "keras-BC:w0d1": {
+        "considered_rules": 67,
         "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 2.52,
+        "ms": 2.51,
         "ok": true,
         "error": null,
         "count": 67
       },
       "keras-BC:w1d2": {
+        "considered_rules": 119,
         "ground_rules": 119,
         "ground_proofs": 119,
-        "ms": 4.02,
+        "ms": 3.97,
         "ok": true,
         "error": null,
         "count": 119
       },
       "keras-BC:w1d3": {
+        "considered_rules": 165,
         "ground_rules": 165,
         "ground_proofs": 165,
-        "ms": 5.86,
+        "ms": 5.82,
         "ok": true,
         "error": null,
         "count": 165
       },
       "SLD:d1": {
+        "considered_rules": 48,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 6.73,
+        "ms": 6.36,
         "ok": true,
         "error": null,
         "count": 0
       },
       "SLD:d2": {
+        "considered_rules": 48,
         "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 12.12,
+        "ms": 11.55,
         "ok": true,
         "error": null,
         "count": 67
       },
       "SLD:d3": {
+        "considered_rules": 106,
         "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 18.95,
+        "ms": 17.8,
         "ok": true,
         "error": null,
         "count": 67
       },
       "SLD:d4": {
+        "considered_rules": 106,
         "ground_rules": 118,
         "ground_proofs": 145,
-        "ms": 25.62,
+        "ms": 24.49,
         "ok": true,
         "error": null,
         "count": 118
       },
       "enum-flat:w0d1": {
+        "considered_rules": 67,
         "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 8.11,
+        "ms": 7.48,
         "ok": true,
         "error": null,
         "count": 67
       },
       "enum-flat:w1d2": {
+        "considered_rules": 119,
         "ground_rules": 118,
         "ground_proofs": 145,
-        "ms": 14.08,
+        "ms": 13.21,
         "ok": true,
         "error": null,
         "count": 118
       },
       "enum-flat:w1d3": {
+        "considered_rules": 165,
         "ground_rules": 156,
         "ground_proofs": 273,
-        "ms": 21.09,
+        "ms": 19.76,
         "ok": true,
         "error": null,
         "count": 156
       },
       "enum-dense:w0d1": {
+        "considered_rules": 67,
         "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 7.25,
+        "ms": 6.77,
         "ok": true,
         "error": null,
         "count": 67
       },
       "enum-dense:w1d2": {
+        "considered_rules": 119,
         "ground_rules": 118,
         "ground_proofs": 145,
-        "ms": 18.4,
+        "ms": 17.96,
         "ok": true,
         "error": null,
         "count": 118
       },
       "enum-dense:w1d3": {
+        "considered_rules": 165,
         "ground_rules": 163,
         "ground_proofs": 311,
-        "ms": 31.95,
+        "ms": 31.01,
         "ok": true,
         "error": null,
         "count": 163
       },
       "FC:fp_global": {
-        "ground_rules": 1296,
+        "considered_rules": 1296,
+        "ground_rules": 99,
         "ground_proofs": 99,
-        "ms": 7.39,
+        "ms": 7.08,
         "ok": true,
         "error": null,
-        "count": 1296
+        "count": 99
       }
     },
     "countries_s3": {
       "_n_queries": 24,
       "keras-BC:w0d1": {
+        "considered_rules": 42,
         "ground_rules": 42,
         "ground_proofs": 42,
-        "ms": 34.87,
+        "ms": 33.37,
         "ok": true,
         "error": null,
         "count": 42
       },
       "keras-BC:w1d2": {
+        "considered_rules": 783,
         "ground_rules": 783,
         "ground_proofs": 783,
-        "ms": 204.62,
+        "ms": 201.23,
         "ok": true,
         "error": null,
         "count": 783
       },
       "keras-BC:w1d3": {
+        "considered_rules": 3349,
         "ground_rules": 3349,
         "ground_proofs": 3349,
-        "ms": 370.53,
+        "ms": 349.66,
         "ok": true,
         "error": null,
         "count": 3349
       },
       "SLD:d1": {
+        "considered_rules": 72,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 7.01,
+        "ms": 6.53,
         "ok": true,
         "error": null,
         "count": 0
       },
       "SLD:d2": {
+        "considered_rules": 72,
         "ground_rules": 1,
         "ground_proofs": 1,
-        "ms": 12.63,
+        "ms": 12.05,
         "ok": true,
         "error": null,
         "count": 1
       },
       "SLD:d3": {
+        "considered_rules": 339,
         "ground_rules": 42,
         "ground_proofs": 42,
-        "ms": 19.57,
+        "ms": 18.48,
         "ok": true,
         "error": null,
         "count": 42
       },
       "SLD:d4": {
+        "considered_rules": 1494,
         "ground_rules": 189,
         "ground_proofs": 149,
-        "ms": 27.35,
+        "ms": 26.29,
         "ok": true,
         "error": null,
         "count": 189
       },
       "enum-flat:w0d1": {
+        "considered_rules": 42,
         "ground_rules": 42,
         "ground_proofs": 42,
-        "ms": 8.78,
+        "ms": 8.37,
         "ok": true,
         "error": null,
         "count": 42
       },
       "enum-flat:w1d2": {
+        "considered_rules": 783,
         "ground_rules": 599,
         "ground_proofs": 813,
-        "ms": 21.74,
+        "ms": 20.85,
         "ok": true,
         "error": null,
         "count": 599
       },
       "enum-flat:w1d3": {
+        "considered_rules": 3349,
         "ground_rules": 1016,
         "ground_proofs": 2677,
-        "ms": 120.09,
+        "ms": 118.72,
         "ok": true,
         "error": null,
         "count": 1016
       },
       "enum-dense:w0d1": {
+        "considered_rules": 41,
         "ground_rules": 41,
         "ground_proofs": 41,
-        "ms": 9.42,
+        "ms": 8.43,
         "ok": true,
         "error": null,
         "count": 41
       },
       "enum-dense:w1d2": {
+        "considered_rules": 751,
         "ground_rules": 304,
         "ground_proofs": 307,
-        "ms": 38.78,
+        "ms": 37.83,
         "ok": true,
         "error": null,
         "count": 304
       },
       "enum-dense:w1d3": {
+        "considered_rules": 3123,
         "ground_rules": 409,
         "ground_proofs": 577,
-        "ms": 71.01,
+        "ms": 70.6,
         "ok": true,
         "error": null,
         "count": 409
       },
       "FC:fp_global": {
-        "ground_rules": 4846,
+        "considered_rules": 4846,
+        "ground_rules": 478,
         "ground_proofs": 478,
-        "ms": 8.71,
+        "ms": 8.47,
         "ok": true,
         "error": null,
-        "count": 4846
+        "count": 478
       }
     },
     "family": {
       "_n_queries": 5626,
       "keras-BC:w0d1": {
+        "considered_rules": 18071,
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 384.46,
+        "ms": 366.77,
         "ok": true,
         "error": null,
         "count": 18071
       },
       "keras-BC:w1d2": {
+        "considered_rules": 34949,
         "ground_rules": 34949,
         "ground_proofs": 34949,
-        "ms": 2234.21,
+        "ms": 2147.54,
         "ok": true,
         "error": null,
         "count": 34949
       },
       "keras-BC:w1d3": {
+        "considered_rules": 39414,
         "ground_rules": 39414,
         "ground_proofs": 39414,
-        "ms": 6454.4,
+        "ms": 6207.9,
         "ok": true,
         "error": null,
         "count": 39414
       },
       "SLD:d1": {
+        "considered_rules": 25480,
         "ground_rules": 318,
         "ground_proofs": 318,
-        "ms": 391.78,
+        "ms": 372.77,
         "ok": true,
         "error": null,
         "count": 318
       },
       "SLD:d2": {
+        "considered_rules": 59090,
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 981.72,
+        "ms": 954.96,
         "ok": true,
         "error": null,
         "count": 18071
       },
       "SLD:d3": {
+        "considered_rules": 296820,
         "ground_rules": 18199,
         "ground_proofs": 18206,
-        "ms": 1764.36,
+        "ms": 1730.08,
         "ok": true,
         "error": null,
         "count": 18199
       },
       "SLD:d4": {
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
         "ms": 0.0,
@@ -547,172 +610,193 @@
         "count": 0
       },
       "enum-flat:w0d1": {
+        "considered_rules": 18071,
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 494.27,
+        "ms": 478.0,
         "ok": true,
         "error": null,
         "count": 18071
       },
       "enum-flat:w1d2": {
+        "considered_rules": 34949,
         "ground_rules": 32846,
         "ground_proofs": 61604,
-        "ms": 1117.32,
+        "ms": 1088.59,
         "ok": true,
         "error": null,
         "count": 32846
       },
       "enum-flat:w1d3": {
+        "considered_rules": 39414,
         "ground_rules": 36028,
         "ground_proofs": 148533,
-        "ms": 2019.56,
+        "ms": 1975.37,
         "ok": true,
         "error": null,
         "count": 36028
       },
       "enum-dense:w0d1": {
+        "considered_rules": 18071,
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 466.85,
+        "ms": 464.71,
         "ok": true,
         "error": null,
         "count": 18071
       },
       "enum-dense:w1d2": {
+        "considered_rules": 34950,
         "ground_rules": 34766,
         "ground_proofs": 71314,
-        "ms": 4155.1,
+        "ms": 4136.08,
         "ok": true,
         "error": null,
         "count": 34766
       },
       "enum-dense:w1d3": {
+        "considered_rules": 39274,
         "ground_rules": 35400,
         "ground_proofs": 135402,
-        "ms": 8583.34,
+        "ms": 8560.42,
         "ok": true,
         "error": null,
         "count": 35400
       },
       "FC:fp_global": {
-        "ground_rules": 153999,
+        "considered_rules": 153999,
+        "ground_rules": 30493,
         "ground_proofs": 30493,
-        "ms": 450.37,
+        "ms": 437.2,
         "ok": true,
         "error": null,
-        "count": 153999
+        "count": 30493
       }
     },
     "wn18rr": {
       "_n_queries": 2924,
       "keras-BC:w0d1": {
+        "considered_rules": 1266,
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 575.96,
+        "ms": 558.2,
         "ok": true,
         "error": null,
         "count": 1266
       },
       "keras-BC:w1d2": {
+        "considered_rules": 2610,
         "ground_rules": 2610,
         "ground_proofs": 2610,
-        "ms": 6867.49,
+        "ms": 6558.79,
         "ok": true,
         "error": null,
         "count": 2610
       },
       "keras-BC:w1d3": {
+        "considered_rules": 4394,
         "ground_rules": 4394,
         "ground_proofs": 4394,
-        "ms": 27278.47,
+        "ms": 26233.95,
         "ok": true,
         "error": null,
         "count": 4394
       },
       "SLD:d1": {
+        "considered_rules": 10486,
         "ground_rules": 1088,
         "ground_proofs": 1088,
-        "ms": 1785.47,
+        "ms": 1629.1,
         "ok": true,
         "error": null,
         "count": 1088
       },
       "SLD:d2": {
+        "considered_rules": 45301,
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 4147.37,
+        "ms": 3990.18,
         "ok": true,
         "error": null,
         "count": 1266
       },
       "SLD:d3": {
+        "considered_rules": 242757,
         "ground_rules": 1369,
         "ground_proofs": 1370,
-        "ms": 7073.5,
+        "ms": 6848.66,
         "ok": true,
         "error": null,
         "count": 1369
       },
       "SLD:d4": {
+        "considered_rules": 841518,
         "ground_rules": 2774,
         "ground_proofs": 2276,
-        "ms": 10301.63,
+        "ms": 10013.64,
         "ok": true,
         "error": null,
         "count": 2774
       },
       "enum-flat:w0d1": {
+        "considered_rules": 1266,
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 1715.86,
+        "ms": 1613.75,
         "ok": true,
         "error": null,
         "count": 1266
       },
       "enum-flat:w1d2": {
+        "considered_rules": 2610,
         "ground_rules": 1990,
         "ground_proofs": 1727,
-        "ms": 3426.47,
+        "ms": 3258.02,
         "ok": true,
         "error": null,
         "count": 1990
       },
       "enum-flat:w1d3": {
+        "considered_rules": 4394,
         "ground_rules": 3122,
         "ground_proofs": 2336,
-        "ms": 5951.52,
+        "ms": 5672.96,
         "ok": true,
         "error": null,
         "count": 3122
       },
       "enum-dense:w0d1": {
+        "considered_rules": 1266,
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 1634.79,
+        "ms": 1537.32,
         "ok": true,
         "error": null,
         "count": 1266
       },
       "enum-dense:w1d2": {
+        "considered_rules": 2552,
         "ground_rules": 2534,
         "ground_proofs": 2018,
-        "ms": 17238.41,
+        "ms": 17059.24,
         "ok": true,
         "error": null,
         "count": 2534
       },
       "enum-dense:w1d3": {
+        "considered_rules": 3828,
         "ground_rules": 3491,
         "ground_proofs": 2998,
-        "ms": 35891.93,
+        "ms": 35592.41,
         "ok": true,
         "error": null,
         "count": 3491
       },
       "FC:fp_global": {
+        "considered_rules": 33489363,
         "ground_rules": 33489363,
         "ground_proofs": 0,
-        "ms": 2055.55,
+        "ms": 2032.98,
         "ok": true,
         "error": null,
         "count": 33489363
@@ -721,9 +805,10 @@
     "fb15k237": {
       "_n_queries": 50,
       "FC:fp_global": {
+        "considered_rules": 256941207,
         "ground_rules": 256941207,
         "ground_proofs": 0,
-        "ms": 246860.98,
+        "ms": 239583.51,
         "ok": true,
         "error": null,
         "count": 256941207

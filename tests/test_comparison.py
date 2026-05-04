@@ -170,15 +170,17 @@ def _sync(device) -> None:
 
 
 def run_keras(ds: KGDataset, ds_path: Path, kb, queries: torch.Tensor,
-              cfg: Dict[str, Any]) -> Tuple[int, int, float]:
+              cfg: Dict[str, Any]) -> Tuple[int, int, int, float]:
     """Run the keras-ns ApproximateBackwardChainingGrounder.
 
-    Returns ``(ground_rules, ground_proofs, ms)``. ``ground_rules`` is
-    keras's ``rule2groundings`` total. ``ground_proofs`` is the proof
-    tree count derived from the rule applications via
-    :func:`grounder.groundings.count_proof_trees` — vectorised,
-    matches what BC's
-    ``evidence.count.sum`` reports for the torch grounders.
+    Returns ``(considered_rules, ground_rules, ground_proofs, ms)``.
+    Keras-ns only reports a single ``rule2groundings`` total (its
+    accumulator); we surface that as both ``considered_rules`` and
+    ``ground_rules`` since keras doesn't draw a distinction between
+    "rule app considered" and "rule app in completed proof". Proofs
+    is also set to that total (keras has no separate proof-tree
+    counter and the closed-form recursion overflows on recursive
+    rule sets like ablation's ``locatedInCR``).
     """
     test_tuples = [
         (ds.idx2pred[queries[i, 0].item()],
@@ -202,11 +204,11 @@ def run_keras(ds: KGDataset, ds_path: Path, kb, queries: torch.Tensor,
     # (ablation's locatedInCR rule alone gives unbounded depth).
     # Report ``ground_proofs == ground_rules`` for keras — at minimum
     # there's one proof tree per ground rule application.
-    return total, total, elapsed
+    return total, total, total, elapsed
 
 
 def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
-                 cfg: Dict[str, Any], bs: int) -> Tuple[int, int, float]:
+                 cfg: Dict[str, Any], bs: int) -> Tuple[int, int, int, float]:
     """Run a BCGrounder (SLD / enum-flat / enum-dense).
 
     Returns ``(ground_rules, ground_proofs, ms)``:
@@ -258,20 +260,35 @@ def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
         out = g(queries, qmask, **fwd_kwargs)
     _sync(queries.device)
     elapsed = (time.perf_counter() - t0) * 1000.0
-    # ``ground_rules`` and ``ground_proofs`` both come from the same
-    # source: ``out.evidence`` (per-query proof trees, post-substitution).
-    # Rule groundings are the unique ``(rule, head, sorted_body)``
-    # tuples in evidence (keras-comparable). Proof groundings are
-    # ``evidence.count.sum`` — number of distinct proof trees. This
-    # routing replaces the previous inconsistency where enum used the
-    # in-grounder ``rule_groundings`` accumulator while SLD used a
-    # separate evidence-based helper.
+    # Three metrics reported per cell:
+    #
+    # ``considered_rules`` — every rule application the grounder
+    #   *considered* during search. For enum this is the in-pipeline
+    #   ``rule_groundings`` accumulator (post-filter, pre-proof);
+    #   matches keras's ``rule2groundings`` semantics. For SLD this
+    #   includes pre-substitution branches (every rule fire across
+    #   every SLD step), so it can be much larger than the in-proof
+    #   count below.
+    #
+    # ``ground_rules`` — unique ``(rule, head, sorted_body)`` tuples
+    #   that appear in some completed proof tree (= keras-comparable
+    #   "rule applications used in proofs"). Derived from
+    #   ``out.evidence`` (post-substitution).
+    #
+    # ``ground_proofs`` — ``evidence.count.sum`` — the number of
+    #   distinct proof trees rooted at the queries.
     pad = kb.padding_idx
+    if out.rule_groundings is not None:
+        considered_rules = sum(
+            out.rule_groundings.A_in[r].shape[0]
+            for r in out.rule_groundings.A_in)
+    else:
+        considered_rules = 0
     ground_rules = evidence_unique_app_count(out.evidence, pad)
     ground_proofs = 0
     if out.evidence is not None and out.evidence.count is not None:
         ground_proofs = int(out.evidence.count.sum().item())
-    return ground_rules, ground_proofs, elapsed
+    return considered_rules, ground_rules, ground_proofs, elapsed
 
 
 def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
@@ -357,7 +374,7 @@ def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
     # the set of distinct rule groundings ``(rule, head, body)``
     # whose body atoms are derivable in the closure — i.e., what
     # pure FC would produce as its rule-application output.
-    def _attempt(target_kb, target_q, target_qm, chunk_bs: int) -> Tuple[int, int, float]:
+    def _attempt(target_kb, target_q, target_qm, chunk_bs: int) -> Tuple[int, int, int, float]:
         g = BCGrounder(
             target_kb, resolution="enum", width=None, depth=1,
             filter="fp_global",
@@ -377,22 +394,26 @@ def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
             out = g(target_q, target_qm, **kw)
         _sync(target_q.device)
         ms = (time.perf_counter() - t0) * 1000.0
-        if out.rule_groundings is None:
-            return 0, 0, ms
-        n_rules = sum(out.rule_groundings.A_in[r].shape[0]
-                      for r in out.rule_groundings.A_in)
+        if out.rule_groundings is not None:
+            considered = sum(out.rule_groundings.A_in[r].shape[0]
+                             for r in out.rule_groundings.A_in)
+        else:
+            considered = 0
+        n_rules = evidence_unique_app_count(out.evidence, target_kb.padding_idx)
         n_proofs = 0
         if out.evidence is not None and out.evidence.count is not None:
             n_proofs = int(out.evidence.count.sum().item())
-        return n_rules, n_proofs, ms
+        return considered, n_rules, n_proofs, ms
 
     bs_options = [bs or 100, 50, 20, 10, 5, 2, 1]
     # First pass: GPU.
     for chunk_bs in bs_options:
         try:
-            n_rules, n_proofs, ms = _attempt(kb, queries, qmask, chunk_bs)
-            print(f"    [FC bs={chunk_bs} → {n_rules} rules, {n_proofs} proofs]")
-            return n_rules, n_proofs, ms
+            considered, n_rules, n_proofs, ms = _attempt(
+                kb, queries, qmask, chunk_bs)
+            print(f"    [FC bs={chunk_bs} → considered={considered}, "
+                  f"in-proof={n_rules}, proofs={n_proofs}]")
+            return considered, n_rules, n_proofs, ms
         except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
             msg = str(e)[:80]
             print(f"    [FC bs={chunk_bs} OOM: {msg!r}]")
@@ -411,10 +432,11 @@ def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
         m_cpu = qmask.to("cpu")
         for chunk_bs in (50, 10, 1):
             try:
-                n_rules, n_proofs, ms = _attempt(kb_cpu, q_cpu, m_cpu, chunk_bs)
-                print(f"    [FC CPU bs={chunk_bs} → {n_rules} rules, "
-                      f"{n_proofs} proofs]")
-                return n_rules, n_proofs, ms
+                considered, n_rules, n_proofs, ms = _attempt(
+                    kb_cpu, q_cpu, m_cpu, chunk_bs)
+                print(f"    [FC CPU bs={chunk_bs} → considered={considered}, "
+                      f"in-proof={n_rules}, proofs={n_proofs}]")
+                return considered, n_rules, n_proofs, ms
             except (RuntimeError, MemoryError) as e:
                 print(f"    [FC CPU bs={chunk_bs} failed: {str(e)[:80]}]")
     except Exception as e:
@@ -426,7 +448,7 @@ def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
     return _fc_closure_only(kb, queries)
 
 
-def _fc_closure_only(kb, queries) -> Tuple[int, int, float]:
+def _fc_closure_only(kb, queries) -> Tuple[int, int, int, float]:
     """SpMM forward-chaining closure size as the FC metric, depth-capped.
 
     Used when the post-closure BC enum step is infeasible (memory or
@@ -435,7 +457,10 @@ def _fc_closure_only(kb, queries) -> Tuple[int, int, float]:
     the same as the per-query rule-grounding count from the BC enum
     step, but it's the natural closure-based number for a KB too
     large for that step. ``ground_proofs`` is recorded as 0 since we
-    don't enumerate proof trees in this path.
+    don't enumerate proof trees in this path. ``considered_rules``
+    is set equal to ``ground_rules`` since closure-only mode doesn't
+    distinguish "considered" from "in-proof" — every closure atom is
+    derivable, full stop.
     """
     import gc
     try:
@@ -463,10 +488,10 @@ def _fc_closure_only(kb, queries) -> Tuple[int, int, float]:
         _sync(queries.device)
         ms = (time.perf_counter() - t0) * 1000.0
         print(f"    [FC closure-only: {n_atoms} provable atoms, {ms:.0f}ms]")
-        return n_atoms, 0, ms
+        return n_atoms, n_atoms, 0, ms
     except Exception as e:
         print(f"    [FC closure-only failed: {type(e).__name__}: {str(e)[:80]}]")
-        return 0, 0, 0.0
+        return 0, 0, 0, 0.0
 
 
 def _batch_size_for_kb(kb) -> int:
@@ -484,15 +509,15 @@ def _batch_size_for_kb(kb) -> int:
 # ── Sweep driver ──────────────────────────────────────────────────────
 
 def run_cell(kind: str, ds: KGDataset, ds_path: Path, kb,
-             queries, qmask, cfg, bs: int) -> Tuple[int, int, float]:
+             queries, qmask, cfg, bs: int) -> Tuple[int, int, int, float]:
     """Dispatch a single (grounder, dataset) cell to its runner.
 
-    Returns ``(ground_rules, ground_proofs, ms)`` — see runner
-    docstrings for the precise definitions of each metric.
+    Returns ``(considered_rules, ground_rules, ground_proofs, ms)``.
+    See runner docstrings for the precise definitions of each metric.
     """
     if kind == "keras-BC":
         if not HAS_KERAS:
-            return 0, 0, 0.0
+            return 0, 0, 0, 0.0
         return run_keras(ds, ds_path, kb, queries, cfg)
     if kind in ("SLD", "enum-flat", "enum-dense"):
         return run_torch_bc(kb, queries, qmask, cfg, bs)
@@ -584,16 +609,17 @@ def main() -> None:
         for kind, cfg_label, cfg in ordered:
             torch.cuda.empty_cache()
             try:
-                rules, proofs, ms = run_cell(kind, ds, ds_path, kb,
-                                              queries, qmask, cfg, bs)
+                considered, rules, proofs, ms = run_cell(
+                    kind, ds, ds_path, kb, queries, qmask, cfg, bs)
                 ok = True
                 err = None
             except Exception as e:
-                rules, proofs, ms = 0, 0, 0.0
+                considered, rules, proofs, ms = 0, 0, 0, 0.0
                 ok = False
                 err = f"{type(e).__name__}: {str(e)[:80]}"
             tag = f"{kind}:{cfg_label}"
             cells[ds_name][tag] = {
+                "considered_rules": considered,
                 "ground_rules": rules,
                 "ground_proofs": proofs,
                 "ms": round(ms, 2),
@@ -604,7 +630,8 @@ def main() -> None:
                 "count": rules,
             }
             if ok:
-                status = (f"rules={rules:>6d}  proofs={proofs:>6d}  "
+                status = (f"considered={considered:>7d}  "
+                          f"in-proof={rules:>6d}  proofs={proofs:>6d}  "
                           f"{ms:>9.1f}ms")
             else:
                 status = f"FAIL ({err})"
@@ -639,8 +666,14 @@ def main() -> None:
         return "FAIL"
 
     _print_table(
-        "GROUND RULES (unique fully-ground (rule,head,body) — "
-        "what keras counts)",
+        "CONSIDERED RULES (every rule app the grounder considered — "
+        "keras's rule2groundings semantics; "
+        "for SLD includes pre-substitution branches)",
+        lambda c: _fmt(c, lambda c: str(
+            c.get("considered_rules", c.get("count", 0)))))
+    _print_table(
+        "GROUND RULES (unique (rule,head,body) appearing in some "
+        "completed proof tree — evidence-derived)",
         lambda c: _fmt(c, lambda c: str(
             c.get("ground_rules", c.get("count", 0)))))
     _print_table(
