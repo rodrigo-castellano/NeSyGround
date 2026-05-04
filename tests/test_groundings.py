@@ -20,11 +20,11 @@ Run as precommit (requires keras-ns + tensorflow on CPU). Use args to
 narrow scope:
 
     # Quick smoke run on one dataset, one grounder, fewer queries
-    python tests/test_comparison.py \\
+    python tests/test_groundings.py \\
         --datasets ablation_d2 --rows enum-flat:w1d2 --max-queries 25
 
     # Full sweep, write baseline
-    python tests/test_comparison.py --output tests/baselines/comparison.json
+    python tests/test_groundings.py --output tests/baselines/comparison.json
 """
 from __future__ import annotations
 
@@ -61,15 +61,17 @@ except Exception:
     HAS_KERAS = False
 
 from grounder.data.loader import KGDataset
-from grounder.bc.bc import BCGrounder
-from grounder.factory import make_bcwd
+from grounder.bc.bc import BCGrounder    # used by run_fc directly (fp_global)
 from grounder.groundings import (
     atom_hash, count_proof_trees, evidence_unique_app_count,
 )
 
-# Reuse keras-ns wrappers from the existing comparison test.
+# Reuse keras-ns and torch grounder builders from the shared
+# ``_runners`` module so the count and speed sweeps stay aligned.
 sys.path.insert(0, str(TESTS_DIR))
-from test_keras_grounding_comparison import build_keras_grounder  # noqa: E402
+from _runners import (  # noqa: E402
+    DEFAULT_COMPILE_MODES, build_keras_grounder, build_torch_grounder,
+)
 
 # ── Default grid ──────────────────────────────────────────────────────
 
@@ -216,32 +218,29 @@ def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
       doesn't populate ``evidence``.
     """
     is_sld = "depth" in cfg
+    kind = "SLD" if is_sld else (
+        "enum-flat" if cfg.get("flat", True) else "enum-dense")
+    # Compile mode comes from the same ``DEFAULT_COMPILE_MODES`` table
+    # ``test_speed.py`` uses. BCGrounder routes ``sld`` / ``rtf``
+    # through the outer-compile + chunked-replay path; ``enum`` uses
+    # per-step inner compile.
+    #
+    # SLD additionally drops ``collect_rule_groundings`` because that
+    # accumulator's per-step body is appended to a Python list that
+    # holds CUDA-graph-private-pool memory across chunks — which gets
+    # overwritten by each subsequent compiled chunk call. Dropping it
+    # gives us a None ``considered_rules`` for SLD; the metric is
+    # meaningfully different for SLD anyway (raw branch count, not
+    # unique apps), so we surface ``—`` for it. ``ground_rules`` and
+    # ``ground_proofs`` come from evidence which IS cloned by the
+    # outer-compile path.
+    grounder_kwargs: Dict[str, Any] = {}
     if is_sld:
-        # SLD has no width parameter — depth is the only knob.
-        # ``filter='none'`` is the right choice for SLD: ``fp_batch``
-        # operates on enum's app graph and incorrectly prunes SLD's
-        # proof set on multi-step datasets (ablation_d3 in particular
-        # — fp_batch drops every proof at depth ≥ 3). With
-        # filter='none' the rule_groundings accumulator captures every
-        # SLD rule application (per-rule, post-substitution).
-        g = BCGrounder(
-            kb, resolution="sld", filter="none",
-            depth=cfg["depth"],
-            max_total_groundings=4096, max_states=256,
-            prune_facts=True, collect_evidence=True,
-            collect_rule_groundings=True,
-        )
-    else:
-        # enum: dispatch via make_bcwd; ``flat`` controls flat vs dense.
-        g = make_bcwd(
-            kb, w=cfg["w"], d=cfg["d"],
-            flat_intermediate=cfg["flat"],
-            max_groundings_per_query=4096,
-            max_total_groundings=4096,
-            max_states=256, fc_method="spmm", prune_facts=True,
-            bump_s_to_k=False,
-            init_state_shape="minimal",
-        )
+        grounder_kwargs["collect_rule_groundings"] = False
+    g = build_torch_grounder(
+        kind, kb, cfg,
+        compile_mode=DEFAULT_COMPILE_MODES.get(kind),
+        **grounder_kwargs)
     # Warmup (first call may allocate buffers); timed call is the second.
     fwd_kwargs = {"batch_size": bs} if bs > 0 else {}
     with torch.no_grad():
@@ -274,6 +273,11 @@ def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
         considered_rules = sum(
             out.rule_groundings.A_in[r].shape[0]
             for r in out.rule_groundings.A_in)
+    elif is_sld:
+        # SLD's outer-compile path drops the rule_groundings
+        # accumulator (see ``grounder_kwargs`` above). Surface ``—``
+        # in the considered-rules table rather than a misleading 0.
+        considered_rules = None
     else:
         considered_rules = 0
     ground_rules = evidence_unique_app_count(out.evidence, pad)
@@ -681,7 +685,11 @@ def main() -> None:
         "CONSIDERED RULES (every rule app the grounder considered — "
         "keras's rule2groundings semantics; "
         "for SLD includes pre-substitution branches)",
-        lambda c: _fmt_count(c, "considered_rules", "count"))
+        # No ``count`` fallback for considered_rules — when a grounder
+        # legitimately doesn't expose this metric (SLD compiled-mode,
+        # keras-BC), the cell stores ``None`` and we want ``—``, not
+        # the ground_rules count.
+        lambda c: _fmt_count(c, "considered_rules"))
     _print_table(
         "GROUND RULES (unique (rule,head,body) appearing in some "
         "completed proof tree — evidence-derived)",
@@ -729,6 +737,18 @@ def main() -> None:
         with open(out_path, "w") as f:
             json.dump(baseline, f, indent=2)
         print(f"\n[json] wrote {out_path}")
+
+    # Surface cell failures via process exit code (precommit / CI
+    # driver expects this).
+    n_fail = sum(
+        1 for ds_d in cells.values()
+        for tag, c in ds_d.items()
+        if tag != "_n_queries" and isinstance(c, dict)
+        and c.get("ok") is False
+    )
+    if n_fail > 0:
+        print(f"\n[exit 1] {n_fail} cell(s) failed")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

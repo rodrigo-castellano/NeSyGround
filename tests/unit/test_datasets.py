@@ -14,9 +14,10 @@ import pytest
 from grounder import BCGrounder
 
 DEVICE = torch.device("cpu")
+# tests/unit/test_datasets.py → "../../data" reaches the repo root data/
 DATA_ROOT = Path(os.environ.get(
     "GROUNDER_DATA_ROOT",
-    os.path.join(os.path.dirname(__file__), "..", "data"),
+    os.path.join(os.path.dirname(__file__), "..", "..", "data"),
 ))
 
 

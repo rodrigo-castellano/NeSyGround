@@ -3,8 +3,8 @@
 Default: family, sld resolution, depth=4, 100 test queries.
 Uses the grounder's own KGDataset and BCGrounder — no torch-ns/DpRL deps.
 
-Override: pytest tests/test_groundings.py --dataset wn18rr --depth 2
-Generate: pytest tests/test_groundings.py --generate-baseline
+Override: pytest tests/unit/test_grounding_baseline.py --dataset wn18rr --depth 2
+Generate: pytest tests/unit/test_grounding_baseline.py --generate-baseline
 """
 
 from __future__ import annotations
@@ -17,7 +17,9 @@ from typing import Any
 import pytest
 import torch
 
-TESTS_DIR = Path(__file__).resolve().parent
+# Tests live in tests/unit/; baseline_utils lives in tests/.
+UNIT_DIR = Path(__file__).resolve().parent
+TESTS_DIR = UNIT_DIR.parent
 sys.path.insert(0, str(TESTS_DIR))
 
 from baseline_utils import (
@@ -142,7 +144,7 @@ def test_grounding_counts(dataset, grounder_type, depth, baseline_dir,
 
     assert bp.exists(), (
         f"FAILED: Baseline not found at {bp}\n"
-        f"Run: pytest tests/test_groundings.py --generate-baseline"
+        f"Run: pytest tests/unit/test_grounding_baseline.py --generate-baseline"
     )
 
     bl = load_json(bp)

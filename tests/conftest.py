@@ -25,7 +25,7 @@ def pytest_addoption(parser):
 
 
 _DEFAULTS = {
-    "test_groundings.py": {
+    "test_grounding_baseline.py": {
         "dataset": "family",
         "grounder_type": "sld",
         "depth": 4,

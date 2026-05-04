@@ -1,0 +1,78 @@
+{
+  "generated_at": "2026-05-04T15:23:10+00:00",
+  "datasets": [
+    "wn18rr"
+  ],
+  "rows": [
+    "keras-BC:w1d3",
+    "SLD:d4",
+    "enum-flat:w1d3",
+    "enum-dense:w1d3",
+    "FC:fp_global"
+  ],
+  "n_warmup": 1,
+  "n_timed": 1,
+  "max_queries": 0,
+  "device": "cuda",
+  "compile_modes": {
+    "keras-BC": null,
+    "SLD": "reduce-overhead",
+    "enum-flat": null,
+    "enum-dense": "reduce-overhead",
+    "FC": null
+  },
+  "cells": {
+    "wn18rr": {
+      "_n_queries": 2924,
+      "keras-BC:w1d3": {
+        "ms_median": 25700.271395035088,
+        "ms_min": 25700.271395035088,
+        "ms_max": 25700.271395035088,
+        "ms_mean": 25700.271395035088,
+        "samples_ms": [
+          25700.271395035088
+        ],
+        "n_timed": 1,
+        "n_warmup": 1,
+        "ok": true,
+        "error": null
+      },
+      "SLD:d4": {
+        "ms_median": 1808.5630999994464,
+        "ms_min": 1808.5630999994464,
+        "ms_max": 1808.5630999994464,
+        "ms_mean": 1808.5630999994464,
+        "samples_ms": [
+          1808.5630999994464
+        ],
+        "n_timed": 1,
+        "n_warmup": 1,
+        "compile_mode_used": "reduce-overhead",
+        "ok": true,
+        "error": null
+      },
+      "enum-flat:w1d3": {
+        "ms_median": 5768.20084702922,
+        "ms_min": 5768.20084702922,
+        "ms_max": 5768.20084702922,
+        "ms_mean": 5768.20084702922,
+        "samples_ms": [
+          5768.20084702922
+        ],
+        "n_timed": 1,
+        "n_warmup": 1,
+        "compile_mode_used": null,
+        "ok": true,
+        "error": null
+      },
+      "enum-dense:w1d3": {
+        "ok": false,
+        "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 480.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 52.81 MiB is free. In"
+      },
+      "FC:fp_global": {
+        "ok": false,
+        "error": "RuntimeError: shape mismatch: value tensor of shape [2062, 2, 3] cannot be broadcast to indexing result of shape [2062, 1, 3]"
+      }
+    }
+  }
+}

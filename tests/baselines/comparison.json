@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-04T09:46:11+00:00",
+  "generated_at": "2026-05-04T14:38:27+00:00",
   "datasets": [
     "ablation_d2",
     "ablation_d3",
@@ -697,7 +697,7 @@
         "considered_rules": 4394,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 26233.95,
+        "ms": 26072.64,
         "ok": true,
         "error": null,
         "count": null
@@ -730,10 +730,10 @@
         "count": 1369
       },
       "SLD:d4": {
-        "considered_rules": 841518,
+        "considered_rules": null,
         "ground_rules": 2774,
         "ground_proofs": 2276,
-        "ms": 10013.64,
+        "ms": 2544.35,
         "ok": true,
         "error": null,
         "count": 2774
@@ -760,7 +760,7 @@
         "considered_rules": 4394,
         "ground_rules": 3122,
         "ground_proofs": 2336,
-        "ms": 5672.96,
+        "ms": 5787.67,
         "ok": true,
         "error": null,
         "count": 3122
@@ -784,19 +784,19 @@
         "count": 2534
       },
       "enum-dense:w1d3": {
-        "considered_rules": 3828,
-        "ground_rules": 3491,
-        "ground_proofs": 2998,
-        "ms": 35592.41,
-        "ok": true,
-        "error": null,
-        "count": 3491
+        "considered_rules": 0,
+        "ground_rules": 0,
+        "ground_proofs": 0,
+        "ms": 0.0,
+        "ok": false,
+        "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 480.00 MiB. GPU 0 has a total capacity of ",
+        "count": 0
       },
       "FC:fp_global": {
         "considered_rules": 33489363,
         "ground_rules": 33489363,
-        "ground_proofs": 0,
-        "ms": 2032.98,
+        "ground_proofs": null,
+        "ms": 1943.35,
         "ok": true,
         "error": null,
         "count": 33489363

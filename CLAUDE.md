@@ -119,18 +119,51 @@ Do not add standalone training scripts to `grounder/` unless they are genuinely 
 
 ## Testing
 
-Local grounder tests:
+Layout:
+
+```
+tests/
+├── unit/                            # Pure-Python / CPU pytest suite (~3.5s)
+│   ├── test_primitives.py             unify, apply_substitutions
+│   ├── test_packing.py                pack_states, compact_atoms
+│   ├── test_fact_index.py             ArgKey / Inverted / BlockSparse
+│   ├── test_filters.py                fp_batch, fp_global
+│   ├── test_grounder.py               BCGrounder + SLD end-to-end (toy KBs)
+│   ├── test_rtf.py                    BCGrounder + RTF smoke
+│   ├── test_datasets.py               real-KB integration (family/wn18rr/fb15k237)
+│   └── test_grounding_baseline.py     per-query exact-count regression vs JSON baseline
+├── _runners.py                      # Shared grounder construction (build_torch_grounder, build_keras_grounder, DEFAULT_COMPILE_MODES)
+├── profile_speed.py                 # Generic timing helpers (time_runner, time_grounder)
+├── test_groundings.py               # Cross-system count sweep — 4 tables (considered/ground_rules/ground_proofs/timing) over (datasets × grounders)
+├── test_speed.py                    # Cross-system speed sweep — wall-clock per cell with per-grounder compile_mode
+├── precommit.py                     # Runs test_groundings + test_speed on wn18rr × {keras-BC:w1d3, SLD:d4, enum-flat:w1d3, enum-dense:w1d3, FC:fp_global}
+└── baselines/
+    ├── comparison.json                count baseline (test_groundings.py)
+    ├── speed.json                     timing baseline (test_speed.py)
+    └── groundings.json                per-query baseline (unit/test_grounding_baseline.py)
+```
+
+Quick runs:
 
 ```bash
 cd /path/to/grounder
-PYTHONUNBUFFERED=1 python -m pytest tests/ -v
-PYTHONUNBUFFERED=1 python -m pytest tests/test_groundings.py -v
+# Unit tests only (CPU, fast):
+PYTHONUNBUFFERED=1 python -m pytest tests/unit/ -v
+# Per-query regression:
+PYTHONUNBUFFERED=1 python -m pytest tests/unit/test_grounding_baseline.py -v
+# Combined precommit (counts + speed on wn18rr × 5 grounders):
+python tests/precommit.py
+# Full count sweep (all datasets × all configs):
+python tests/test_groundings.py
+# Full speed sweep (all datasets × all configs, with per-grounder compile_mode):
+python tests/test_speed.py
 ```
 
 Rules:
 
 - Run timing-sensitive suites sequentially.
-- Run `tests/test_groundings.py` when grounding counts, resolution, filters, or dataset loading may have changed.
+- `precommit.py` is the gate before commits — it surfaces both correctness and wall-clock regressions on the smallest grid that exercises every grounder family.
+- Run `tests/unit/test_grounding_baseline.py` when grounding counts, resolution, filters, or dataset loading may have changed.
 - If this repository is mirrored into another checkout, sync the changed files there and rerun the relevant integration tests in that mirror as needed.
 
 ## Documentation
@@ -219,7 +252,8 @@ Public API aliases (for backward compatibility with experiments/model.py):
 
 ## Verification Checklist
 
-- any code change: `python -m pytest tests/ -v` (skip the `test_keras_*` files unless GPU + tensorflow are available)
-- grounding semantics or counts changed: `python -m pytest tests/test_groundings.py -v`
+- any code change: `python -m pytest tests/unit/ -v` (the unit suite is GPU-light; integration vs keras lives in `tests/test_groundings.py` / `tests/test_speed.py`).
+- grounding semantics or counts changed: `python -m pytest tests/unit/test_grounding_baseline.py -v`
+- before commit: `python tests/precommit.py` (counts + speed on the precommit grid).
 - mirrored change intended: sync the other grounder copy or checkout and rerun its relevant tests
 - before any commit: the `check-editable-pins` pre-commit hook runs automatically (if installed) and blocks the commit if the `torch-kge-kernels` SHA pin in `pyproject.toml` has drifted from the editable install or points at an unpushed HEAD. To run it manually: `python scripts/check_editable_pins.py`.

@@ -92,10 +92,19 @@ grounder/
 +-- standardization.py    # standardize_vars_offset, standardize_vars_canonical
 +-- types.py              # ForwardResult, StepResult, etc.
 +-- tests/
-    +-- test_primitives.py
-    +-- test_fact_index.py
-    +-- test_grounder.py
-    +-- test_packing.py
+    +-- unit/                       # CPU-light pytest suite
+    |   +-- test_primitives.py
+    |   +-- test_fact_index.py
+    |   +-- test_grounder.py
+    |   +-- test_packing.py
+    |   +-- test_filters.py
+    |   +-- test_datasets.py
+    |   +-- test_grounding_baseline.py
+    |   +-- test_rtf.py
+    +-- test_groundings.py          # Cross-system count sweep (4 tables)
+    +-- test_speed.py               # Cross-system speed sweep (per-grounder compile mode)
+    +-- precommit.py                # Combined precommit: counts + speed on wn18rr × 5 grounders
+    +-- baselines/                  # Pinned JSON baselines
 ```
 
 ## Testing

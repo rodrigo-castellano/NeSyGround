@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run tests/test_comparison.py one (grounder, config) row per
+# Run tests/test_groundings.py one (grounder, config) row per
 # subprocess so each row sees a clean GPU. Each subprocess merges
 # its result into tests/baselines/comparison.json.
 #
@@ -39,7 +39,7 @@ for row in "${ROWS[@]}"; do
     echo "ROW: $row"
     echo "──────────────────────────────────────────────────────────────"
     conda run --no-capture-output -n gpu \
-        python tests/test_comparison.py \
+        python tests/test_groundings.py \
             --rows "$row" --merge "$@" \
         || echo "  [row $row failed]"
     echo "  ($(($(date +%s) - row_start))s)"
