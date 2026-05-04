@@ -78,7 +78,12 @@ from grounder.filters import filter_prune_dead, filter_width
 # --- Types ---
 from grounder.types import (
     GrounderOutput, GroundingResult, ProofEvidence, ProofState,
-    ResolvedChildren, PackedStates, SyncParams,
+    ResolvedChildren, PackedStates, SyncParams, RuleGroundings,
+)
+from grounder.groundings import (
+    atom_hash, count_proof_trees,
+    evidence_to_rule_groundings,
+    evidence_unique_app_count, evidence_unique_app_keys,
 )
 
 # --- Data loading ---
@@ -142,6 +147,13 @@ __all__ = [
     "ResolvedChildren",
     "PackedStates",
     "SyncParams",
+    "RuleGroundings",
+    # Groundings conversions (proof evidence ↔ rule groundings ↔ proof count)
+    "atom_hash",
+    "count_proof_trees",
+    "evidence_to_rule_groundings",
+    "evidence_unique_app_count",
+    "evidence_unique_app_keys",
     # Data loading
     "KGDataset",
     # Forward chaining

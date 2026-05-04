@@ -104,6 +104,34 @@ class ProofEvidence:
         idx = torch.arange(G, device=self.body_count.device)
         return idx < self.body_count.unsqueeze(-1)
 
+    # ── Conversions to other grounding metrics ──────────────────────
+    # Implementations live in ``grounder.groundings`` to avoid cyclic
+    # imports at type-definition time.
+
+    def unique_app_count(self, padding_idx: int) -> int:
+        """Count distinct ``(rule, head, sorted_body)`` tuples in this
+        evidence — keras-comparable rule_grounding metric.
+
+        Equivalent to building :meth:`to_rule_groundings` and summing
+        ``A_in[r].shape[0]``, but cheaper because it skips the per-rule
+        split and atom-table construction.
+        """
+        from grounder.groundings import evidence_unique_app_count
+        return evidence_unique_app_count(self, padding_idx)
+
+    def to_rule_groundings(
+        self, padding_idx: int, num_rules: Optional[int] = None,
+    ) -> "RuleGroundings":
+        """Build a :class:`RuleGroundings` dataclass from this evidence.
+
+        Equivalent to keras's ``rule2groundings`` — each rule
+        application is one entry, body atoms point into a global atom
+        table. Pass ``num_rules`` to keep ``A_in`` keyspace stable
+        across runs (otherwise inferred as ``max(rule_idx)+1``).
+        """
+        from grounder.groundings import evidence_to_rule_groundings
+        return evidence_to_rule_groundings(self, padding_idx, num_rules)
+
 
 @dataclass
 class RuleGroundings:

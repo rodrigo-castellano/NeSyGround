@@ -63,6 +63,9 @@ except Exception:
 from grounder.data.loader import KGDataset
 from grounder.bc.bc import BCGrounder
 from grounder.factory import make_bcwd
+from grounder.groundings import (
+    atom_hash, count_proof_trees, evidence_unique_app_count,
+)
 
 # Reuse keras-ns wrappers from the existing comparison test.
 sys.path.insert(0, str(TESTS_DIR))
@@ -159,108 +162,11 @@ def _sync(device) -> None:
         torch.cuda.synchronize()
 
 
-def _atom_hash(atoms: torch.Tensor) -> torch.Tensor:
-    """Hash an atom triple ``(p, a0, a1)`` to a single int64 id.
-
-    Combines the three columns with a Cantor-ish polynomial. Collisions
-    are vanishingly rare for the entity / predicate ranges used here
-    (≤ 10^5 each), so this is suitable as a dictionary key for proof
-    counting. ``atoms`` may be any shape ending in ``(..., 3)``.
-    """
-    # Three large coprime primes chosen to scatter (p, a0, a1) far apart
-    # so that all three components contribute to the hash without
-    # overflowing 64-bit signed.
-    P0, P1, P2 = 1_000_003, 999_983, 999_979
-    a = atoms.long()
-    return a[..., 0] * P0 + a[..., 1] * P1 + a[..., 2] * P2
-
-
-def count_ground_proofs(rule_apps_atoms: torch.Tensor,
-                        rule_apps_lens: torch.Tensor,
-                        facts_atoms: torch.Tensor,
-                        queries: torch.Tensor,
-                        max_iters: int = 64) -> int:
-    """Vectorised proof-tree count from a rule-application set.
-
-    Definition: a proof tree of query ``q`` is a tree whose root is
-    ``q`` and whose leaves are facts; every internal node is the head
-    of a rule application whose body atoms are children. The proof
-    count of ``q`` is the number of such trees.
-
-    Recurrence:
-      proofs[atom] = 1                                 if atom ∈ facts
-      proofs[atom] = Σ_apps  ∏_{b ∈ body_a}  proofs[b] otherwise
-
-    Iterated to fixpoint. The total ``ground_proofs`` returned is
-    ``Σ_{q ∈ queries} proofs[q]`` — the number of distinct proof trees
-    rooted at any of the supplied queries.
-
-    ``rule_apps_atoms`` is ``[N_apps, 1+M, 3]`` (head + body atoms,
-    body padded with ``-pad`` triples beyond ``rule_apps_lens[i]``).
-    All shapes are tensors so the inner step is fully vectorised.
-    """
-    if rule_apps_atoms.numel() == 0:
-        # No apps → every query that's already a fact counts as 1.
-        q_h = _atom_hash(queries)
-        f_h = _atom_hash(facts_atoms)
-        return int(torch.isin(q_h, f_h).sum().item())
-
-    N, MM1, _ = rule_apps_atoms.shape         # MM1 = 1 + M
-    M = MM1 - 1
-    head = rule_apps_atoms[:, 0, :]           # [N, 3]
-    body = rule_apps_atoms[:, 1:, :]          # [N, M, 3]
-    head_h = _atom_hash(head)                 # [N]
-    body_h = _atom_hash(body)                 # [N, M]
-    fact_h = _atom_hash(facts_atoms)          # [F]
-    q_h    = _atom_hash(queries)              # [Q]
-    body_pos = torch.arange(M, device=body_h.device)
-    body_active = body_pos.unsqueeze(0) < rule_apps_lens.unsqueeze(1)
-
-    # All distinct atoms involved in the proof set.
-    all_atoms_h = torch.cat([fact_h,
-                             head_h,
-                             body_h[body_active]])
-    uniq_h, _ = torch.unique(all_atoms_h, return_inverse=True)
-    # ``id_of[h]`` = index of hash ``h`` in ``uniq_h`` via searchsorted.
-    def _id_of(h: torch.Tensor) -> torch.Tensor:
-        idx = torch.searchsorted(uniq_h, h)
-        return idx.clamp(max=uniq_h.shape[0] - 1)
-    fact_id = _id_of(fact_h)
-    head_id = _id_of(head_h)
-    body_id = _id_of(body_h.reshape(-1)).reshape(N, M)
-    q_id    = _id_of(q_h)
-
-    U = uniq_h.shape[0]
-    proofs = torch.zeros(U, dtype=torch.float64,
-                          device=uniq_h.device)
-    proofs.index_fill_(0, fact_id, 1.0)
-
-    # Inactive body slots contribute factor 1; active slots contribute
-    # ``proofs[body_id]``. Padded body_id entries we replace with a
-    # constant-1 sentinel index (the first fact's id is fine — its
-    # proof count is 1).
-    sentinel_id = fact_id[0] if fact_id.numel() else torch.tensor(
-        0, device=body_id.device)
-    body_id_safe = torch.where(body_active, body_id, sentinel_id)
-
-    for _ in range(max_iters):
-        body_proofs = proofs[body_id_safe]                 # [N, M]
-        # inactive slots → 1.0 (no contribution to the product)
-        body_proofs = torch.where(body_active, body_proofs,
-                                  torch.ones_like(body_proofs))
-        per_app = body_proofs.prod(dim=1)                  # [N]
-        new_head_proofs = torch.zeros_like(proofs)
-        new_head_proofs.scatter_add_(0, head_id, per_app)
-        # Combine: facts stay 1.0; non-facts take the new sum (we keep
-        # the max to avoid resetting an already-converged head). For a
-        # well-formed acyclic set, new_head_proofs ≥ proofs always.
-        prev = proofs.clone()
-        proofs = torch.maximum(proofs, new_head_proofs)
-        proofs.index_fill_(0, fact_id, 1.0)
-        if torch.equal(proofs, prev):
-            break
-
-    return int(proofs[q_id].sum().item())
+# ``atom_hash`` and ``count_proof_trees`` (the proof-tree fixpoint
+# counter) and ``evidence_unique_app_count`` (the keras-comparable
+# rule-grounding metric) live in :mod:`grounder.groundings` so they
+# can be reused by callers outside this test harness. We import them
+# at the top of the file.
 
 
 def run_keras(ds: KGDataset, ds_path: Path, kb, queries: torch.Tensor,
@@ -270,7 +176,8 @@ def run_keras(ds: KGDataset, ds_path: Path, kb, queries: torch.Tensor,
     Returns ``(ground_rules, ground_proofs, ms)``. ``ground_rules`` is
     keras's ``rule2groundings`` total. ``ground_proofs`` is the proof
     tree count derived from the rule applications via
-    ``count_ground_proofs`` — vectorised, matches what BC's
+    :func:`grounder.groundings.count_proof_trees` — vectorised,
+    matches what BC's
     ``evidence.count.sum`` reports for the torch grounders.
     """
     test_tuples = [
@@ -351,84 +258,20 @@ def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
         out = g(queries, qmask, **fwd_kwargs)
     _sync(queries.device)
     elapsed = (time.perf_counter() - t0) * 1000.0
-    # ``ground_rules``: keras-comparable unique-apps count.
-    #
-    # For enum, ``rule_groundings.A_in[r]`` already contains
-    # post-grounding (rule, head, body) entries; the row count is the
-    # right metric directly.
-    #
-    # For SLD, ``rule_groundings.A_in[r]`` records EVERY SLD branch
-    # — including pre-substitution bodies that still carry free
-    # variables. Counting raw rows over-reports relative to keras
-    # and enum. We instead derive the keras-comparable metric from
-    # ``out.evidence`` (which is post-substitution): build the unique
-    # ``(rule, head, sorted_body)`` set the same way enum's
-    # rule_groundings does internally.
+    # ``ground_rules`` and ``ground_proofs`` both come from the same
+    # source: ``out.evidence`` (per-query proof trees, post-substitution).
+    # Rule groundings are the unique ``(rule, head, sorted_body)``
+    # tuples in evidence (keras-comparable). Proof groundings are
+    # ``evidence.count.sum`` — number of distinct proof trees. This
+    # routing replaces the previous inconsistency where enum used the
+    # in-grounder ``rule_groundings`` accumulator while SLD used a
+    # separate evidence-based helper.
     pad = kb.padding_idx
-    if is_sld:
-        ground_rules = _count_unique_apps_from_evidence(
-            out.evidence, kb.M, pad)
-    elif out.rule_groundings is not None:
-        ground_rules = sum(out.rule_groundings.A_in[r].shape[0]
-                           for r in out.rule_groundings.A_in)
-    else:
-        ground_rules = 0
-    # ``ground_proofs``: per-query terminal proof-tree count.
-    #   * enum — number of completed (depth=D, all-fact-leaves)
-    #     proof trees rooted at queries.
-    #   * SLD — number of SLD branches that terminated at depth ≤ D.
+    ground_rules = evidence_unique_app_count(out.evidence, pad)
     ground_proofs = 0
     if out.evidence is not None and out.evidence.count is not None:
         ground_proofs = int(out.evidence.count.sum().item())
     return ground_rules, ground_proofs, elapsed
-
-
-def _count_unique_apps_from_evidence(ev, M: int, pad: int) -> int:
-    """Count unique ``(rule, head, sorted_body)`` from BC evidence.
-
-    Used for SLD where the per-step ``rule_groundings`` accumulator
-    captures pre-substitution bodies. Evidence is post-substitution
-    (constants only), so building the unique set from it gives a
-    keras-comparable rule-application count.
-    """
-    if ev is None or ev.rule_idx is None or ev.body is None:
-        return 0
-    # ev.rule_idx: [B, C, D]; ev.body: [B, C, D, M, 3]; ev.mask: [B, C]
-    B, C, D = ev.rule_idx.shape
-    mask = ev.mask.unsqueeze(-1) & (ev.rule_idx >= 0)  # [B, C, D]
-    flat_mask = mask.reshape(-1)
-    if not bool(flat_mask.any()):
-        return 0
-    flat_ridx = ev.rule_idx.reshape(-1)
-    flat_body = ev.body.reshape(-1, M, 3)
-    if ev.head is not None:
-        flat_head = ev.head.reshape(-1, 3)
-    else:
-        flat_head = torch.full((flat_ridx.size(0), 3), pad,
-                               dtype=torch.long,
-                               device=flat_ridx.device)
-    keep = flat_mask
-    ridx_k = flat_ridx[keep].long()
-    body_k = flat_body[keep].long()
-    head_k = flat_head[keep].long()
-    # Sort body atoms within each entry so different anchor variants
-    # of the same logical app share a key.
-    P0, P1, P2 = 1_000_003, 999_983, 999_979
-    ah = (body_k[..., 0] * P0
-          + body_k[..., 1] * P1
-          + body_k[..., 2] * P2)
-    active = body_k[..., 0] != pad
-    sentinel = torch.full_like(ah, (2 ** 62) - 1)
-    ah_sort = torch.where(active, ah, sentinel)
-    sort_idx = ah_sort.argsort(dim=-1)
-    body_sorted = body_k.gather(
-        1, sort_idx.unsqueeze(-1).expand(-1, -1, 3))
-    combined = torch.cat([
-        ridx_k.unsqueeze(-1),
-        head_k,
-        body_sorted.reshape(-1, M * 3),
-    ], dim=-1)
-    return int(torch.unique(combined, dim=0).size(0))
 
 
 def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
