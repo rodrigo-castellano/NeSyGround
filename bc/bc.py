@@ -37,7 +37,7 @@ from grounder.bc.common import (
 )
 from grounder.types import (
     FlatResolvedChildren, GrounderOutput, ProofEvidence, ProofState,
-    ResolvedChildren, SyncParams,
+    ResolvedChildren, RuleGroundings, SyncParams,
 )
 from grounder.filters import check_in_fp_global
 from grounder.filters.search import filter_width, filter_prune_dead
@@ -347,13 +347,40 @@ class BCGrounder(nn.Module):
         else:
             raise ValueError(f"Unknown resolution: {self.resolution}")
 
-        # Compilation (all resolutions — shapes are static)
+        # Compilation. Two modes are supported:
+        #
+        # * **Per-step inner compile** (existing path, used by ``enum``):
+        #   ``_step_compiled`` calls ``torch.compile(self._step_impl,
+        #   fullgraph=True, mode=compile_mode)`` once per ``(depth, kind)``
+        #   variant. Pairs with the dense static-shape enum path.
+        #
+        # * **Outer per-batch compile** (new path, used by ``sld`` /
+        #   ``rtf``): wraps ``_forward_one_batch_inner`` once with
+        #   ``torch.compile(..., fullgraph=True, mode=compile_mode)``.
+        #   Dynamo traces the entire single-batch forward (init →
+        #   step×depth → finalize) as one graph; the chunked-forward
+        #   path replays the same captured graph per padded chunk.
+        #   Pairs with resolutions whose per-step ``_step_impl`` has
+        #   path-sensitive control flow that breaks dynamo at the
+        #   per-step granularity (notably SLD).
+        #
+        # Both paths require ``compile_mode`` to be set and run on
+        # CUDA; reduce-overhead specifically wants CUDA graphs. The
+        # outer path also requires the caller to pass an explicit
+        # ``batch_size`` so the captured graph sees a stable shape.
         self._compiled = False
         self._clone_between_steps = False
         self._fn_steps_by_depth: Dict[int, Any] = {}
+        self._uses_outer_compile = (
+            self.compile_mode is not None
+            and self.resolution != "enum"
+            and self.kb.device_.type == "cuda"
+        )
+        self._compiled_inner: Optional[Any] = None  # lazy on first call
         if (self.compile_mode
                 and self.depth > 1
-                and self.kb.device_.type == "cuda"):
+                and self.kb.device_.type == "cuda"
+                and not self._uses_outer_compile):
             self._clone_between_steps = (
                 self.compile_mode == "reduce-overhead")
             self._compiled = True
@@ -737,6 +764,19 @@ class BCGrounder(nn.Module):
             with B; chunking keeps peak memory roughly constant.
         """
         N = queries.size(0)
+        # Outer-compile resolutions (sld/rtf) always go through the
+        # chunked path so the captured CUDA graph is replayed against
+        # a stable per-chunk shape. Caller must supply ``batch_size``
+        # so the chunk size is reproducible across calls.
+        if self._uses_outer_compile:
+            if batch_size is None or batch_size <= 0:
+                raise ValueError(
+                    f"resolution={self.resolution!r} with "
+                    f"compile_mode={self.compile_mode!r} requires an "
+                    "explicit positive ``batch_size`` so the captured "
+                    "CUDA graph sees a stable per-chunk shape.")
+            return self._forward_chunked(
+                queries, query_mask, batch_size, **init_kwargs)
         if batch_size is None and self.compile_mode is not None:
             batch_size = self._auto_batch_size(N)
         if batch_size is not None and 0 < batch_size < N:
@@ -783,8 +823,22 @@ class BCGrounder(nn.Module):
         # Reset r2g accumulators once for the entire chunked call.
         self._reset_r2g_state()
 
-        # Run each chunk through ``_forward_one_batch_inner`` (which
-        # does NOT reset / finalise r2g — those are once-per-call here).
+        # Choose the inner step. When outer compile is enabled (sld/
+        # rtf with compile_mode set), wrap _forward_one_batch_inner
+        # with torch.compile once and reuse for every chunk; the
+        # padded chunk shape stays constant so the captured CUDA
+        # graph replays. Otherwise run the eager inner.
+        if self._uses_outer_compile:
+            if self._compiled_inner is None:
+                self._compiled_inner = torch.compile(
+                    self._forward_one_batch_inner,
+                    mode=self.compile_mode, fullgraph=True)
+            inner_fn = self._compiled_inner
+        else:
+            inner_fn = self._forward_one_batch_inner
+
+        # Run each chunk through the inner forward (which does NOT
+        # reset / finalise r2g — those are once-per-call here).
         chunk_outputs: List[GrounderOutput] = []
         chunk_sizes: List[int] = []
         for start in range(0, N, batch_size):
@@ -800,11 +854,66 @@ class BCGrounder(nn.Module):
                 q_padded[:n_real] = q
                 m_padded[:n_real] = m
                 q, m = q_padded, m_padded
-            out = self._forward_one_batch_inner(q, m, **init_kwargs)
+            if self._uses_outer_compile:
+                # Tell CUDA-graph trees a new iteration is starting so
+                # static-address output buffers are safe to reuse.
+                # Mirrors dprl's per-step pattern (PPO compilation.py
+                # calls this before every rollout_step).
+                torch.compiler.cudagraph_mark_step_begin()
+            out = inner_fn(q, m, **init_kwargs)
+            if self._uses_outer_compile:
+                # Captured graph outputs share static memory across
+                # calls — clone every tensor field so subsequent
+                # chunks don't overwrite earlier per-chunk results
+                # (``_merge_chunk_outputs`` reads them all at the end).
+                out = self._clone_grounder_output(out)
             chunk_outputs.append(out)
             chunk_sizes.append(n_real)
 
         return self._merge_chunk_outputs(chunk_outputs, chunk_sizes, queries)
+
+    @staticmethod
+    def _clone_grounder_output(out: GrounderOutput) -> GrounderOutput:
+        """Deep-clone every tensor field of a GrounderOutput.
+
+        Used after compiled (CUDA-graph) chunked calls so the per-chunk
+        output survives subsequent chunks overwriting the static-address
+        buffers the captured graph re-uses.
+        """
+        def _c(t):
+            return t.clone() if isinstance(t, Tensor) else t
+
+        st = out.state
+        new_state = ProofState(
+            proof_goals=_c(st.proof_goals),
+            state_valid=_c(st.state_valid),
+            top_ridx=_c(st.top_ridx),
+            next_var_indices=_c(st.next_var_indices),
+        )
+        new_evidence = None
+        if out.evidence is not None:
+            ev = out.evidence
+            new_evidence = ProofEvidence(
+                body=_c(ev.body), mask=_c(ev.mask),
+                count=_c(ev.count), rule_idx=_c(ev.rule_idx),
+                body_count=_c(ev.body_count),
+                D=ev.D, M=ev.M, head=_c(ev.head),
+            )
+        new_rg = None
+        if out.rule_groundings is not None:
+            rg = out.rule_groundings
+            new_rg = RuleGroundings(
+                atom_table=_c(rg.atom_table),
+                A_in={k: _c(v) for k, v in rg.A_in.items()},
+                A_out={k: _c(v) for k, v in rg.A_out.items()},
+                num_atoms=rg.num_atoms,
+                num_rules=rg.num_rules,
+            )
+        return GrounderOutput(
+            state=new_state,
+            evidence=new_evidence,
+            rule_groundings=new_rg,
+        )
 
     def _reset_r2g_state(self) -> None:
         if self._collect_rule_groundings:
@@ -1840,8 +1949,14 @@ class BCGrounder(nn.Module):
         active_atom = body[..., 0] != pad           # [T, M]
         has_body = active_atom.any(dim=-1)           # [T]
         valid = valid & has_body & (rule_idx >= 0)
-        if not bool(valid.any()):
-            return
+        # Note: an early ``if not bool(valid.any()): return`` here
+        # used to short-circuit the rest of this function, but that
+        # ``bool()`` on a 0-d tensor breaks ``torch.compile`` under
+        # ``fullgraph=True`` (Dynamo can't trace the data-dependent
+        # Python branch). Downstream tensor ops handle the
+        # all-False case correctly — empty selections cascade to
+        # zero-size accumulator appends, which is the right result —
+        # so we let the rest of the function run unconditionally.
 
         rule_idx = rule_idx[valid].long()
         body = body[valid]
