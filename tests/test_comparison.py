@@ -170,17 +170,19 @@ def _sync(device) -> None:
 
 
 def run_keras(ds: KGDataset, ds_path: Path, kb, queries: torch.Tensor,
-              cfg: Dict[str, Any]) -> Tuple[int, int, int, float]:
+              cfg: Dict[str, Any]) -> Tuple[int, Optional[int], Optional[int], float]:
     """Run the keras-ns ApproximateBackwardChainingGrounder.
 
     Returns ``(considered_rules, ground_rules, ground_proofs, ms)``.
-    Keras-ns only reports a single ``rule2groundings`` total (its
-    accumulator); we surface that as both ``considered_rules`` and
-    ``ground_rules`` since keras doesn't draw a distinction between
-    "rule app considered" and "rule app in completed proof". Proofs
-    is also set to that total (keras has no separate proof-tree
-    counter and the closed-form recursion overflows on recursive
-    rule sets like ablation's ``locatedInCR``).
+    Keras-ns only exposes its ``rule2groundings`` accumulator total —
+    its considered-rules metric. It does **not** distinguish "rule
+    apps appearing in a completed proof tree" from "rule apps
+    considered", and it does **not** expose a per-query proof-tree
+    counter (the closed-form recursion overflows on recursive rule
+    sets like ablation's ``locatedInCR``). We therefore report
+    ``ground_rules`` and ``ground_proofs`` as ``None`` for keras, so
+    the table renders ``—`` rather than misleadingly echoing the
+    considered count.
     """
     test_tuples = [
         (ds.idx2pred[queries[i, 0].item()],
@@ -194,17 +196,7 @@ def run_keras(ds: KGDataset, ds_path: Path, kb, queries: torch.Tensor,
     kg.ground(fact_tuples, test_tuples)
     elapsed = (time.perf_counter() - t0) * 1000.0
     total = sum(len(v) for v in kg.rule2groundings.values())
-
-    # Build (head + body) atom arrays for the proof counter. Each
-    # keras rule grounding is a list of body atom tuples; the head is
-    # implicit in the rule's variable bindings — we look it up via
-    # the grounder's substitution.
-    # keras-ns doesn't expose a proof-tree counter and the
-    # closed-form recursion overflows for recursive rule sets
-    # (ablation's locatedInCR rule alone gives unbounded depth).
-    # Report ``ground_proofs == ground_rules`` for keras — at minimum
-    # there's one proof tree per ground rule application.
-    return total, total, total, elapsed
+    return total, None, None, elapsed
 
 
 def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
@@ -448,19 +440,24 @@ def run_fc(kb, queries: torch.Tensor, qmask: torch.Tensor,
     return _fc_closure_only(kb, queries)
 
 
-def _fc_closure_only(kb, queries) -> Tuple[int, int, int, float]:
+def _fc_closure_only(kb, queries) -> Tuple[int, int, Optional[int], float]:
     """SpMM forward-chaining closure size as the FC metric, depth-capped.
 
     Used when the post-closure BC enum step is infeasible (memory or
-    fan-out blows up on the dense path). The returned ``ground_rules``
-    is the **raw provable-atom count** at depth 3 — semantically not
-    the same as the per-query rule-grounding count from the BC enum
-    step, but it's the natural closure-based number for a KB too
-    large for that step. ``ground_proofs`` is recorded as 0 since we
-    don't enumerate proof trees in this path. ``considered_rules``
-    is set equal to ``ground_rules`` since closure-only mode doesn't
-    distinguish "considered" from "in-proof" — every closure atom is
-    derivable, full stop.
+    fan-out blows up on the dense path). The returned counts are
+    semantically a different metric from the post-closure BC numbers
+    in other cells:
+
+      * ``considered_rules`` = ``ground_rules`` = SpMM closure size
+        (number of provable atoms at depth 3). Every closure atom is
+        derivable; closure-only mode doesn't enumerate per-rule-app
+        groundings so we don't distinguish "considered" from "in-proof".
+      * ``ground_proofs`` = ``None`` (renders as ``—``). We don't
+        enumerate proof trees in this path.
+
+    Cap at depth 3 — for fb15k237 the closure is still growing at
+    d=3 (113M new atoms in step 2) so ``fixpoint`` would blow past
+    available memory.
     """
     import gc
     try:
@@ -488,10 +485,10 @@ def _fc_closure_only(kb, queries) -> Tuple[int, int, int, float]:
         _sync(queries.device)
         ms = (time.perf_counter() - t0) * 1000.0
         print(f"    [FC closure-only: {n_atoms} provable atoms, {ms:.0f}ms]")
-        return n_atoms, n_atoms, 0, ms
+        return n_atoms, n_atoms, None, ms
     except Exception as e:
         print(f"    [FC closure-only failed: {type(e).__name__}: {str(e)[:80]}]")
-        return 0, 0, 0, 0.0
+        return 0, 0, None, 0.0
 
 
 def _batch_size_for_kb(kb) -> int:
@@ -630,8 +627,10 @@ def main() -> None:
                 "count": rules,
             }
             if ok:
-                status = (f"considered={considered:>7d}  "
-                          f"in-proof={rules:>6d}  proofs={proofs:>6d}  "
+                def _s(v):
+                    return f"{v:>6d}" if isinstance(v, int) else "    —"
+                status = (f"considered={_s(considered)}  "
+                          f"in-proof={_s(rules)}  proofs={_s(proofs)}  "
                           f"{ms:>9.1f}ms")
             else:
                 status = f"FAIL ({err})"
@@ -658,30 +657,41 @@ def main() -> None:
                 row += f"{value_fn(cell):>{cw}}"
             print(row)
 
-    def _fmt(c, ok_fn):
+    def _fmt_count(c, key, fallback_key=None):
         if not c:
             return "—"
-        if c.get("ok"):
-            return ok_fn(c)
-        return "FAIL"
+        if not c.get("ok"):
+            return "FAIL"
+        v = c.get(key)
+        if v is None and fallback_key is not None:
+            v = c.get(fallback_key)
+        if v is None:
+            return "—"
+        return str(v)
+
+    def _fmt_ms(c):
+        if not c:
+            return "—"
+        if not c.get("ok"):
+            return "FAIL"
+        v = c.get("ms")
+        return "—" if v is None else f"{v:.0f}"
 
     _print_table(
         "CONSIDERED RULES (every rule app the grounder considered — "
         "keras's rule2groundings semantics; "
         "for SLD includes pre-substitution branches)",
-        lambda c: _fmt(c, lambda c: str(
-            c.get("considered_rules", c.get("count", 0)))))
+        lambda c: _fmt_count(c, "considered_rules", "count"))
     _print_table(
         "GROUND RULES (unique (rule,head,body) appearing in some "
         "completed proof tree — evidence-derived)",
-        lambda c: _fmt(c, lambda c: str(
-            c.get("ground_rules", c.get("count", 0)))))
+        lambda c: _fmt_count(c, "ground_rules", "count"))
     _print_table(
         "GROUND PROOFS (per-query proof-tree count summed)",
-        lambda c: _fmt(c, lambda c: str(c.get("ground_proofs", 0))))
+        lambda c: _fmt_count(c, "ground_proofs"))
     _print_table(
         "TIMING (ms)",
-        lambda c: _fmt(c, lambda c: f"{c['ms']:.0f}"))
+        _fmt_ms)
 
     # ── Write JSON baseline ──
     out_path = args.output
