@@ -147,9 +147,10 @@ class BCGrounder(nn.Module):
         self.prune_facts = prune_facts
         # Enum defaults:
         #   all_anchors=True              — try every body atom as anchor
-        #                                    (matches keras's per-i loop)
-        #   collect_rule_groundings=True  — populate _r2g_buffer for the
-        #                                    keras-comparable per-rule output
+        #                                    (matches keras's per-i loop;
+        #                                    forced for correctness because
+        #                                    anchoring only on the first body
+        #                                    atom misses bindings keras finds)
         #   cartesian_product=False       — fact-anchored enumeration: candidates
         #                                    come from ``fact_index.enumerate``
         #                                    (the partial atom lookup), not from
@@ -163,11 +164,16 @@ class BCGrounder(nn.Module):
         # Callers may opt back into ``cartesian_product=True`` for full-domain
         # exploration; the count is identical (after filtering) because both
         # admit the same set of valid groundings.
+        #
+        # ``collect_rule_groundings`` is NOT forced for enum: speed-only
+        # callers (test_speed.py) pass ``False`` so the per-step
+        # ``_step_compiled`` accumulators stay empty. Forcing True caused
+        # the chunked path to leak ~100 MB / chunk on wn18rr (step_body /
+        # step_head / step_ridx clones from every chunk's depth=1 step
+        # piling up across all 293 chunks until ~24 GB OOM).
         if resolution == "enum":
             if not all_anchors:
                 all_anchors = True
-            if not collect_rule_groundings:
-                collect_rule_groundings = True
         self._cartesian_product = cartesian_product
         self._all_anchors = all_anchors
         self._flat_intermediate_flag = flat_intermediate

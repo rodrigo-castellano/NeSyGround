@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-04T19:06:13+00:00",
+  "generated_at": "2026-05-04T19:35:34+00:00",
   "datasets": [
     "wn18rr"
   ],
@@ -7,9 +7,7 @@
     "keras-BC:w1d3",
     "SLD:d4",
     "enum-flat:w1d2",
-    "enum-flat:w1d3",
     "enum-dense:w1d2",
-    "enum-dense:w1d3",
     "FC:fp_global"
   ],
   "n_warmup": 1,
@@ -26,26 +24,13 @@
   "cells": {
     "wn18rr": {
       "_n_queries": 2924,
-      "keras-BC:w1d3": {
-        "ms_median": 26600.82778398646,
-        "ms_min": 26600.82778398646,
-        "ms_max": 26600.82778398646,
-        "ms_mean": 26600.82778398646,
+      "enum-dense:w1d2": {
+        "ms_median": 7079.479235981125,
+        "ms_min": 7079.479235981125,
+        "ms_max": 7079.479235981125,
+        "ms_mean": 7079.479235981125,
         "samples_ms": [
-          26600.82778398646
-        ],
-        "n_timed": 1,
-        "n_warmup": 1,
-        "ok": true,
-        "error": null
-      },
-      "SLD:d4": {
-        "ms_median": 1809.3848010175861,
-        "ms_min": 1809.3848010175861,
-        "ms_max": 1809.3848010175861,
-        "ms_mean": 1809.3848010175861,
-        "samples_ms": [
-          1809.3848010175861
+          7079.479235981125
         ],
         "n_timed": 1,
         "n_warmup": 1,
@@ -53,44 +38,40 @@
         "ok": true,
         "error": null
       },
-      "enum-flat:w1d3": {
-        "ms_median": 5768.20084702922,
-        "ms_min": 5768.20084702922,
-        "ms_max": 5768.20084702922,
-        "ms_mean": 5768.20084702922,
+      "keras-BC:w1d3": {
+        "ms_median": 26754.178731993306,
+        "ms_min": 26754.178731993306,
+        "ms_max": 26754.178731993306,
+        "ms_mean": 26754.178731993306,
         "samples_ms": [
-          5768.20084702922
+          26754.178731993306
         ],
         "n_timed": 1,
         "n_warmup": 1,
-        "compile_mode_used": null,
         "ok": true,
         "error": null
       },
-      "enum-dense:w1d3": {
-        "ok": false,
-        "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 480.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 52.81 MiB is free. In"
-      },
-      "FC:fp_global": {
-        "ms_median": 2403.270620969124,
-        "ms_min": 2403.270620969124,
-        "ms_max": 2403.270620969124,
-        "ms_mean": 2403.270620969124,
+      "SLD:d4": {
+        "ms_median": 1808.4794610040262,
+        "ms_min": 1808.4794610040262,
+        "ms_max": 1808.4794610040262,
+        "ms_mean": 1808.4794610040262,
         "samples_ms": [
-          2403.270620969124
+          1808.4794610040262
         ],
         "n_timed": 1,
         "n_warmup": 1,
+        "compile_mode_used": "reduce-overhead",
         "ok": true,
         "error": null
       },
       "enum-flat:w1d2": {
-        "ms_median": 3530.768550001085,
-        "ms_min": 3530.768550001085,
-        "ms_max": 3530.768550001085,
-        "ms_mean": 3530.768550001085,
+        "ms_median": 3218.508814985398,
+        "ms_min": 3218.508814985398,
+        "ms_max": 3218.508814985398,
+        "ms_mean": 3218.508814985398,
         "samples_ms": [
-          3530.768550001085
+          3218.508814985398
         ],
         "n_timed": 1,
         "n_warmup": 1,
@@ -98,9 +79,18 @@
         "ok": true,
         "error": null
       },
-      "enum-dense:w1d2": {
-        "ok": false,
-        "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 480.00 MiB. GPU 0 has a total capacity of 23.56 GiB of which 440.81 MiB is free. I"
+      "FC:fp_global": {
+        "ms_median": 2329.0854549850337,
+        "ms_min": 2329.0854549850337,
+        "ms_max": 2329.0854549850337,
+        "ms_mean": 2329.0854549850337,
+        "samples_ms": [
+          2329.0854549850337
+        ],
+        "n_timed": 1,
+        "n_warmup": 1,
+        "ok": true,
+        "error": null
       }
     }
   }
