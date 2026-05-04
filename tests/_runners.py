@@ -84,6 +84,8 @@ def build_torch_grounder(
     *,
     compile_mode: Optional[str] = None,
     max_total_groundings: int = 4096,
+    max_groundings_per_query: int = 64,
+    max_derived_per_state: Optional[int] = 64,
     max_states: int = 256,
     fc_method: str = "spmm",
     collect_evidence: bool = True,
@@ -99,16 +101,31 @@ def build_torch_grounder(
             ``SLD``        → ``{"depth": int}``
             ``enum-*``     → ``{"w": int, "d": int, "flat": bool}``
         compile_mode: forwarded to ``BCGrounder``. ``None`` = eager.
-        max_total_groundings, max_states, fc_method,
-        collect_evidence, collect_rule_groundings: forwarded
-            uniformly. ``collect_*=True`` is the right default for
-            both count metrics and FC-closure-driven filtering.
+        max_total_groundings: ``C`` (collected-groundings budget per
+            query). Defaults 4096.
+        max_groundings_per_query: ``G_r`` for enum (per-rule per-query
+            candidate budget, controls the dense path's
+            ``[B*S, K_r, G_r, M, 3]`` body tensor — the dominant
+            intermediate). Default 64 retains ≥99.8% groundings on
+            every dataset in the precommit sweep while shrinking the
+            dense path's compiled CUDA-graph capture by ~64× at w1d2
+            (raw default 4096 → 1 GB → 64 → 16 MB).
+            Ignored by SLD (which sizes K via K_f + K_r).
+        max_derived_per_state: caps SLD's per-state ``K = K_f + K_r``.
+            Default 64 retains 100% groundings on wn18rr d4 because
+            with width=1 most fact children get filtered anyway. Set
+            to None to leave K = K_f + K_r uncapped. Ignored by enum.
+        max_states, fc_method, collect_evidence,
+        collect_rule_groundings: forwarded uniformly.
+            ``collect_*=True`` is the right default for both count
+            metrics and FC-closure-driven filtering.
     """
     if kind == "SLD":
         return BCGrounder(
             kb, resolution="sld", filter="none",
             depth=cfg["depth"],
             max_total_groundings=max_total_groundings,
+            max_derived_per_state=max_derived_per_state,
             max_states=max_states,
             prune_facts=True,
             collect_evidence=collect_evidence,
@@ -120,7 +137,7 @@ def build_torch_grounder(
         return make_bcwd(
             kb, w=cfg["w"], d=cfg["d"],
             flat_intermediate=flat,
-            max_groundings_per_query=max_total_groundings,
+            max_groundings_per_query=max_groundings_per_query,
             max_total_groundings=max_total_groundings,
             max_states=max_states,
             fc_method=fc_method,
