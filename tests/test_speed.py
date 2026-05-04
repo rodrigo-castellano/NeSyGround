@@ -80,9 +80,13 @@ DEFAULT_DATASETS: List[str] = [
 # (kind, config_label, cfg). One row per kind; this is the deepest
 # paper config per family. Override per-cell via ``--rows``.
 DEFAULT_ROWS: List[Tuple[str, str, Dict[str, Any]]] = [
+    ("keras-BC",    "w1d2", dict(w=1, d=2)),
     ("keras-BC",    "w1d3", dict(w=1, d=3)),
+    ("SLD",         "d3",   dict(depth=3)),
     ("SLD",         "d4",   dict(depth=4)),
+    ("enum-flat",   "w1d2", dict(w=1, d=2, flat=True)),
     ("enum-flat",   "w1d3", dict(w=1, d=3, flat=True)),
+    ("enum-dense",  "w1d2", dict(w=1, d=2, flat=False)),
     ("enum-dense",  "w1d3", dict(w=1, d=3, flat=False)),
     ("FC",          "fp_global", dict()),
 ]
@@ -193,37 +197,53 @@ def _time_keras(ds, ds_path, queries, cfg, *,
 
 
 def _time_fc(kb, queries, qmask, *, n_warmup, n_timed) -> Dict[str, Any]:
-    """Time the FC fp_global path. Mirrors ``test_groundings.run_fc``'s
-    setup but only measures the timed forward call (closure built
-    during BCGrounder construction is not counted).
+    """Time the SpMM forward-chaining closure compute.
 
-    ``fc_depth=3`` caps the SpMM closure depth: at ``fc_depth=10``
-    (the BCGrounder default) wn18rr's closure compute exceeds 24 GB
-    on a single GPU because ``cusparseSpGEMM_workEstimation`` blows
-    up at deep iterations. ``test_groundings`` handles this via a
-    closure-only fallback after BC enumeration OOMs; the speed sweep
-    avoids it upfront. d=3 is the closure size other grounders see
-    in practice.
+    The FC speed metric is the closure algorithm itself —
+    :func:`grounder.fc.fc.run_forward_chaining` over (facts, rules).
+    Not the post-closure BC enum step that ``run_fc`` in
+    ``test_groundings.py`` runs to extract per-query rule groundings:
+    that step doesn't fit on a 24 GB GPU after the kb's fact_index
+    has been augmented with millions of closure atoms (wn18rr's
+    augmented kb expands ``BlockSparseFactIndex.ps_offsets`` to
+    ``[P=40k, E=40k]`` longs ≈ 13 GB), and ``run_fc`` falls back to
+    ``_fc_closure_only`` whenever it does — so the count-sweep
+    "wn18rr FC ms" is already a closure-compute time.
+
+    Cap at ``fc_depth=3`` (matches the closure-only fallback in
+    ``test_groundings.py:_fc_closure_only``) — beyond that the
+    closure on fb15k237 is unbounded for this rule set on a 24 GB
+    GPU (``cusparseSpGEMM_workEstimation`` blows up).
     """
-    bs = _batch_size_for_kb(kb)
-    g = BCGrounder(
-        kb, resolution="enum", width=None, depth=1,
-        filter="fp_global",
-        max_groundings_per_query=4096,
-        max_total_groundings=4096,
-        max_states=256,
-        fc_method="spmm", fc_depth=3,
-        prune_facts=True,
-        flat_intermediate=True, bump_s_to_k=False,
-        init_state_shape="minimal",
-        collect_evidence=False,
-        collect_rule_groundings=False,
-        # FC: eager per DEFAULT_COMPILE_MODES.
-    )
-    fwd_kwargs = {"batch_size": bs} if bs > 0 else {}
-    return time_grounder(
-        g, queries, qmask, fwd_kwargs,
-        n_warmup=n_warmup, n_timed=n_timed)
+    import gc
+    from grounder.fc.fc import run_forward_chaining
+    from grounder.data.rule_index import compile_rules
+
+    rules = compile_rules(
+        kb.rule_index.rules_heads_sorted,
+        kb.rule_index.rules_bodies_sorted,
+        kb.rule_index.rule_lens_sorted,
+        kb.fact_index._num_entities)
+    facts_idx = kb.fact_index.facts_idx
+    n_ent = kb.fact_index._num_entities
+    n_pred = kb.fact_index._num_predicates
+    device = str(queries.device)
+
+    def _call():
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        run_forward_chaining(
+            compiled_rules=rules,
+            facts_idx=facts_idx,
+            num_entities=n_ent,
+            num_predicates=n_pred,
+            depth=3, device=device)
+
+    is_cuda = (queries.device.type == "cuda")
+    sync_fn = torch.cuda.synchronize if is_cuda else None
+    return time_runner(_call, n_warmup=n_warmup, n_timed=n_timed,
+                       sync_fn=sync_fn)
 
 
 def _batch_size_for_kb(kb) -> int:

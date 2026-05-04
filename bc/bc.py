@@ -1197,7 +1197,17 @@ class BCGrounder(nn.Module):
         D = self.depth
         M = self.kb.M  # max body atoms in any single rule
         # M_work: working buffer for the current depth's body atoms.
-        M_work = 1 if not self.collect_evidence else M
+        # Must fit the widest rule body (``M``) — ``pack_states_flat``
+        # writes ``new_body = flat_goals[:, :M_rule, :]`` into this
+        # buffer (bc/common.py around line 421), and rules with
+        # ``M_rule > 1`` overflow the index target if M_work=1. The
+        # earlier ``1 if not self.collect_evidence else M`` shortcut
+        # saved a few KB on collect_evidence=False but produced
+        # ``shape mismatch: value tensor of shape [N, 2, 3] cannot be
+        # broadcast to indexing result of shape [N, 1, 3]`` on any
+        # KB with ``kb.M > 1`` (every dataset except trivially-1-body
+        # ones — ablation_d2, family, wn18rr, fb15k237, …).
+        M_work = M
 
         # ``init_state_shape``:
         #   "minimal" — S_init=1; smallest possible buffer at d=0.
@@ -1215,9 +1225,16 @@ class BCGrounder(nn.Module):
         # M-sized working buffer (current depth's rule body atoms)
         grounding_body = torch.full(
             (B, S_init, M_work, 3), pad, dtype=torch.long, device=dev)
-        # Structured accumulator: [B, S, D, M, 3] — one slot per depth
-        acc_D = 1 if not self.collect_evidence else D
-        acc_M = 1 if not self.collect_evidence else M
+        # Structured accumulator: [B, S, D, M, 3] — one slot per depth.
+        # ``acc_D``/``acc_M`` collapse to 1 when nothing reads the
+        # accumulator, but the ``fp_global`` filter writes witness
+        # body atoms into ``accumulated_body`` via
+        # ``_inject_witnesses_into_evidence`` and needs the full
+        # ``M`` slot count even when ``collect_evidence=False``.
+        skip_acc = (not self.collect_evidence
+                    and self.filter_mode != "fp_global")
+        acc_D = 1 if skip_acc else D
+        acc_M = 1 if skip_acc else M
         accumulated_body = torch.full(
             (B, S_init, acc_D, acc_M, 3), pad, dtype=torch.long, device=dev)
         body_count = torch.zeros(B, S_init, acc_D, dtype=torch.long, device=dev)

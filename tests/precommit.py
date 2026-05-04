@@ -34,9 +34,13 @@ TESTS_DIR = Path(__file__).resolve().parent
 GROUNDER_ROOT = TESTS_DIR.parent
 
 # Single dataset + ROW SET narrow enough to run in ~2 min total.
+# enum cells use ``w1d2`` rather than ``w1d3`` because the dense
+# path's ``[B*S, K_r, G_r, M, 3]`` body tensor is ~3-4× smaller at
+# d=2, fitting the reduce-overhead CUDA-graph capture on a 24 GB GPU
+# for wn18rr (``w1d3`` doesn't — see comparison.json baselines).
 PRECOMMIT_DATASETS = "wn18rr"
 PRECOMMIT_ROWS = (
-    "keras-BC:w1d3,SLD:d4,enum-flat:w1d3,enum-dense:w1d3,FC:fp_global"
+    "keras-BC:w1d3,SLD:d4,enum-flat:w1d2,enum-dense:w1d2,FC:fp_global"
 )
 
 
