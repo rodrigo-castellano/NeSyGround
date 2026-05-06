@@ -1124,8 +1124,13 @@ class BCGrounder(nn.Module):
         # already span every chunk).
         rule_groundings = None
         if self._collect_rule_groundings:
+            # Static-buffer path always finalizes from the pre-allocated
+            # tensors; eager path finalizes only when its Python-list
+            # accumulator is non-empty.
+            has_static = self._static_buffers and self._r2g_static_buf is not None
+            has_eager = bool(getattr(self, "_r2g_acc_rule", None))
             if (not getattr(self, "_r2g_skip_per_step", False)
-                    and getattr(self, "_r2g_acc_rule", None)):
+                    and (has_static or has_eager)):
                 rule_groundings = self._finalize_r2g_tensor()
                 if rule_groundings is not None and self.filter_mode == "fp_batch":
                     rule_groundings = self._prune_rule_groundings_tensor(
@@ -1254,8 +1259,13 @@ class BCGrounder(nn.Module):
         # the tensor accumulators are empty (e.g. evidence-based mode).
         rule_groundings = None
         if self._collect_rule_groundings:
+            # Static-buffer path always finalizes from the pre-allocated
+            # tensors; eager path finalizes only when its Python-list
+            # accumulator is non-empty.
+            has_static = self._static_buffers and self._r2g_static_buf is not None
+            has_eager = bool(getattr(self, "_r2g_acc_rule", None))
             if (not getattr(self, "_r2g_skip_per_step", False)
-                    and getattr(self, "_r2g_acc_rule", None)):
+                    and (has_static or has_eager)):
                 rule_groundings = self._finalize_r2g_tensor()
                 if rule_groundings is not None and self.filter_mode == "fp_batch":
                     rule_groundings = self._prune_rule_groundings_tensor(
