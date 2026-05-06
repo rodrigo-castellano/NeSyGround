@@ -1124,14 +1124,20 @@ class BCGrounder(nn.Module):
         # already span every chunk).
         rule_groundings = None
         if self._collect_rule_groundings:
-            # Static-buffer path always finalizes from the pre-allocated
-            # tensors; eager path finalizes only when its Python-list
-            # accumulator is non-empty.
-            has_static = self._static_buffers and self._r2g_static_buf is not None
-            has_eager = bool(getattr(self, "_r2g_acc_rule", None))
-            if (not getattr(self, "_r2g_skip_per_step", False)
-                    and (has_static or has_eager)):
-                rule_groundings = self._finalize_r2g_tensor()
+            # Per-step ``_collect_r2g_tensor`` captures rule-application
+            # body atoms BEFORE later-depth fact resolutions substitute
+            # their cross-body variables (e.g. Y in
+            # ``p(X,Y) ∧ q(Y,Z) → t(X,Z)`` stays unbound in the
+            # accumulator even after a depth-d fact ``p(a,b)`` binds
+            # ``Y=b``). Build from the final evidence instead —
+            # ``_sync_accumulated`` already applied all winning_subs to
+            # ``evidence.body``, so this gives the ground-truth
+            # substituted body atoms (matching keras-ns).
+            if evidence is not None:
+                from grounder.groundings import evidence_to_rule_groundings
+                rule_groundings = evidence_to_rule_groundings(
+                    evidence, self.kb.padding_idx,
+                    num_rules=self.kb.num_rules)
                 if rule_groundings is not None and self.filter_mode == "fp_batch":
                     rule_groundings = self._prune_rule_groundings_tensor(
                         rule_groundings)
@@ -1259,14 +1265,20 @@ class BCGrounder(nn.Module):
         # the tensor accumulators are empty (e.g. evidence-based mode).
         rule_groundings = None
         if self._collect_rule_groundings:
-            # Static-buffer path always finalizes from the pre-allocated
-            # tensors; eager path finalizes only when its Python-list
-            # accumulator is non-empty.
-            has_static = self._static_buffers and self._r2g_static_buf is not None
-            has_eager = bool(getattr(self, "_r2g_acc_rule", None))
-            if (not getattr(self, "_r2g_skip_per_step", False)
-                    and (has_static or has_eager)):
-                rule_groundings = self._finalize_r2g_tensor()
+            # Per-step ``_collect_r2g_tensor`` captures rule-application
+            # body atoms BEFORE later-depth fact resolutions substitute
+            # their cross-body variables (e.g. Y in
+            # ``p(X,Y) ∧ q(Y,Z) → t(X,Z)`` stays unbound in the
+            # accumulator even after a depth-d fact ``p(a,b)`` binds
+            # ``Y=b``). Build from the final evidence instead —
+            # ``_sync_accumulated`` already applied all winning_subs to
+            # ``evidence.body``, so this gives the ground-truth
+            # substituted body atoms (matching keras-ns).
+            if evidence is not None:
+                from grounder.groundings import evidence_to_rule_groundings
+                rule_groundings = evidence_to_rule_groundings(
+                    evidence, self.kb.padding_idx,
+                    num_rules=self.kb.num_rules)
                 if rule_groundings is not None and self.filter_mode == "fp_batch":
                     rule_groundings = self._prune_rule_groundings_tensor(
                         rule_groundings)

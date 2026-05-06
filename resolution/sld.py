@@ -63,15 +63,21 @@ def resolve_sld(
     dev = queries.device
     pad = padding_idx
 
-    # Fact resolution (pure index ops — no gradients needed)
-    # Pass grounding_body=None: accumulated body sync is handled separately
-    # in bc.py._sync_accumulated, so resolution doesn't need to substitute it.
+    # Fact resolution (pure index ops — no gradients needed). Pass
+    # grounding_body so MGU substitutions propagate into the per-state
+    # working body — without this, multi-body rules like
+    # ``p(X,Y) ∧ q(Y,Z) → t(X,Z)`` lose the cross-atom binding (Y)
+    # after the first body atom is resolved against a fact, and later
+    # depths look up unbound goals → MRR regresses to ~0.45 on
+    # ablation_d2 sld.d4. (``_sync_accumulated`` on the structured
+    # accumulated_body handles a *different* propagation across
+    # depths; both are required.)
     with torch.no_grad():
         fact_goals, fact_gbody, fact_success, fact_subs = mgu_resolve_facts(
             queries, remaining, fact_index, facts_idx,
             constant_no, padding_idx, K_f,
             state_valid, active_mask,
-            grounding_body=None,
+            grounding_body=grounding_body,
             excluded_queries=excluded_queries)
 
     # Hook: may contain learned parameters (KGE scorer, etc.)
@@ -90,7 +96,8 @@ def resolve_sld(
             torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev),
         )
 
-    # Pass grounding_body=None: accumulated body sync is handled separately
+    # Pass grounding_body so head-unification subs propagate into the
+    # per-state working body (same reason as fact resolution above).
     with torch.no_grad():
         rule_goals, rule_gbody_out, rule_success, \
             sub_rule_idx, _, Bmax, rule_subs = mgu_resolve_rules(
@@ -98,7 +105,7 @@ def resolve_sld(
                 constant_no, padding_idx, K_r,
                 max_vars_per_rule, num_rules,
                 state_valid, active_mask, next_var_indices,
-                grounding_body=None)
+                grounding_body=grounding_body)
 
     # Hook: may contain learned parameters
     if rule_hook is not None:

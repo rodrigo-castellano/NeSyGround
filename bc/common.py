@@ -156,7 +156,9 @@ def pack_states(
             skip_fact = uninit & ~is_initial
             f_valid = f_valid & ~skip_fact.unsqueeze(-1).expand(
                 B, S_in, K_f).reshape(B, n_f)
-        # Fact children: no new body atoms (padding)
+        # Fact children: no new body atoms (padding). Substitution
+        # propagation across depths is handled by _sync_accumulated
+        # writing winning_subs into accumulated_body.
         f_gbody = torch.full(
             (B, n_f, M_work, 3), pad, dtype=torch.long, device=dev)
         f_has_new = torch.zeros(B, n_f, dtype=torch.bool, device=dev)
