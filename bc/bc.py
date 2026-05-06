@@ -115,6 +115,11 @@ class BCGrounder(nn.Module):
         #     all depths (no d=0 specialization). Recommended when
         #     ``compile_mode`` is set.
         init_state_shape: str = "minimal",
+        # ``static_buffers``: opt into pre-allocated r2g accumulators
+        # for fullgraph-compile-safety (see bc/compile_safe.py).
+        # Default False keeps the cheap Python-list path. Refused for
+        # ``flat_intermediate=True`` (enum-flat / torch.nonzero).
+        static_buffers: bool = False,
     ) -> None:
         super().__init__()
         self.kb = kb
@@ -185,6 +190,20 @@ class BCGrounder(nn.Module):
                 f"init_state_shape must be 'minimal' or 'full', "
                 f"got {init_state_shape!r}")
         self._init_state_shape = init_state_shape
+        # Static-buffer opt-in for fullgraph compile (see compile_safe.py).
+        # Refused for flat_intermediate (enum-flat) where torch.nonzero
+        # produces dynamic shapes incompatible with pre-allocation.
+        if static_buffers and flat_intermediate:
+            raise ValueError(
+                "static_buffers=True is incompatible with "
+                "flat_intermediate=True (enum-flat / torch.nonzero).")
+        # Static buffers need constant per-depth T = B*S*K_r; force
+        # init_state_shape='full' so S doesn't vary across depths.
+        if static_buffers and init_state_shape != "full":
+            init_state_shape = "full"
+        self._static_buffers = static_buffers
+        self._r2g_static_buf: Optional[Dict[str, Tensor]] = None  # lazy
+        self._r2g_static_max_per_step: int = 0
         # Paper BC_{w,d,u} convention: u (= w_last_depth) defaults to 0.
         # All body atoms at the last (= terminal) step must be facts;
         # any rule application with leftover unknown leaves is dropped
@@ -885,7 +904,9 @@ class BCGrounder(nn.Module):
         pad_q = queries.new_zeros(batch_size, queries.shape[1])
         pad_m = torch.zeros(batch_size, dtype=torch.bool, device=dev)
 
-        # Reset r2g accumulators once for the entire chunked call.
+        # Static r2g buffers (no-op unless opted in), then reset.
+        # Allocation is eager (outside any compile boundary).
+        self._alloc_r2g_static_buffers(batch_size, dev)
         self._reset_r2g_state()
 
         # Choose the inner step. When outer compile is enabled (sld/
@@ -919,11 +940,14 @@ class BCGrounder(nn.Module):
                 q_padded[:n_real] = q
                 m_padded[:n_real] = m
                 q, m = q_padded, m_padded
-            if self._uses_outer_compile:
+            if self._uses_outer_compile and not torch.compiler.is_compiling():
                 # Tell CUDA-graph trees a new iteration is starting so
                 # static-address output buffers are safe to reuse.
                 # Mirrors dprl's per-step pattern (PPO compilation.py
                 # calls this before every rollout_step).
+                # Skipped when called from inside torch.compile tracing —
+                # the outer compile owns step boundaries, and
+                # mark_step_begin is a forbidden tracing op anyway.
                 torch.compiler.cudagraph_mark_step_begin()
             out = inner_fn(q, m, **init_kwargs)
             if self._uses_outer_compile:
@@ -981,14 +1005,39 @@ class BCGrounder(nn.Module):
         )
 
     def _reset_r2g_state(self) -> None:
-        if self._collect_rule_groundings:
-            self._r2g_buffer: Dict[int, set] = {}
-            self._r2g_acc_rule: List[Tensor] = []
-            self._r2g_acc_head: List[Tensor] = []
-            self._r2g_acc_body: List[Tensor] = []
-            self._r2g_skip_per_step = False
-        else:
-            self._r2g_skip_per_step = False
+        self._r2g_skip_per_step = False
+        if not self._collect_rule_groundings:
+            return
+        self._r2g_buffer: Dict[int, set] = {}
+        self._r2g_acc_rule: List[Tensor] = []
+        self._r2g_acc_head: List[Tensor] = []
+        self._r2g_acc_body: List[Tensor] = []
+        # Reset pre-allocated static buffers in-place (cheap; the
+        # alloc itself happens lazily in ``_alloc_r2g_static_buffers``).
+        if self._static_buffers and self._r2g_static_buf is not None:
+            self._r2g_static_buf["rule_idx"].fill_(-1)
+            self._r2g_static_buf["head"].fill_(self.kb.padding_idx)
+            self._r2g_static_buf["body"].fill_(self.kb.padding_idx)
+
+    def _alloc_r2g_static_buffers(self, B: int, dev) -> None:
+        """Lazy-allocate static r2g buffers (B-dependent → not in __init__).
+
+        No-op when not opted in or not collecting r2g; reuses existing
+        buffers if the (B, dev) envelope hasn't grown.
+        """
+        if not (self._static_buffers and self._collect_rule_groundings):
+            return
+        from grounder.bc.compile_safe import alloc_static_buffers
+        max_per_step = max(B * self.S * max(self.kb.num_rules, 1), 1)
+        if (self._r2g_static_buf is not None
+                and self._r2g_static_max_per_step >= max_per_step
+                and self._r2g_static_buf["rule_idx"].device == dev):
+            return
+        self._r2g_static_buf = alloc_static_buffers(
+            depth=self.depth, max_per_step=max_per_step,
+            M=self.kb.M, pad=self.kb.padding_idx, device=dev,
+        )
+        self._r2g_static_max_per_step = max_per_step
 
     def _merge_chunk_outputs(
         self,
@@ -1155,6 +1204,7 @@ class BCGrounder(nn.Module):
         self, queries: Tensor, query_mask: Tensor, **init_kwargs,
     ) -> GrounderOutput:
         """Single-batch grounder forward: reset r2g, run, finalise."""
+        self._alloc_r2g_static_buffers(queries.size(0), queries.device)
         self._reset_r2g_state()
         states = self.init_states(queries, query_mask, **init_kwargs)
         for d in range(self.depth):
@@ -1392,8 +1442,12 @@ class BCGrounder(nn.Module):
         # Tensorized path: appends to per-step GPU tensors with no
         # ``.item()`` / ``.tolist()`` syncs. Final dedup + host transfer
         # happens once after the step loop in ``_finalize_r2g_tensor``.
+        # Stash the depth index so ``_collect_r2g_tensor`` knows which
+        # static-buffer slot to write to (no-op for the legacy
+        # Python-list path).
         if (self._collect_rule_groundings
                 and not getattr(self, "_r2g_skip_per_step", False)):
+            states["_step_idx"] = d
             self._collect_r2g_tensor(resolved, states)
 
         # ── PACK → returns (states, sync) — no dict pollution ──
@@ -2027,33 +2081,28 @@ class BCGrounder(nn.Module):
             b_idx = bi
             s_idx = si
 
-        # Drop entries with no body atom or invalid mask.
+        # Drop entries with no body atom or invalid mask. ``valid`` here
+        # is full-shape [T] — invalid rows masked but tensors not
+        # filtered (the static-buffer path needs that; the eager path
+        # filters at the end). Note: an early ``if not bool(valid.any())
+        # : return`` here used to short-circuit the rest of this
+        # function, but ``bool()`` on a 0-d tensor breaks
+        # ``torch.compile(fullgraph=True)`` (data-dependent Python
+        # branch). Downstream tensor ops handle the all-False case.
         active_atom = body[..., 0] != pad           # [T, M]
         has_body = active_atom.any(dim=-1)           # [T]
         valid = valid & has_body & (rule_idx >= 0)
-        # Note: an early ``if not bool(valid.any()): return`` here
-        # used to short-circuit the rest of this function, but that
-        # ``bool()`` on a 0-d tensor breaks ``torch.compile`` under
-        # ``fullgraph=True`` (Dynamo can't trace the data-dependent
-        # Python branch). Downstream tensor ops handle the
-        # all-False case correctly — empty selections cascade to
-        # zero-size accumulator appends, which is the right result —
-        # so we let the rest of the function run unconditionally.
 
-        rule_idx = rule_idx[valid].long()
-        body = body[valid]
-        b_idx = b_idx[valid].long()
-        s_idx = s_idx[valid].long()
-        active_atom = active_atom[valid]
-
-        # Map variant → orig.
+        # Variant → orig mapping (clamp(min=0) keeps invalid entries
+        # in-bounds; they'll be masked out by ``valid``).
+        rule_idx = rule_idx.long()
         v2o = getattr(self, "_variant_to_orig_t", None)
         if v2o is not None:
             rule_idx = v2o[rule_idx.clamp(min=0)]
 
-        # Head: gather selected goal per (b, s).
+        # Head: gather selected goal per (b, s). Full-shape — no filter.
         if sel is not None:
-            head = sel[b_idx, s_idx]                # [T, 3]
+            head = sel[b_idx.long(), s_idx.long()]              # [T, 3]
         else:
             head = torch.full(
                 (rule_idx.size(0), 3), pad,
@@ -2072,10 +2121,20 @@ class BCGrounder(nn.Module):
         body_sorted = body.gather(
             1, sort_idx.unsqueeze(-1).expand(-1, -1, 3))
 
-        # Append to running accumulators (one cat at end of forward).
-        self._r2g_acc_rule.append(rule_idx)
-        self._r2g_acc_head.append(head)
-        self._r2g_acc_body.append(body_sorted)
+        # Persist. Static-buffer path: write full [T] slot with valid
+        # mask (compile-safe; no data-dependent slice). Eager path:
+        # filter by ``valid`` then append (smaller cat at finalize).
+        if self._static_buffers:
+            from grounder.bc.compile_safe import collect_step
+            collect_step(
+                self._r2g_static_buf, states.get("_step_idx", 0),
+                rule_idx=rule_idx, head=head, body_sorted=body_sorted,
+                valid=valid, pad=pad,
+            )
+            return
+        self._r2g_acc_rule.append(rule_idx[valid])
+        self._r2g_acc_head.append(head[valid])
+        self._r2g_acc_body.append(body_sorted[valid])
 
     def _prune_rule_groundings_tensor(self, rg):
         """fp_batch / Kleene fixed-point pruning over a RuleGroundings.
@@ -2158,97 +2217,32 @@ class BCGrounder(nn.Module):
         )
 
     def _finalize_r2g_tensor(self):
-        """Dedup accumulated (rule, head, body) tensors with
-        ``torch.unique`` and build a ``RuleGroundings`` directly.
+        """Build ``RuleGroundings`` from per-step accumulators.
 
-        Returns the RuleGroundings tensor structure (atom_table, A_in,
-        A_out) without going through ``_r2g_buffer``. The host transfer
-        is one int per (head, body) atom — O(U·(M+1)) — which is
-        orders of magnitude smaller than the legacy ``.tolist()`` of
-        raw resolved children per step.
+        Both paths (eager Python lists / static tensor buffers) feed
+        the same ``finalize_flat`` helper. Returns ``None`` when the
+        eager list is empty (preserves the old contract; the
+        compile-time path always has data via the pre-allocated
+        buffers).
         """
-        from grounder.types import RuleGroundings
+        from grounder.bc.compile_safe import finalize_flat
 
-        if not self._r2g_acc_rule:
-            return None
-        rule_idx = torch.cat(self._r2g_acc_rule, 0)
-        head = torch.cat(self._r2g_acc_head, 0)
-        body = torch.cat(self._r2g_acc_body, 0)
-        T = rule_idx.size(0)
-        if T == 0:
-            return None
-        # Drop sentinel rows (rule_idx == -1) inserted by the per-step
-        # path to keep ``_collect_r2g_tensor`` host-sync-free. One sync
-        # here at finalize amortises across all steps.
-        keep = rule_idx >= 0
-        if not bool(keep.any()):
-            return None
-        if not bool(keep.all()):
-            rule_idx = rule_idx[keep]
-            head = head[keep]
-            body = body[keep]
-            T = rule_idx.size(0)
-        M = body.size(1)
-        device = rule_idx.device
-        # Encode each row as a single comparable tensor for unique:
-        # [rule, head[3], body[M*3]] = [1 + 3 + 3M].
-        combined = torch.cat([
-            rule_idx.unsqueeze(-1),
-            head.long(),
-            body.long().reshape(T, M * 3),
-        ], dim=-1)
-        uniq = torch.unique(combined, dim=0)          # [U, 1 + 3 + 3M]
-        if uniq.size(0) == 0:
-            return None
-        u_rule = uniq[:, 0].long()
-        u_head = uniq[:, 1:4].long()                  # [U, 3]
-        u_body = uniq[:, 4:].reshape(-1, M, 3).long() # [U, M, 3]
-
-        # Atom table: union of (head, body) atoms across all rule
-        # applications.  Build via a single ``torch.unique`` on the
-        # flattened atom set.
-        # Drop padding body atoms by tagging them with a sentinel index;
-        # they'll get filtered when building per-rule A_in.
-        pad = self.kb.padding_idx
-        all_atoms = torch.cat([u_head.unsqueeze(1), u_body], dim=1)  # [U, M+1, 3]
-        flat_atoms = all_atoms.reshape(-1, 3)                       # [U*(M+1), 3]
-        atom_table, inverse = torch.unique(
-            flat_atoms, dim=0, return_inverse=True,
-        )
-        inverse = inverse.reshape(-1, M + 1)                        # [U, M+1]
-        head_atom_idx = inverse[:, 0]                               # [U]
-        body_atom_idx = inverse[:, 1:]                              # [U, M]
-        # Active body-atom mask (drop padding atoms in A_in).
-        body_active = (u_body[..., 0] != pad)                       # [U, M]
-
-        # Bucket into per-rule tensors.  Keep this Python loop over
-        # ``num_rules`` only — typically tens, not thousands.  The
-        # masking + indexing inside is tensor-only.
-        num_rules = self.kb.num_rules
-        A_in: Dict[int, Tensor] = {}
-        A_out: Dict[int, Tensor] = {}
-        # Track max body length per rule to size A_in.
-        max_body_per_rule = body_active.long().sum(dim=-1)          # [U]
-        for r in range(num_rules):
-            mask = (u_rule == r)
-            if not bool(mask.any()):
-                A_in[r] = torch.zeros(
-                    0, 0, dtype=torch.long, device=device)
-                A_out[r] = torch.zeros(
-                    0, 1, dtype=torch.long, device=device)
-                continue
-            r_body_idx = body_atom_idx[mask]                        # [G_r, M]
-            r_head_idx = head_atom_idx[mask].unsqueeze(-1)          # [G_r, 1]
-            # Compact: drop padding atoms by per-row slice.
-            r_max_m = int(max_body_per_rule[mask].max().item())
-            A_in[r] = r_body_idx[:, :r_max_m].contiguous()
-            A_out[r] = r_head_idx
-        return RuleGroundings(
-            atom_table=atom_table.contiguous(),
-            A_in=A_in,
-            A_out=A_out,
-            num_atoms=int(atom_table.size(0)),
-            num_rules=num_rules,
+        if self._static_buffers:
+            buf = self._r2g_static_buf
+            rule_idx = buf["rule_idx"].reshape(-1)
+            head = buf["head"].reshape(-1, 3)
+            body = buf["body"].reshape(-1, *buf["body"].shape[-2:])
+        else:
+            if not self._r2g_acc_rule:
+                return None
+            rule_idx = torch.cat(self._r2g_acc_rule, 0)
+            head = torch.cat(self._r2g_acc_head, 0)
+            body = torch.cat(self._r2g_acc_body, 0)
+            if rule_idx.size(0) == 0:
+                return None
+        return finalize_flat(
+            rule_idx, head, body,
+            num_rules=self.kb.num_rules, pad=self.kb.padding_idx,
         )
 
     def _build_r2g_from_evidence(self, evidence) -> None:

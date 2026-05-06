@@ -323,47 +323,36 @@ def populate_query_pool_idx(
     device = queries.device
 
     pool = rg.atom_table.to(device)
-    if pool.numel() == 0:
-        # No groundings — atom_table is empty. Build it from queries
-        # plus the padding sentinel so downstream code has a valid
-        # padding slot (matching evidence_to_rule_groundings's invariant).
-        pad = torch.tensor(
-            [padding_idx, padding_idx, padding_idx],
-            dtype=torch.long, device=device).unsqueeze(0)
-        all_atoms = torch.cat([pad, queries], dim=0)        # [1+B, 3]
-        all_h = atom_hash(all_atoms)
-        uniq_h, inv = torch.unique(all_h, return_inverse=True)
-        repr_atoms = torch.zeros(
-            uniq_h.shape[0], 3, dtype=torch.long, device=device)
-        repr_atoms[inv] = all_atoms
-        new_query_pool_idx = inv[1:]                         # drop the padding row
-        return RuleGroundings(
-            atom_table=repr_atoms,
-            A_in=rg.A_in,
-            A_out=rg.A_out,
-            num_atoms=int(repr_atoms.shape[0]),
-            num_rules=rg.num_rules,
-            query_pool_idx=new_query_pool_idx,
-        )
 
-    # Hash both sides; figure out which queries are already in the pool.
+    # Branchless union: pool ∪ unique(queries). Works whether pool is
+    # empty or non-empty — when empty, ``in_pool_mask`` is all-False
+    # (the broadcast comparison reduces over a zero-size dim → False
+    # everywhere), ``novel_atoms`` is just ``queries``, and
+    # ``new_pool`` becomes the deduped queries. No data-dependent
+    # ``if pool.numel() == 0`` branch — the whole function is
+    # fullgraph-traceable.
     pool_h = atom_hash(pool)                                 # [N]
     query_h = atom_hash(queries)                             # [B]
-    in_pool_mask = torch.isin(query_h, pool_h)               # [B]
+    # Equivalent of ``torch.isin(query_h, pool_h)`` but without the
+    # decomposition's data-dependent ``len(test) * log2(len(elem))``
+    # heuristic that breaks dynamo. O(B*N) broadcast compare; for the
+    # sizes seen here (B ~ thousands, N ~ thousands) the GPU swallows
+    # this trivially.
+    in_pool_mask = (
+        query_h.unsqueeze(1) == pool_h.unsqueeze(0)
+    ).any(dim=1)                                             # [B]
 
-    # Append only the novel queries (deduped among themselves) so that
-    # the existing slots 0..N-1 stay stable and rg.A_in/A_out remain
-    # valid as-is.
-    if bool((~in_pool_mask).any()):
-        novel_atoms = queries[~in_pool_mask]
-        novel_h = atom_hash(novel_atoms)
-        novel_h_uniq, novel_inv = torch.unique(novel_h, return_inverse=True)
-        novel_repr = torch.zeros(
-            novel_h_uniq.shape[0], 3, dtype=torch.long, device=device)
-        novel_repr[novel_inv] = novel_atoms
-        new_pool = torch.cat([pool, novel_repr], dim=0)
-    else:
-        new_pool = pool
+    # Append novel queries (deduped among themselves) so the existing
+    # slots 0..N-1 stay stable and rg.A_in/A_out remain valid as-is.
+    # Even when every query is already in the pool, ``queries[~in_pool_mask]``
+    # produces an empty [0, 3] tensor and ``torch.cat`` is a no-op.
+    novel_atoms = queries[~in_pool_mask]
+    novel_h = atom_hash(novel_atoms)
+    novel_h_uniq, novel_inv = torch.unique(novel_h, return_inverse=True)
+    novel_repr = torch.zeros(
+        novel_h_uniq.shape[0], 3, dtype=torch.long, device=device)
+    novel_repr[novel_inv] = novel_atoms
+    new_pool = torch.cat([pool, novel_repr], dim=0)
 
     # Final lookup: each query's index in new_pool, via sorted-hash
     # binary search. Stable for tie-broken duplicates because each
