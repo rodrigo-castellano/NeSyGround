@@ -820,9 +820,17 @@ class BCGrounder(nn.Module):
 
         prev_collect = self._collect_rule_groundings
         self._collect_rule_groundings = True
+        # Only forward ``batch_size`` when caller explicitly set it.
+        # Passing ``batch_size=None`` triggers the SLD+reduce-overhead
+        # validation in ``forward`` (which requires an explicit positive
+        # batch_size for stable CUDA-graph capture); omitting the arg
+        # entirely lets ``forward`` apply its own ``_auto_batch_size``
+        # heuristic, matching the regular ``__call__`` adapter path.
+        fwd_kwargs = dict(init_kwargs)
+        if batch_size is not None:
+            fwd_kwargs["batch_size"] = batch_size
         try:
-            out = self.forward(
-                queries, query_mask, batch_size=batch_size, **init_kwargs)
+            out = self.forward(queries, query_mask, **fwd_kwargs)
         finally:
             self._collect_rule_groundings = prev_collect
 
