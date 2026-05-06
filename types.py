@@ -143,12 +143,21 @@ class RuleGroundings:
     atom_table[i] = [pred, subj, obj] for atom i.
     A_in[r][g, m]  = atom index of m-th body atom in grounding g of rule r.
     A_out[r][g, 0] = atom index of head atom in grounding g of rule r.
+
+    ``query_pool_idx`` is populated by :func:`run_bc` (the
+    rule-evidence entry point used by SBR/DCR/R2N's pool-iter loop):
+    each query atom gets a slot in ``atom_table``, even when no
+    grounding produced it as a head. Pool-iter consumers gather
+    ``pool[query_pool_idx]`` to read the final query score.
+    Left ``None`` by the per-tree path (``evidence_to_rule_groundings``
+    has no notion of queries).
     """
     atom_table: Tensor                # [num_atoms, 3]
     A_in: Dict[int, Tensor]           # rule_idx → [G_r, M_r]
     A_out: Dict[int, Tensor]          # rule_idx → [G_r, 1]
     num_atoms: int
     num_rules: int
+    query_pool_idx: Optional[Tensor] = None  # [B] indices into atom_table
 
 
 @dataclass

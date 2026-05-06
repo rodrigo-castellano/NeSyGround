@@ -53,6 +53,7 @@ __all__ = [
     "evidence_unique_app_keys",
     "evidence_to_rule_groundings",
     "count_proof_trees",
+    "populate_query_pool_idx",
 ]
 
 
@@ -283,6 +284,103 @@ def evidence_to_rule_groundings(
         A_out=A_out,
         num_atoms=int(repr_atoms.shape[0]),
         num_rules=num_rules_,
+    )
+
+
+def populate_query_pool_idx(
+    rg: RuleGroundings,
+    queries: Tensor,
+    padding_idx: int,
+) -> RuleGroundings:
+    """Extend ``rg.atom_table`` to include the queries and populate
+    ``rg.query_pool_idx``.
+
+    Pool-iter reasoners (SBR / DCR / R2N) need every query atom to
+    have a slot in the atom pool, even when no grounding produced
+    that atom as a head — so the final ``pool[query_pool_idx]``
+    gather is well-defined regardless of provability. Atoms already
+    present in ``rg.atom_table`` keep their existing slot; novel
+    queries are appended to the end of the table.
+
+    Args:
+        rg: input ``RuleGroundings`` (typically straight from the
+            grounder's per-rule pipeline).
+        queries: ``[B, 3]`` long tensor of query atoms ``(pred, h, t)``.
+        padding_idx: predicate index used to mark padded atoms in
+            ``atom_table``.
+
+    Returns:
+        A new ``RuleGroundings`` whose ``atom_table`` covers every
+        query atom and whose ``query_pool_idx`` is shape ``[B]``,
+        containing the pool index of each query. ``A_in`` / ``A_out``
+        are unchanged (their indices already point into the prefix
+        of ``atom_table`` that wasn't extended).
+    """
+    if queries.dim() != 2 or queries.shape[1] != 3:
+        raise ValueError(
+            f"queries must be [B, 3]; got shape {tuple(queries.shape)}")
+    queries = queries.long()
+    device = queries.device
+
+    pool = rg.atom_table.to(device)
+    if pool.numel() == 0:
+        # No groundings — atom_table is empty. Build it from queries
+        # plus the padding sentinel so downstream code has a valid
+        # padding slot (matching evidence_to_rule_groundings's invariant).
+        pad = torch.tensor(
+            [padding_idx, padding_idx, padding_idx],
+            dtype=torch.long, device=device).unsqueeze(0)
+        all_atoms = torch.cat([pad, queries], dim=0)        # [1+B, 3]
+        all_h = atom_hash(all_atoms)
+        uniq_h, inv = torch.unique(all_h, return_inverse=True)
+        repr_atoms = torch.zeros(
+            uniq_h.shape[0], 3, dtype=torch.long, device=device)
+        repr_atoms[inv] = all_atoms
+        new_query_pool_idx = inv[1:]                         # drop the padding row
+        return RuleGroundings(
+            atom_table=repr_atoms,
+            A_in=rg.A_in,
+            A_out=rg.A_out,
+            num_atoms=int(repr_atoms.shape[0]),
+            num_rules=rg.num_rules,
+            query_pool_idx=new_query_pool_idx,
+        )
+
+    # Hash both sides; figure out which queries are already in the pool.
+    pool_h = atom_hash(pool)                                 # [N]
+    query_h = atom_hash(queries)                             # [B]
+    in_pool_mask = torch.isin(query_h, pool_h)               # [B]
+
+    # Append only the novel queries (deduped among themselves) so that
+    # the existing slots 0..N-1 stay stable and rg.A_in/A_out remain
+    # valid as-is.
+    if bool((~in_pool_mask).any()):
+        novel_atoms = queries[~in_pool_mask]
+        novel_h = atom_hash(novel_atoms)
+        novel_h_uniq, novel_inv = torch.unique(novel_h, return_inverse=True)
+        novel_repr = torch.zeros(
+            novel_h_uniq.shape[0], 3, dtype=torch.long, device=device)
+        novel_repr[novel_inv] = novel_atoms
+        new_pool = torch.cat([pool, novel_repr], dim=0)
+    else:
+        new_pool = pool
+
+    # Final lookup: each query's index in new_pool, via sorted-hash
+    # binary search. Stable for tie-broken duplicates because each
+    # unique hash maps to exactly one slot in new_pool.
+    new_pool_h = atom_hash(new_pool)
+    sort_idx = new_pool_h.argsort()
+    sorted_h = new_pool_h[sort_idx]
+    pos = torch.searchsorted(sorted_h, query_h)
+    new_query_pool_idx = sort_idx[pos]
+
+    return RuleGroundings(
+        atom_table=new_pool,
+        A_in=rg.A_in,
+        A_out=rg.A_out,
+        num_atoms=int(new_pool.shape[0]),
+        num_rules=rg.num_rules,
+        query_pool_idx=new_query_pool_idx,
     )
 
 

@@ -790,6 +790,57 @@ class BCGrounder(nn.Module):
                 queries, query_mask, batch_size, **init_kwargs)
         return self._forward_one_batch(queries, query_mask, **init_kwargs)
 
+    @torch.no_grad()
+    def run_bc(
+        self, queries: Tensor, query_mask: Tensor,
+        *, batch_size: Optional[int] = None,
+        **init_kwargs,
+    ) -> "RuleGroundings":
+        """Rule-evidence entry point — for SBR/DCR/R2N pool-iter consumers.
+
+        Wraps :meth:`forward` and post-processes the output:
+          * forces ``collect_rule_groundings=True`` for the duration of
+            the call so callers don't need to know about that
+            ``__init__`` flag;
+          * extends ``rule_groundings.atom_table`` to include every
+            query atom and populates ``rule_groundings.query_pool_idx``
+            so the pool-iter loop has a well-defined readout slot per
+            query (even when no firing produced that atom as a head).
+
+        Returns the augmented :class:`grounder.types.RuleGroundings`
+        directly; callers that also need the per-tree ``ProofEvidence``
+        or the search ``ProofState`` should still call :meth:`forward`.
+
+        ``init_kwargs`` are forwarded to ``forward`` (and onward to
+        ``_init_resolution`` for any per-call resolution overrides).
+        """
+        # Lazy import to avoid a cycle: groundings.py imports from types.py.
+        from grounder.groundings import populate_query_pool_idx
+        from grounder.types import RuleGroundings as _RG
+
+        prev_collect = self._collect_rule_groundings
+        self._collect_rule_groundings = True
+        try:
+            out = self.forward(
+                queries, query_mask, batch_size=batch_size, **init_kwargs)
+        finally:
+            self._collect_rule_groundings = prev_collect
+
+        rg = out.rule_groundings
+        if rg is None:
+            # Build an empty-firings RuleGroundings whose atom_table
+            # still covers the queries — pool-iter consumers can then
+            # just gather KGE-init at every slot and produce a "no
+            # proof" score (constant per atom) for every query.
+            rg = _RG(
+                atom_table=torch.zeros(
+                    0, 3, dtype=torch.long, device=queries.device),
+                A_in={}, A_out={},
+                num_atoms=0,
+                num_rules=int(getattr(self.kb, "num_rules", 0) or 0),
+            )
+        return populate_query_pool_idx(rg, queries, self.kb.padding_idx)
+
     def _auto_batch_size(self, N: int) -> int:
         """Pick a chunk size for compile mode based on per-chunk memory.
 
