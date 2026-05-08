@@ -168,6 +168,12 @@ def step_impl(
     )
     resolved = apply_search_filters(grounder, resolved)
     resolved = grounder._apply_hooks(resolved, states)
+    # NOTE: ``bc.considered.capture_step`` is NOT called here — the
+    # compiled inner step is fullgraph-traced and Python-side list
+    # appends break the trace. The eager enum-flat path captures
+    # per-step. enum-dense + compile_mode currently surfaces only
+    # evidence-derived rule_groundings; consumers needing the keras-
+    # equivalent "considered" count should use enum-flat.
     states, sync = pack(grounder, resolved, states)
     states = postprocess(grounder, states, sync, d_t, is_last_t)
     return (states["grounding_body"], states["accumulated_body"],

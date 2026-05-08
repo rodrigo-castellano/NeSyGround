@@ -145,6 +145,8 @@ def build_torch_grounder(
             bump_s_to_k=False,
             init_state_shape="minimal",
             compile_mode=compile_mode,
+            collect_evidence=collect_evidence,
+            collect_rule_groundings=collect_rule_groundings,
         )
     raise ValueError(f"unsupported torch grounder kind: {kind!r}")
 

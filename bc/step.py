@@ -78,6 +78,25 @@ def step(
     resolved = apply_search_filters(grounder, resolved)
     resolved = grounder._apply_hooks(resolved, states)
 
+    # Capture every candidate firing BEFORE pack/prune drops dead
+    # children. This is the "considered" rule_groundings semantics
+    # that matches keras-ns ``rule2groundings``: rule applications
+    # are recorded regardless of whether their proof tree completes
+    # within the depth budget. The end-of-BFS ``prune_rule_groundings``
+    # filters down to apps whose body atoms are transitively groundable.
+    #
+    # SKIP when inside torch.compile tracing — the SLD outer-compile
+    # path wraps ``_forward_one_batch_inner`` in ``fullgraph=True``,
+    # and the Python ``list.append`` in ``capture_step`` breaks the
+    # trace and triggers cudagraph partitioning, hurting throughput.
+    # Compiled callers fall back to evidence-derived rule_groundings
+    # (only completed proof trees), matching the compiled enum-dense
+    # path's behaviour. Eager callers get the full "considered" set.
+    if (grounder._collect_rule_groundings
+            and not torch.compiler.is_compiling()):
+        from grounder.bc.considered import capture_step
+        capture_step(grounder, resolved, states)
+
     states, sync = pack(grounder, resolved, states)
     states = postprocess(grounder, states, sync, d)
     return states

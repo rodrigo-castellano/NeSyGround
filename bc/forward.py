@@ -49,6 +49,16 @@ def forward(
     resolutions, an explicit ``batch_size`` (or compile_mode auto)
     triggers chunking when ``batch_size < N``.
     """
+    # Reset the per-step "considered" accumulator once at the top of
+    # the public forward call. The chunked path's per-chunk
+    # ``forward_one_batch_inner`` MUST NOT reset (each chunk's
+    # captures need to accumulate; resetting per-chunk would only
+    # keep the final chunk's firings). The single-batch path uses
+    # this same top-level reset and skips the per-call reset inside
+    # ``forward_one_batch``.
+    if grounder._collect_rule_groundings:
+        from grounder.bc.considered import reset_accumulator
+        reset_accumulator(grounder)
     N = queries.size(0)
     if grounder._uses_outer_compile:
         if batch_size is None or batch_size <= 0:
@@ -285,17 +295,33 @@ def merge_chunk_outputs(
     # slots in evidence.body, so the substituted body atoms come
     # for free here (matching keras-ns).
     rule_groundings = None
-    if grounder._collect_rule_groundings and evidence is not None:
-        from grounder.groundings import evidence_to_rule_groundings
-        rule_groundings = evidence_to_rule_groundings(
-            evidence, grounder.kb.padding_idx,
-            num_rules=grounder.kb.num_rules)
+    if grounder._collect_rule_groundings:
+        # "Considered" semantics: every rule application the BFS
+        # proposed (including ones whose proof tree doesn't complete
+        # within depth) — captured per-step in ``bc.considered``.
+        # Matches keras-ns ``ApproximateBackwardChainingGrounder``'s
+        # ``rule2groundings`` accumulator. The fp_batch fixpoint then
+        # drops apps whose body atoms aren't transitively groundable.
+        #
+        # FALLBACK: when ``capture_step`` was skipped (compiled trace,
+        # see ``bc.step.step``), the accumulator is empty. Build
+        # rule_groundings from ``evidence`` instead so callers still
+        # get a well-defined output — the cost is the in-proof-only
+        # set rather than the full considered set.
+        from grounder.bc.considered import finalize as considered_finalize
+        rule_groundings = considered_finalize(grounder)
+        if rule_groundings is None and evidence is not None:
+            from grounder.groundings import evidence_to_rule_groundings
+            rule_groundings = evidence_to_rule_groundings(
+                evidence, grounder.kb.padding_idx,
+                num_rules=grounder.kb.num_rules)
         if rule_groundings is not None and grounder.filter_mode == "fp_batch":
             from grounder.bc.pruning import prune_rule_groundings
             rule_groundings = prune_rule_groundings(
                 rule_groundings,
                 facts_idx=grounder.kb.fact_index.facts_idx,
-                depth=grounder.depth)
+                depth=grounder.depth,
+                padding_idx=grounder.kb.padding_idx)
 
     return GrounderOutput(state=state, evidence=evidence,
                           rule_groundings=rule_groundings)
@@ -309,6 +335,10 @@ def forward_one_batch_inner(
     Used by :func:`forward_chunked`'s inner loop; the chunked path
     builds RuleGroundings once at the end across all chunks rather
     than per chunk.
+
+    NOTE: does NOT reset the considered accumulator — the chunked
+    path needs captures to accumulate across all chunks. The public
+    ``forward`` resets it once at the top.
     """
     states = init_states(grounder, queries, query_mask, **init_kwargs)
     for d in range(grounder.depth):
@@ -357,7 +387,13 @@ def forward_one_batch_inner(
 def forward_one_batch(
     grounder, queries: Tensor, query_mask: Tensor, **init_kwargs,
 ) -> GrounderOutput:
-    """Single-batch forward + r2g finalisation."""
+    """Single-batch forward + r2g finalisation.
+
+    NOTE: does NOT reset the considered accumulator — public
+    ``forward`` already does that at the top of the call. Skipping
+    the per-batch reset keeps semantics consistent between the
+    single-batch and chunked entry paths.
+    """
     states = init_states(grounder, queries, query_mask, **init_kwargs)
     for d in range(grounder.depth):
         states = step(grounder, states, d)
@@ -390,22 +426,23 @@ def forward_one_batch(
             evidence = ProofEvidence(
                 body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
                 body_count=evidence.body_count)
-    # Build RuleGroundings from the final substituted evidence.
-    # ``sync_accumulated`` propagates winning_subs across all
-    # depth slots in ``evidence.body``, so this gives the
-    # ground-truth substituted body atoms (matching keras-ns).
+    # Build RuleGroundings from the per-step "considered" accumulator
+    # captured by ``bc.considered.capture_step`` during BFS. Matches
+    # keras-ns ``rule2groundings`` semantics (every rule application
+    # the BFS proposed, regardless of proof-tree completion). The
+    # fp_batch fixpoint pruning then drops apps whose body atoms
+    # aren't transitively groundable.
     rule_groundings = None
-    if grounder._collect_rule_groundings and evidence is not None:
-        from grounder.groundings import evidence_to_rule_groundings
-        rule_groundings = evidence_to_rule_groundings(
-            evidence, grounder.kb.padding_idx,
-            num_rules=grounder.kb.num_rules)
+    if grounder._collect_rule_groundings:
+        from grounder.bc.considered import finalize as considered_finalize
+        rule_groundings = considered_finalize(grounder)
         if rule_groundings is not None and grounder.filter_mode == "fp_batch":
             from grounder.bc.pruning import prune_rule_groundings
             rule_groundings = prune_rule_groundings(
                 rule_groundings,
                 facts_idx=grounder.kb.fact_index.facts_idx,
-                depth=grounder.depth)
+                depth=grounder.depth,
+                padding_idx=grounder.kb.padding_idx)
 
     state = ProofState(
         proof_goals=states["proof_goals"],

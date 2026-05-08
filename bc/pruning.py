@@ -14,7 +14,8 @@ import torch
 from torch import Tensor
 
 
-def prune_rule_groundings(rg, *, facts_idx: Tensor, depth: int):
+def prune_rule_groundings(rg, *, facts_idx: Tensor, depth: int,
+                          padding_idx: int = None):
     """Snapshot-based ``num_steps``-iteration pruning.
 
     Mirrors ``common.prune_rule_groundings`` semantics in tensor form.
@@ -46,6 +47,16 @@ def prune_rule_groundings(rg, *, facts_idx: Tensor, depth: int):
         is_fact = fact_mask[inv_atoms]                      # [num_atoms]
     else:
         is_fact = torch.zeros(num_atoms, dtype=torch.bool, device=device)
+
+    # Padding atoms in shorter-rule body slots count as "always proved"
+    # — a body of [real_atom, pad] for an M=2 rule (when global M=3) is
+    # complete iff the real atom is proved; the pad shouldn't block
+    # the firing. Mark every atom_table row whose predicate equals
+    # ``padding_idx`` as proved. Without this, every rule with body
+    # shorter than the global ``kb.M`` is silently filtered out.
+    if padding_idx is not None and num_atoms > 0:
+        is_pad = atom_table[:, 0] == padding_idx
+        is_fact = is_fact | is_pad
 
     # proved-set: starts as facts, grows with proved heads. Snapshot
     # iteration: each pass uses a frozen view from the previous pass.
