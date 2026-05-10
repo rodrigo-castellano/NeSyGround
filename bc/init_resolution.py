@@ -152,14 +152,8 @@ def init_resolution(grounder, **kwargs) -> None:
     grounder._fn_steps_by_depth: Dict[int, Any] = {}
     grounder._uses_outer_compile = (
         grounder.compile_mode is not None
+        and grounder.resolution != "enum"
         and grounder.kb.device_.type == "cuda"
-        # Outer compile for non-enum resolutions (sld/rtf) which need
-        # whole-graph trace for path-sensitive step control flow.
-        # Also for enum + depth=1: enum's per-step compile only kicks
-        # in at depth>1 (per the ``depth > 1`` check below), leaving
-        # depth=1 grounders fully eager. Outer compile fills that gap
-        # — measured 2.2× speedup on countries_s3 BC01 sbr (9.2→4.2ms).
-        and (grounder.resolution != "enum" or grounder.depth == 1)
     )
     grounder._compiled_inner: Optional[Any] = None  # lazy on first call
     if (grounder.compile_mode
