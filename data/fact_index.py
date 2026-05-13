@@ -579,26 +579,21 @@ class BlockSparseFactIndex(InvertedFactIndex):
     def exists(self, atoms: Tensor) -> Tensor:
         """[N, 3] → [N] bool. Handles out-of-range indices (padding, variables).
 
-        Chunked over the atom axis so the ``[N, K]`` intermediate bool
-        tensor stays bounded (each chunk holds at most ``_EXISTS_BUDGET``
-        elements). Without chunking, depth-3 enum grounders on
-        countries_s3 hit 16 GiB single allocations because T*M can
-        reach hundreds of millions of atoms.
+        Single-call fast path by default. ``[N, K]`` only exceeds GPU
+        memory on the largest configurations (countries_s3 BC13 with
+        depth-3 enum + collect_rule_groundings=True hits 16 GiB at
+        N≈300M). Callers that need OOM protection there should pre-
+        chunk and call this method per chunk — the chunking logic
+        cannot live inside ``exists`` itself because the Python
+        ``for`` loop + ``torch.empty(N) + dynamic slice-assignment``
+        break torch.compile graph capture and add ~16× overhead on
+        compile-friendly callers (family BC12: 121 ms → 2000 ms).
         """
         if not self._use_dense:
             return super().exists(atoms)
         K = self._K
         P, E = self._num_predicates, self._num_entities
-        N = atoms.shape[0]
-        # Per-chunk N*K bool budget — 256 M bytes = 32 M booleans.
-        chunk = max(1, 32_000_000 // max(K, 1))
-        if N <= chunk:
-            return self._exists_chunk(atoms, K, P, E)
-        out = torch.empty(N, dtype=torch.bool, device=atoms.device)
-        for start in range(0, N, chunk):
-            end = min(start + chunk, N)
-            out[start:end] = self._exists_chunk(atoms[start:end], K, P, E)
-        return out
+        return self._exists_chunk(atoms, K, P, E)
 
     def _exists_chunk(self, atoms: Tensor, K: int, P: int, E: int) -> Tensor:
         preds, subjs = atoms[:, 0], atoms[:, 1]
