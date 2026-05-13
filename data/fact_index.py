@@ -579,21 +579,43 @@ class BlockSparseFactIndex(InvertedFactIndex):
     def exists(self, atoms: Tensor) -> Tensor:
         """[N, 3] → [N] bool. Handles out-of-range indices (padding, variables).
 
-        Single-call fast path by default. ``[N, K]`` only exceeds GPU
-        memory on the largest configurations (countries_s3 BC13 with
-        depth-3 enum + collect_rule_groundings=True hits 16 GiB at
-        N≈300M). Callers that need OOM protection there should pre-
-        chunk and call this method per chunk — the chunking logic
-        cannot live inside ``exists`` itself because the Python
-        ``for`` loop + ``torch.empty(N) + dynamic slice-assignment``
-        break torch.compile graph capture and add ~16× overhead on
-        compile-friendly callers (family BC12: 121 ms → 2000 ms).
+        Two paths, chosen by torch.compile state:
+
+        * **Compile/tracing context** (``torch.compiler.is_compiling()``
+          is True): single-call inline path. Static-shape, fullgraph-safe,
+          no Python loops. Required for compile-friendly callers like the
+          family BC12 reasoner path (family went 121 → 2003 ms when this
+          had a Python ``for`` loop wrapping ``torch.empty(N) + dynamic
+          slice-assign`` — those constructs break inductor graph capture).
+
+        * **Eager context** (``is_compiling()`` is False): chunked over
+          the atom axis with a 256 MB / ~256 M-bool per-chunk budget.
+          Needed for the countries_s3 BC13 reasoner path where T*M
+          reaches hundreds of millions and ``[N, K]`` blows past 16 GiB
+          as a single allocation. The Python ``for`` loop here is fine
+          because we're not being traced.
+
+        ``is_compiling()`` is the right gate: it's a Python-side flag
+        with no runtime cost, and dynamo statically resolves it during
+        tracing (taking only the compile-path branch into the graph).
         """
         if not self._use_dense:
             return super().exists(atoms)
         K = self._K
         P, E = self._num_predicates, self._num_entities
-        return self._exists_chunk(atoms, K, P, E)
+        # Fast path: inside torch.compile, or when the input is small.
+        if torch.compiler.is_compiling():
+            return self._exists_chunk(atoms, K, P, E)
+        N = atoms.shape[0]
+        # 256 MB / 1 byte/bool = 256 M booleans per chunk.
+        chunk = max(1, 256_000_000 // max(K, 1))
+        if N <= chunk:
+            return self._exists_chunk(atoms, K, P, E)
+        out = torch.empty(N, dtype=torch.bool, device=atoms.device)
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            out[start:end] = self._exists_chunk(atoms[start:end], K, P, E)
+        return out
 
     def _exists_chunk(self, atoms: Tensor, K: int, P: int, E: int) -> Tensor:
         preds, subjs = atoms[:, 0], atoms[:, 1]
