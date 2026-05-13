@@ -133,7 +133,12 @@ def finalize(grounder) -> Optional[RuleGroundings]:
     T = rule_idx.size(0)
     M = body.size(1)
 
-    # Encode (rule, head, body) as a row, dedup with ``torch.unique``.
+    # Encode (rule, head, body) as a row and dedup. Hash-based 1D
+    # unique replaces ``torch.unique(combined, dim=0)`` (slow per-row
+    # sort on a (1 + 3 + 3M)-wide int64 row): polynomial hash over
+    # column projections + 1D ``unique``. The same collision-rarity
+    # trade-off the rest of this module's ``atom_hash`` already accepts.
+    from grounder.groundings import atom_hash, _HASH_P0
     rule_idx_safe = torch.where(
         rule_idx < 0, torch.full_like(rule_idx, num_rules), rule_idx)
     combined = torch.cat([
@@ -141,15 +146,31 @@ def finalize(grounder) -> Optional[RuleGroundings]:
         head.long(),
         body.long().reshape(T, M * 3),
     ], dim=-1)
-    uniq = torch.unique(combined, dim=0)
+    head_h = atom_hash(head)                                    # [T]
+    body_h = atom_hash(body.long())                             # [T, M]
+    P = _HASH_P0
+    row_hash = rule_idx_safe.long() * P + head_h
+    for m in range(M):
+        row_hash = row_hash * P + body_h[:, m]
+    uniq_row_h, inv_row = torch.unique(row_hash, return_inverse=True)
+    n_uniq = uniq_row_h.size(0)
+    uniq = torch.empty(
+        n_uniq, combined.size(1), dtype=combined.dtype, device=combined.device)
+    uniq[inv_row] = combined
     u_rule = uniq[:, 0].long()
     u_head = uniq[:, 1:4].long()
     u_body = uniq[:, 4:].reshape(-1, M, 3).long()
 
-    # Build atom_table = unique union of head + body atoms.
+    # Build atom_table = unique union of head + body atoms. 1D hash
+    # dedup over (p, a0, a1) triples — same speed-up vs ``unique_dim``.
     all_atoms = torch.cat([u_head.unsqueeze(1), u_body], dim=1)   # [U, M+1, 3]
-    atom_table, inverse = torch.unique(
-        all_atoms.reshape(-1, 3), dim=0, return_inverse=True)
+    all_atoms_flat = all_atoms.reshape(-1, 3)
+    atom_h = atom_hash(all_atoms_flat)                            # [U*(M+1)]
+    uniq_atom_h, inverse = torch.unique(atom_h, return_inverse=True)
+    n_uniq_atom = uniq_atom_h.size(0)
+    atom_table = torch.empty(
+        n_uniq_atom, 3, dtype=all_atoms_flat.dtype, device=all_atoms_flat.device)
+    atom_table[inverse] = all_atoms_flat
     inverse = inverse.reshape(-1, M + 1)
     head_atom_idx = inverse[:, 0]
     body_atom_idx = inverse[:, 1:]

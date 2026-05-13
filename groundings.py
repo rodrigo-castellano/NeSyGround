@@ -169,13 +169,30 @@ def evidence_unique_app_keys(
     sort_idx = sort_keys.argsort(dim=-1)
     body_sorted = body.gather(
         1, sort_idx.unsqueeze(-1).expand(-1, -1, 3))
+    body_sorted_h = body_h.gather(1, sort_idx)  # sorted body hashes
 
     keys = torch.cat([
         ridx.unsqueeze(-1),
         head,
         body_sorted.reshape(-1, M * 3),
     ], dim=-1)
-    return torch.unique(keys, dim=0)
+    # Hash-based dedup instead of ``torch.unique(keys, dim=0)``: the
+    # latter calls ``unique_dim`` which does a per-row sort on a
+    # (1 + 3 + 3M)-wide int64 row. Polynomial hash + 1D ``unique``
+    # is faster (the path the rest of this module already takes).
+    # Collisions share the vanishingly-rare risk that ``atom_hash``
+    # already accepts elsewhere.
+    head_h = atom_hash(head)                                   # [N]
+    P = _HASH_P0
+    row_hash = ridx * P + head_h
+    for m in range(M):
+        row_hash = row_hash * P + body_sorted_h[:, m]
+    uniq_h, inv = torch.unique(row_hash, return_inverse=True)
+    n_uniq = uniq_h.size(0)
+    representatives = torch.empty(
+        n_uniq, keys.size(1), dtype=keys.dtype, device=keys.device)
+    representatives[inv] = keys
+    return representatives
 
 
 def evidence_unique_app_count(

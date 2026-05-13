@@ -35,16 +35,16 @@ def prune_rule_groundings(rg, *, facts_idx: Tensor, depth: int,
     device = atom_table.device
 
     # Build fact-set membership: which atom_table rows are facts.
+    # ``atom_hash`` projects each ``(p, a0, a1)`` row to int64, then
+    # ``torch.isin`` does the set-membership check in O((N+F) log F)
+    # on GPU — replaces the old ``unique_dim`` + ``.item()``-sized
+    # fact_mask buffer, which was slow per-row-sort plus a host sync.
     if facts_idx.numel() > 0:
+        from grounder.groundings import atom_hash
         fi_dev = facts_idx.to(device)
-        joined = torch.cat([atom_table, fi_dev], dim=0)     # [num_atoms+F, 3]
-        _, inv = torch.unique(joined, dim=0, return_inverse=True)
-        inv_atoms = inv[:num_atoms]
-        inv_facts = inv[num_atoms:]
-        fact_mask = torch.zeros(
-            inv.max().item() + 1, dtype=torch.bool, device=device)
-        fact_mask[inv_facts] = True
-        is_fact = fact_mask[inv_atoms]                      # [num_atoms]
+        atom_h = atom_hash(atom_table)                      # [num_atoms]
+        fact_h = atom_hash(fi_dev)                          # [F]
+        is_fact = torch.isin(atom_h, fact_h)                # [num_atoms]
     else:
         is_fact = torch.zeros(num_atoms, dtype=torch.bool, device=device)
 
