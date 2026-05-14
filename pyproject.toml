@@ -5,7 +5,7 @@ description = "NeSyGround: Compiled CUDA-graph-safe FOL grounding for neuro-symb
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0",
-    "torch-kge-kernels @ git+https://github.com/rodrigo-castellano/torch-kge-kernels.git@5d5d7f5",
+    "torch-kge-kernels @ git+https://github.com/rodrigo-castellano/torch-kge-kernels.git@a965480",
 ]
 license = "MIT"
 readme = "README.md"
