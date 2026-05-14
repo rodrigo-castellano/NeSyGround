@@ -119,6 +119,10 @@ def finalize(grounder) -> Optional[RuleGroundings]:
     Returns ``None`` if no firings were captured (empty BFS).
     Does not run ``prune_rule_groundings``; the caller should apply
     that filter when ``filter_mode == 'fp_batch'``.
+
+    Fixed-shape padding for compile-friendly downstream consumers is
+    a separate post-pruning step — see
+    :func:`grounder.groundings.pad_rule_groundings`.
     """
     if not grounder._considered_acc_rule:
         return None

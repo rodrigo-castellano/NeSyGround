@@ -459,6 +459,7 @@ def forward_one_batch(
 def run_bc(
     grounder, queries: Tensor, query_mask: Tensor,
     *, batch_size: Optional[int] = None,
+    pad_outputs: bool = False,
     **init_kwargs,
 ) -> "RuleGroundings":
     """Rule-evidence entry point — for SBR/DCR/R2N pool-iter consumers.
@@ -470,7 +471,16 @@ def run_bc(
       * extends ``rule_groundings.atom_table`` to include every
         query atom and populates ``rule_groundings.query_pool_idx``
         so the pool-iter loop has a well-defined readout slot per
-        query (even when no firing produced that atom as a head).
+        query (even when no firing produced that atom as a head);
+      * (opt-in via ``pad_outputs=True``) pads ``A_in[r]``,
+        ``A_out[r]`` and ``atom_table`` to fixed sizes (per-rule
+        ``grounder.G_r`` for firings; ``populate_query_pool_idx``
+        output + a small headroom for atom_table) so the downstream
+        compiled reasoner sees a single tensor shape across batches.
+        Trades a constant per-batch atom-table cost for the ability
+        to keep ``torch.compile(mode="reduce-overhead")`` on cells
+        whose flat-path output would otherwise oscillate per batch
+        (countries_s3 + BC13, family + BC{12,13}).
 
     Returns the augmented :class:`grounder.types.RuleGroundings`
     directly; callers that also need the per-tree ``ProofEvidence``
@@ -480,7 +490,7 @@ def run_bc(
     ``_init_resolution`` for any per-call resolution overrides).
     """
     # Lazy import to avoid a cycle: groundings.py imports from types.py.
-    from grounder.groundings import populate_query_pool_idx
+    from grounder.groundings import populate_query_pool_idx, pad_rule_groundings
     from grounder.types import RuleGroundings as _RG
 
     prev_collect = grounder._collect_rule_groundings
@@ -512,7 +522,36 @@ def run_bc(
             num_atoms=0,
             num_rules=int(getattr(grounder.kb, "num_rules", 0) or 0),
         )
-    return populate_query_pool_idx(rg, queries, grounder.kb.padding_idx)
+    rg = populate_query_pool_idx(rg, queries, grounder.kb.padding_idx)
+    if pad_outputs:
+        # Per-rule firings count after dedup can far exceed grounder.G_r
+        # (the per-query-per-rule budget): batch aggregation + multi-step
+        # state expansion drives the post-dedup K_r into the
+        # ``O(B * S * G_r)`` range. Pad to a power-of-two ceiling of the
+        # actual observed max K_r so the compiled downstream sees a
+        # small fixed set of graph variants (~log2(K_r_max)) instead of
+        # one per batch. The atom_table pad uses the same power-of-two
+        # rule on its own range so atom-side compile captures are
+        # bounded too.
+        if rg.A_in:
+            max_K_r = max(int(a.shape[0]) for a in rg.A_in.values())
+            G_pad = _next_pow2(max(max_K_r, 1))
+            cur_n = int(rg.atom_table.size(0))
+            atom_cap = _next_pow2(max(cur_n + 1, 16))
+            rg = pad_rule_groundings(
+                rg,
+                pad_per_rule_to=G_pad,
+                pad_atom_table_to=atom_cap,
+                pad_idx_for_atoms=0,
+            )
+    return rg
+
+
+def _next_pow2(n: int) -> int:
+    """Smallest power of 2 >= n. Returns 1 for n <= 1."""
+    if n <= 1:
+        return 1
+    return 1 << ((n - 1).bit_length())
 
 
 __all__ = [

@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from grounder import KB, BCGrounder
+from grounder.factory import make_bcwd
 from grounder.groundings import atom_hash, populate_query_pool_idx
 from grounder.types import RuleGroundings
 
@@ -234,3 +235,107 @@ class TestRunBC:
         query_mask = torch.tensor([True])
         _ = grounder.run_bc(queries, query_mask)
         assert grounder._collect_rule_groundings == original
+
+
+# ─────────────────────────────────────────────────────────────────────
+# pad_outputs — padded vs unpadded equivalence
+# ─────────────────────────────────────────────────────────────────────
+
+def _make_enum_grandparent_grounder(w: int = 1, d: int = 2):
+    """gp(X,Z) :- parent(X,Y), parent(Y,Z) under the enum (BC w/d) path.
+
+    The padded-output feature is only active for the enum resolution
+    path (the one that backs the BC_{w,d} family) — that's the path
+    whose flat-output shape oscillates per batch on countries_s3+BC13
+    / family+BC{12,13} and that this patch is designed to stabilise.
+    SLD/RTF don't expose the per-rule ``G_r`` cap that drives padding.
+    """
+    facts = torch.cat([
+        torch.tensor([[1, 1, 2], [1, 2, 3]], dtype=torch.long),
+        _PAD_FACTS,
+    ])
+    heads = torch.tensor([[2, 24, 25]], dtype=torch.long)
+    bodies = torch.tensor(
+        [[[1, 24, 26], [1, 26, 25]]], dtype=torch.long)
+    rule_lens = torch.tensor([2], dtype=torch.long)
+    kb = KB(facts, heads, bodies, rule_lens,
+            constant_no=23, predicate_no=3,
+            padding_idx=PAD, device=DEVICE,
+            fact_index_type='block_sparse')
+    return make_bcwd(kb, w=w, d=d, u=0)
+
+
+class TestPadOutputsEquivalence:
+    """The padded path must produce a ``RuleGroundings`` whose real
+    (non-padded) firings exactly match the unpadded output. Padding rows
+    are masked off via ``firings_valid`` and must point at sentinel
+    pool slot 0 so downstream gathers are safe.
+    """
+
+    @pytest.mark.parametrize("queries_in", [
+        torch.tensor([[2, 1, 3]], dtype=torch.long),                 # provable
+        torch.tensor([[2, 3, 1]], dtype=torch.long),                 # unprovable
+        torch.tensor([[2, 1, 3], [2, 3, 1], [2, 1, 24]],
+                     dtype=torch.long),                              # batch
+    ])
+    def test_padded_matches_unpadded_on_first_K_r(self, queries_in):
+        grounder = _make_enum_grandparent_grounder()
+        query_mask = torch.ones(queries_in.size(0), dtype=torch.bool)
+
+        rg_unpad = grounder.run_bc(queries_in, query_mask, pad_outputs=False)
+        rg_pad = grounder.run_bc(queries_in, query_mask, pad_outputs=True)
+
+        # Unpadded has no firings_valid; padded has it iff any rule has firings.
+        assert getattr(rg_unpad, "firings_valid", None) is None
+        if not rg_unpad.A_in:
+            # Unprovable batch — nothing to pad. Padding is a no-op.
+            assert rg_pad.firings_valid is None
+            return
+        assert rg_pad.firings_valid is not None
+
+        # Same rules present in both.
+        assert set(rg_pad.A_in.keys()) == set(rg_unpad.A_in.keys())
+
+        # Per-rule pad target — must be >= every rule's actual K_r AND
+        # be a power of two (so compile sees only ~log2 graph variants).
+        max_K_r = max(int(t.shape[0]) for t in rg_unpad.A_in.values())
+        G_pad_expected = 1 if max_K_r <= 1 else (1 << (max_K_r - 1).bit_length())
+        for r in rg_unpad.A_in.keys():
+            A_in_unpad = rg_unpad.A_in[r]
+            A_in_pad = rg_pad.A_in[r]
+            A_out_unpad = rg_unpad.A_out[r]
+            A_out_pad = rg_pad.A_out[r]
+            K_r = A_in_unpad.shape[0]
+
+            # Padded shape uses the across-rules max K_r rounded up to
+            # next pow2 — fixed for all rules in this batch.
+            assert A_in_pad.shape[0] == G_pad_expected
+            assert A_in_pad.shape[1] == A_in_unpad.shape[1]
+            assert A_out_pad.shape[0] == G_pad_expected
+            assert A_out_pad.shape[1] == 1
+            # Crucially: padding never *truncates* — every real firing
+            # has a slot in the padded tensor.
+            assert G_pad_expected >= K_r
+
+            # First K_r rows: byte-identical to the unpadded output.
+            assert torch.equal(A_in_pad[:K_r], A_in_unpad)
+            assert torch.equal(A_out_pad[:K_r], A_out_unpad)
+
+            # Padding rows: all point at sentinel slot 0.
+            assert (A_in_pad[K_r:] == 0).all().item()
+            assert (A_out_pad[K_r:] == 0).all().item()
+
+            # firings_valid mask: True for the first K_r, False after.
+            valid = rg_pad.firings_valid[r]
+            assert valid.shape == (G_pad_expected,)
+            assert valid[:K_r].all().item()
+            assert (~valid[K_r:]).all().item()
+
+        # atom_table — padded is a prefix-extension of unpadded (or equal).
+        N_unpad = rg_unpad.atom_table.shape[0]
+        assert rg_pad.atom_table.shape[0] >= N_unpad
+        assert torch.equal(
+            rg_pad.atom_table[:N_unpad], rg_unpad.atom_table)
+
+        # query_pool_idx points into a valid (and identical-prefix) pool.
+        assert torch.equal(rg_pad.query_pool_idx, rg_unpad.query_pool_idx)

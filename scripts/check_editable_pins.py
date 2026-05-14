@@ -65,10 +65,27 @@ def editable_path(pkg: str) -> Path | None:
     return None
 
 
+def _git_env() -> dict:
+    """Subprocess env with GIT_DIR / GIT_WORK_TREE scrubbed.
+
+    When this script is run as a pre-commit hook, git sets these vars
+    in the hook's environment so ``git -C <other-repo>`` would still
+    resolve refs in the *invoking* repo. Scrubbing them forces each
+    ``git -C`` to discover the repo at the explicit path.
+    """
+    import os
+    env = os.environ.copy()
+    for k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
+              "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR"):
+        env.pop(k, None)
+    return env
+
+
 def head_sha(path: Path) -> str:
     return subprocess.run(
         ["git", "-C", str(path), "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True,
+        env=_git_env(),
     ).stdout.strip()
 
 
@@ -77,6 +94,7 @@ def head_is_pushed(path: Path) -> bool:
     out = subprocess.run(
         ["git", "-C", str(path), "branch", "-r", "--contains", "HEAD"],
         capture_output=True, text=True, check=True,
+        env=_git_env(),
     ).stdout.strip()
     return bool(out)
 

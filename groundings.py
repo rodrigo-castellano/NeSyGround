@@ -39,7 +39,7 @@ For convenience, ``ProofEvidence`` exposes
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, Optional
 
 import torch
 from torch import Tensor
@@ -54,6 +54,7 @@ __all__ = [
     "evidence_to_rule_groundings",
     "count_proof_trees",
     "populate_query_pool_idx",
+    "pad_rule_groundings",
 ]
 
 
@@ -472,3 +473,103 @@ def count_proof_trees(
             break
 
     return int(proofs[q_id].sum().item())
+
+
+def pad_rule_groundings(
+    rg: "RuleGroundings",
+    *,
+    pad_per_rule_to: Optional[int] = None,
+    pad_atom_table_to: Optional[int] = None,
+    pad_idx_for_atoms: int = 0,
+) -> "RuleGroundings":
+    """Return a copy of ``rg`` whose ``A_in[r]``/``A_out[r]`` are
+    padded to ``[pad_per_rule_to, M]``/``[pad_per_rule_to, 1]`` and
+    whose ``atom_table`` is padded to ``[pad_atom_table_to, 3]``.
+
+    Padding rows in each ``A_in[r]`` / ``A_out[r]`` point at the
+    consumer-side sentinel pool slot (``pad_idx_for_atoms``, default 0
+    — the standard ``_rule_loop`` pad slot). The per-rule
+    ``firings_valid`` mask is emitted so that
+    ``build_firings_from_rule_groundings`` can forward validity into
+    ``FiringsTensors.firing_valid`` and the rule loop masks the
+    padded rows out of the T-norm composition.
+
+    This is a post-processing step (after any
+    ``prune_rule_groundings``) used to give the downstream compiled
+    reasoner a fixed-shape input on cells whose flat-path output
+    would otherwise oscillate across batches (countries_s3 + BC13,
+    family + BC{12,13}). On main, those cells fall back to
+    ``compile_mode=None`` instead.
+
+    No-ops when both pad arguments are ``None``.
+    """
+    from grounder.types import RuleGroundings
+    if pad_per_rule_to is None and pad_atom_table_to is None:
+        return rg
+
+    atom_table = rg.atom_table
+    device = atom_table.device
+    A_in = rg.A_in
+    A_out = rg.A_out
+
+    new_A_in: Dict[int, Tensor] = {}
+    new_A_out: Dict[int, Tensor] = {}
+    firings_valid: Optional[Dict[int, Tensor]] = (
+        {} if pad_per_rule_to is not None else None
+    )
+    if pad_per_rule_to is not None:
+        G = pad_per_rule_to
+        for r in sorted(A_in.keys()):
+            a_in_r = A_in[r]
+            a_out_r = A_out[r]
+            K_r, M = a_in_r.shape
+            if K_r > G:
+                # Truncate (lossy) — should not happen if caller chose
+                # pad_per_rule_to >= grounder.G_r. The downstream graph
+                # pool depends on G being a known upper bound; we'd
+                # rather lose marginal firings than blow the pool.
+                a_in_r = a_in_r[:G]
+                a_out_r = a_out_r[:G]
+                K_r = G
+            pad_n = G - K_r
+            if pad_n > 0:
+                pad_in = torch.full(
+                    (pad_n, M), pad_idx_for_atoms,
+                    dtype=a_in_r.dtype, device=device,
+                )
+                pad_out = torch.full(
+                    (pad_n, 1), pad_idx_for_atoms,
+                    dtype=a_out_r.dtype, device=device,
+                )
+                a_in_r = torch.cat([a_in_r, pad_in], dim=0)
+                a_out_r = torch.cat([a_out_r, pad_out], dim=0)
+            valid = torch.zeros(G, dtype=torch.bool, device=device)
+            valid[:K_r] = True
+            new_A_in[r] = a_in_r
+            new_A_out[r] = a_out_r
+            firings_valid[r] = valid
+    else:
+        new_A_in = dict(A_in)
+        new_A_out = dict(A_out)
+
+    if pad_atom_table_to is not None:
+        cur_n = atom_table.size(0)
+        if pad_atom_table_to > cur_n:
+            extra = pad_atom_table_to - cur_n
+            pad_rows = torch.zeros(
+                extra, 3, dtype=atom_table.dtype, device=device,
+            )
+            atom_table = torch.cat([atom_table, pad_rows], dim=0)
+        # If pad_atom_table_to <= cur_n we leave atom_table as-is.
+        # Truncating would silently invalidate gathers from real
+        # firings whose indices point past the truncation.
+
+    return RuleGroundings(
+        atom_table=atom_table.contiguous(),
+        A_in=new_A_in,
+        A_out=new_A_out,
+        num_atoms=int(atom_table.size(0)),
+        num_rules=rg.num_rules,
+        query_pool_idx=rg.query_pool_idx,
+        firings_valid=firings_valid,
+    )

@@ -158,6 +158,15 @@ class RuleGroundings:
     num_atoms: int
     num_rules: int
     query_pool_idx: Optional[Tensor] = None  # [B] indices into atom_table
+    # Optional per-rule validity mask, ``[G_r]`` bool per rule. Populated
+    # only when the grounder was configured with fixed-shape output
+    # padding (``pad_outputs=True``): the first K_r entries are real
+    # firings; the trailing G_r - K_r entries are padding rows whose
+    # ``A_in``/``A_out`` slots point at the atom_table padding sentinel
+    # and whose ``firings_valid[r][K_r:]`` is False. Consumers that build
+    # FiringsTensors from this dict must forward these flags into
+    # ``FiringsTensors.firing_valid`` so the rule loop masks padding out.
+    firings_valid: Optional[Dict[int, Tensor]] = None
 
 
 @dataclass
