@@ -530,12 +530,9 @@ def pad_rule_groundings(
         # rule shares M after considered.finalize / prune).
         sample = next((A_in[r] for r in rule_keys if A_in[r].size(1) > 0),
                       A_in[rule_keys[0]] if rule_keys else None)
-        if sample is None or sample.numel() == 0 and all(A_in[r].size(0) == 0 for r in rule_keys):
-            # Empty input — nothing to pad; emit per-rule empty tensors.
-            for r in rule_keys:
-                new_A_in[r] = A_in[r]
-                new_A_out[r] = A_out[r]
-                firings_valid[r] = torch.zeros(G, dtype=torch.bool, device=device)
+        if sample is None:
+            # No rules at all — return empty.
+            pass
         else:
             M = sample.size(1)
             a_in_dtype = sample.dtype
