@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-04T20:13:34+00:00",
+  "generated_at": "2026-05-15T09:12:05+00:00",
   "datasets": [
     "ablation_d2",
     "ablation_d3",
@@ -697,7 +697,7 @@
         "considered_rules": 4394,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 26974.72,
+        "ms": 26305.31,
         "ok": true,
         "error": null,
         "count": null
@@ -733,7 +733,7 @@
         "considered_rules": null,
         "ground_rules": 2774,
         "ground_proofs": 2276,
-        "ms": 2541.75,
+        "ms": 2541.18,
         "ok": true,
         "error": null,
         "count": 2774
@@ -748,13 +748,13 @@
         "count": 1266
       },
       "enum-flat:w1d2": {
-        "considered_rules": 0,
-        "ground_rules": 1990,
+        "considered_rules": 2793,
+        "ground_rules": 1989,
         "ground_proofs": 1727,
-        "ms": 3142.98,
+        "ms": 3372.46,
         "ok": true,
         "error": null,
-        "count": 1990
+        "count": 1989
       },
       "enum-flat:w1d3": {
         "considered_rules": 4394,
@@ -775,13 +775,13 @@
         "count": 1266
       },
       "enum-dense:w1d2": {
-        "considered_rules": 0,
-        "ground_rules": 2511,
+        "considered_rules": 2557,
+        "ground_rules": 2557,
         "ground_proofs": 2037,
-        "ms": 1756.75,
+        "ms": 1513.97,
         "ok": true,
         "error": null,
-        "count": 2511
+        "count": 2557
       },
       "enum-dense:w1d3": {
         "considered_rules": 0,
@@ -796,7 +796,7 @@
         "considered_rules": 33489363,
         "ground_rules": 33489363,
         "ground_proofs": null,
-        "ms": 2102.99,
+        "ms": 1929.3,
         "ok": true,
         "error": null,
         "count": 33489363

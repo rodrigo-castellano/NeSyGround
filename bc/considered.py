@@ -179,13 +179,28 @@ def finalize(grounder) -> Optional[RuleGroundings]:
     head_atom_idx = inverse[:, 0]
     body_atom_idx = inverse[:, 1:]
 
-    # Bucket per rule. Skip rule_idx == num_rules (= invalid sentinel).
+    # Bucket per rule via argsort + bincount + view-slicing instead of
+    # ``num_rules`` boolean-mask gathers. The previous form fired one
+    # gather kernel per rule (~48 launches on family), the new form
+    # fires ~3 launches plus one device→host sync independent of rule
+    # count. Stable sort preserves the original within-rule ordering
+    # the dedup pipeline produced. Skip rule_idx == num_rules (= the
+    # invalid sentinel).
+    sort_idx = torch.argsort(u_rule, stable=True)
+    rule_idx_sorted = u_rule[sort_idx]
+    body_atom_sorted = body_atom_idx[sort_idx]
+    head_atom_sorted = head_atom_idx[sort_idx]
+    sizes = torch.bincount(rule_idx_sorted, minlength=num_rules + 1)
+    sizes_cpu = sizes.tolist()                                 # 1 sync
     A_in: Dict[int, Tensor] = {}
     A_out: Dict[int, Tensor] = {}
+    offset = 0
     for r in range(num_rules):
-        mask = (u_rule == r)
-        A_in[r] = body_atom_idx[mask]
-        A_out[r] = head_atom_idx[mask].unsqueeze(-1)
+        K_r = sizes_cpu[r]
+        end = offset + K_r
+        A_in[r] = body_atom_sorted[offset:end]                  # view, 0 kernels
+        A_out[r] = head_atom_sorted[offset:end].unsqueeze(-1)    # view, 0 kernels
+        offset = end
 
     return RuleGroundings(
         atom_table=atom_table.contiguous(),

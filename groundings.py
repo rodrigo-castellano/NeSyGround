@@ -519,35 +519,86 @@ def pad_rule_groundings(
     )
     if pad_per_rule_to is not None:
         G = pad_per_rule_to
-        for r in sorted(A_in.keys()):
-            a_in_r = A_in[r]
-            a_out_r = A_out[r]
-            K_r, M = a_in_r.shape
-            if K_r > G:
-                # Truncate (lossy) — should not happen if caller chose
-                # pad_per_rule_to >= grounder.G_r. The downstream graph
-                # pool depends on G being a known upper bound; we'd
-                # rather lose marginal firings than blow the pool.
-                a_in_r = a_in_r[:G]
-                a_out_r = a_out_r[:G]
-                K_r = G
-            pad_n = G - K_r
-            if pad_n > 0:
-                pad_in = torch.full(
-                    (pad_n, M), pad_idx_for_atoms,
-                    dtype=a_in_r.dtype, device=device,
-                )
-                pad_out = torch.full(
-                    (pad_n, 1), pad_idx_for_atoms,
-                    dtype=a_out_r.dtype, device=device,
-                )
-                a_in_r = torch.cat([a_in_r, pad_in], dim=0)
-                a_out_r = torch.cat([a_out_r, pad_out], dim=0)
-            valid = torch.zeros(G, dtype=torch.bool, device=device)
-            valid[:K_r] = True
-            new_A_in[r] = a_in_r
-            new_A_out[r] = a_out_r
-            firings_valid[r] = valid
+        # Fully-vectorized pad: build one [num_rules*G, M] target buffer
+        # and scatter each rule's real firings into its slice via a
+        # single index assignment. The previous per-rule torch.cat fired
+        # ~5 small CUDA kernels per rule (zeros×2, cat×2, ones×1) which
+        # on the 48-rule family workload dominated the pad cost. The
+        # vectorized form runs ~6 kernels regardless of rule count.
+        rule_keys = sorted(A_in.keys())
+        # Determine M and dtypes from the first non-empty rule (every
+        # rule shares M after considered.finalize / prune).
+        sample = next((A_in[r] for r in rule_keys if A_in[r].size(1) > 0),
+                      A_in[rule_keys[0]] if rule_keys else None)
+        if sample is None or sample.numel() == 0 and all(A_in[r].size(0) == 0 for r in rule_keys):
+            # Empty input — nothing to pad; emit per-rule empty tensors.
+            for r in rule_keys:
+                new_A_in[r] = A_in[r]
+                new_A_out[r] = A_out[r]
+                firings_valid[r] = torch.zeros(G, dtype=torch.bool, device=device)
+        else:
+            M = sample.size(1)
+            a_in_dtype = sample.dtype
+            a_out_dtype = A_out[rule_keys[0]].dtype
+            # Per-rule firing counts (clamped to G — truncate if K_r > G).
+            K_clamped = torch.tensor(
+                [min(A_in[r].size(0), G) for r in rule_keys],
+                dtype=torch.long, device=device,
+            )                                                       # [num_rules]
+            num_rules_local = len(rule_keys)
+            # Flatten real firings across rules in one cat call. Truncate
+            # per-rule first so torch.cat sees clamped sizes.
+            a_in_chunks = []
+            a_out_chunks = []
+            for i, r in enumerate(rule_keys):
+                K_r_clamped = int(K_clamped[i].item())
+                if K_r_clamped == 0:
+                    continue
+                a_in_chunks.append(A_in[r][:K_r_clamped])
+                a_out_chunks.append(A_out[r][:K_r_clamped, 0])
+            if a_in_chunks:
+                a_in_flat = torch.cat(a_in_chunks, dim=0)            # [total_K, M]
+                a_out_flat = torch.cat(a_out_chunks, dim=0)          # [total_K]
+            else:
+                a_in_flat = torch.empty(0, M, dtype=a_in_dtype, device=device)
+                a_out_flat = torch.empty(0, dtype=a_out_dtype, device=device)
+            # Allocate target buffers shaped [num_rules, G, ...] and
+            # initialize to pad_idx_for_atoms.
+            A_in_3d = torch.full(
+                (num_rules_local, G, M), pad_idx_for_atoms,
+                dtype=a_in_dtype, device=device,
+            )
+            A_out_3d = torch.full(
+                (num_rules_local, G, 1), pad_idx_for_atoms,
+                dtype=a_out_dtype, device=device,
+            )
+            valid_2d = torch.zeros(
+                (num_rules_local, G), dtype=torch.bool, device=device)
+            # Compute target rows for the flat input via:
+            #   rule_idx[i] = which rule firing i belongs to
+            #   local_idx[i] = position within that rule (0..K_r-1)
+            #   target[i] = rule_idx[i] * G + local_idx[i]
+            rule_idx_flat = torch.repeat_interleave(
+                torch.arange(num_rules_local, device=device, dtype=torch.long),
+                K_clamped,
+            )                                                       # [total_K]
+            total_K = int(K_clamped.sum().item())
+            rule_offset = torch.cumsum(
+                torch.cat([torch.zeros(1, dtype=torch.long, device=device),
+                           K_clamped[:-1]]), dim=0)                  # [num_rules]
+            local_idx = (torch.arange(total_K, device=device, dtype=torch.long)
+                         - rule_offset[rule_idx_flat])
+            target_idx = rule_idx_flat * G + local_idx                # [total_K]
+            # Scatter via .view(-1, ...) — A_in_3d is contiguous so
+            # view(-1, M) is a single dispatch (no copy).
+            A_in_3d.view(-1, M)[target_idx] = a_in_flat
+            A_out_3d.view(-1, 1)[target_idx, 0] = a_out_flat
+            valid_2d.view(-1)[target_idx] = True
+            # Per-rule slicing: views into the 3D tensor, 0 kernels.
+            for i, r in enumerate(rule_keys):
+                new_A_in[r] = A_in_3d[i]                              # view [G, M]
+                new_A_out[r] = A_out_3d[i]                            # view [G, 1]
+                firings_valid[r] = valid_2d[i]                        # view [G]
     else:
         new_A_in = dict(A_in)
         new_A_out = dict(A_out)

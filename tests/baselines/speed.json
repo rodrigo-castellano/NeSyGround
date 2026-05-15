@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-04T20:15:42+00:00",
+  "generated_at": "2026-05-15T09:14:10+00:00",
   "datasets": [
     "wn18rr"
   ],
@@ -24,54 +24,13 @@
   "cells": {
     "wn18rr": {
       "_n_queries": 2924,
-      "enum-dense:w1d2": {
-        "ms_median": 1703.0101789860055,
-        "ms_min": 1703.0101789860055,
-        "ms_max": 1703.0101789860055,
-        "ms_mean": 1703.0101789860055,
-        "samples_ms": [
-          1703.0101789860055
-        ],
-        "n_timed": 1,
-        "n_warmup": 1,
-        "compile_mode_used": "reduce-overhead",
-        "ok": true,
-        "error": null
-      },
-      "keras-BC:w1d3": {
-        "ms_median": 26480.26826500427,
-        "ms_min": 26480.26826500427,
-        "ms_max": 26480.26826500427,
-        "ms_mean": 26480.26826500427,
-        "samples_ms": [
-          26480.26826500427
-        ],
-        "n_timed": 1,
-        "n_warmup": 1,
-        "ok": true,
-        "error": null
-      },
-      "SLD:d4": {
-        "ms_median": 1809.1584129724652,
-        "ms_min": 1809.1584129724652,
-        "ms_max": 1809.1584129724652,
-        "ms_mean": 1809.1584129724652,
-        "samples_ms": [
-          1809.1584129724652
-        ],
-        "n_timed": 1,
-        "n_warmup": 1,
-        "compile_mode_used": "reduce-overhead",
-        "ok": true,
-        "error": null
-      },
       "enum-flat:w1d2": {
-        "ms_median": 3096.726363990456,
-        "ms_min": 3096.726363990456,
-        "ms_max": 3096.726363990456,
-        "ms_mean": 3096.726363990456,
+        "ms_median": 2220.506059937179,
+        "ms_min": 2220.506059937179,
+        "ms_max": 2220.506059937179,
+        "ms_mean": 2220.506059937179,
         "samples_ms": [
-          3096.726363990456
+          2220.506059937179
         ],
         "n_timed": 1,
         "n_warmup": 1,
@@ -79,13 +38,54 @@
         "ok": true,
         "error": null
       },
-      "FC:fp_global": {
-        "ms_median": 2421.3440119638108,
-        "ms_min": 2421.3440119638108,
-        "ms_max": 2421.3440119638108,
-        "ms_mean": 2421.3440119638108,
+      "keras-BC:w1d3": {
+        "ms_median": 25765.00324299559,
+        "ms_min": 25765.00324299559,
+        "ms_max": 25765.00324299559,
+        "ms_mean": 25765.00324299559,
         "samples_ms": [
-          2421.3440119638108
+          25765.00324299559
+        ],
+        "n_timed": 1,
+        "n_warmup": 1,
+        "ok": true,
+        "error": null
+      },
+      "SLD:d4": {
+        "ms_median": 1815.4264849144965,
+        "ms_min": 1815.4264849144965,
+        "ms_max": 1815.4264849144965,
+        "ms_mean": 1815.4264849144965,
+        "samples_ms": [
+          1815.4264849144965
+        ],
+        "n_timed": 1,
+        "n_warmup": 1,
+        "compile_mode_used": "reduce-overhead",
+        "ok": true,
+        "error": null
+      },
+      "enum-dense:w1d2": {
+        "ms_median": 1401.6014700755477,
+        "ms_min": 1401.6014700755477,
+        "ms_max": 1401.6014700755477,
+        "ms_mean": 1401.6014700755477,
+        "samples_ms": [
+          1401.6014700755477
+        ],
+        "n_timed": 1,
+        "n_warmup": 1,
+        "compile_mode_used": "reduce-overhead",
+        "ok": true,
+        "error": null
+      },
+      "FC:fp_global": {
+        "ms_median": 2523.6665750853717,
+        "ms_min": 2523.6665750853717,
+        "ms_max": 2523.6665750853717,
+        "ms_mean": 2523.6665750853717,
+        "samples_ms": [
+          2523.6665750853717
         ],
         "n_timed": 1,
         "n_warmup": 1,
