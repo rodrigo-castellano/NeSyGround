@@ -316,8 +316,13 @@ class FCDynamic(nn.Module):
         for cr in compiled_rules:
             for bp in cr.body_patterns[: cr.num_body]:
                 used_preds.add(int(bp["pred_idx"]))
-            # head_pred_idx kept original — only used for output hash
-            # multiplication, doesn't index the offset arrays.
+            # head_pred_idx MUST be in the compact map: output hashes
+            # are emitted in compact space (see ``_apply_rule`` ->
+            # ``head_pred_compact * E2 + ...``) and decompacted at
+            # ``run()`` return. Without this, heads that don't appear
+            # in any fact or body collide with the compact-0 sentinel
+            # and get filtered out.
+            used_preds.add(int(cr.head_pred_idx))
         # Always reserve compact 0 for "no predicate" (sentinel /
         # padding). Original predicates remap above that.
         sorted_preds = [-1] + sorted(p for p in used_preds if p >= 0)
@@ -1181,15 +1186,23 @@ def run_forward_chaining(
         n_provable: Number of provable atoms (0 if none).
     """
     if method == "spmm":
-        # SpMM supports 1-body, 2-body, and 3-body chain rules.
-        # 4+ body rules in the rule set are UNSUPPORTED and silently
-        # skipped — fall back to staged for those if you need them.
+        # SpMM supports 1/2/3-body rules whose binding shape matches the
+        # ops table (COPY, TRANSPOSE, MATMUL, ELEM_AND, CASE_A, EXIST_AND,
+        # MATMUL3). Anything else — 4+ body rules or 1/2/3-body rules
+        # classified UNSUPPORTED (e.g. compositional rules wrapped with a
+        # disequality-guard body) — silently skips inside SpMM. Pre-check
+        # the whole set: if any rule is UNSUPPORTED, fall through to
+        # FCDynamic so it can handle the full mix.
         from grounder.fc.spmm import run_forward_chaining_spmm
-        if not any(getattr(cr, "num_body", 0) >= 4 for cr in compiled_rules):
+        from grounder.fc.spmm.ops import SpMMOp, classify_rule
+        all_supported = all(
+            classify_rule(cr).op != SpMMOp.UNSUPPORTED for cr in compiled_rules
+        )
+        if all_supported:
             return run_forward_chaining_spmm(
                 compiled_rules, facts_idx, num_entities, num_predicates,
                 depth=depth, device=device)
-        # Fall through to staged for 4+ body rule sets.
+        # Fall through to staged for any UNSUPPORTED rule.
 
     fc = FCDynamic(compiled_rules, facts_idx, num_entities, num_predicates,
                    device,
