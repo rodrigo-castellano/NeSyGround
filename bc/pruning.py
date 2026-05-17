@@ -58,31 +58,19 @@ def prune_rule_groundings(rg, *, facts_idx: Tensor, depth: int,
         is_pad = atom_table[:, 0] == padding_idx
         is_fact = is_fact | is_pad
 
-    # Fully-tensorized fixpoint + final filter. Key insight: every
-    # ``rg.A_in[r]`` already shares the same M dim (the global max
-    # body length set by ``considered.finalize`` — shorter rules have
-    # padding atoms in unused positions, and ``is_pad`` above marks
-    # those as proved). So we can cat all rules into one [total_K, M]
-    # via a single torch.cat and run the fixpoint without per-rule
-    # padding logic. After the fixpoint, the per-rule split uses an
-    # argsort + bincount + view-slicing pattern that fires O(1)
-    # kernels in the rule count.
-    rule_keys = sorted(rg.A_in.keys())
-    a_in_chunks = [rg.A_in[r] for r in rule_keys]
-    a_out_chunks = [rg.A_out[r][:, 0] for r in rule_keys]
-    K_per_rule = torch.tensor(
-        [t.size(0) for t in a_in_chunks], dtype=torch.long, device=device)
+    # Fully-tensorized fixpoint + final filter over the flat firings.
+    # ``rg.body_pool_idx`` is already ``[N, M_max]``; we apply the
+    # fixpoint directly on it and use ``rg.body_atom_valid`` to mask
+    # padded slots as proved (they're padding sentinels in atom_table
+    # via ``is_pad`` above).
+    A_in_all = rg.body_pool_idx                                  # [N, M_max]
+    A_out_all = rg.head_pool_idx                                 # [N]
+    body_atom_valid = rg.body_atom_valid                         # [N, M_max]
+    rule_idx_all = rg.rule_idx                                   # [N]
 
-    if not a_in_chunks or all(t.size(0) == 0 for t in a_in_chunks):
-        # All rules empty — nothing to filter.
-        return RuleGroundings(
-            atom_table=rg.atom_table,
-            A_in=dict(rg.A_in), A_out=dict(rg.A_out),
-            num_atoms=rg.num_atoms, num_rules=rg.num_rules,
-        )
-
-    A_in_all = torch.cat(a_in_chunks, dim=0)                    # [total_K, M]
-    A_out_all = torch.cat(a_out_chunks, dim=0)                  # [total_K]
+    if A_in_all.size(0) == 0:
+        # All rules empty — nothing to filter; return rg unchanged.
+        return rg
 
     # Fixpoint over proved-set, fully GPU-resident:
     #   - ``proved[A_in_all].all(-1)``: gather + reduce, fixed shapes.
@@ -106,42 +94,36 @@ def prune_rule_groundings(rg, *, facts_idx: Tensor, depth: int,
         )
         proved = torch.maximum(proved, new_heads)
 
-    keep_all = (proved[A_in_all] == 1).all(dim=-1)              # [total_K]
+    keep_all = (proved[A_in_all] == 1).all(dim=-1)              # [N]
 
-    # Per-rule split via cumsum of K_per_rule — view-slicing only,
-    # 0 CUDA kernels regardless of rule count. The slices are views
-    # into ``A_in_all`` / ``A_out_all`` (already filtered by keep_all
-    # via a single gather above).
-    A_in_kept = A_in_all[keep_all]                              # 1 kernel
-    A_out_kept = A_out_all[keep_all]                            # 1 kernel
-    # Recompute per-rule sizes after filtering.
-    # rule_idx_per_row: which rule each surviving row came from.
-    # Built by gathering from a flat rule_idx vector via the same
-    # keep_all mask. One torch.repeat_interleave + one gather.
-    rule_idx_all = torch.repeat_interleave(
-        torch.arange(len(rule_keys), device=device, dtype=torch.long),
-        K_per_rule)                                              # [total_K]
-    rule_idx_kept = rule_idx_all[keep_all]                       # [K_kept]
-    sizes_kept = torch.bincount(
-        rule_idx_kept, minlength=len(rule_keys))                 # [num_rule_keys]
-    sizes_cpu = sizes_kept.tolist()                              # 1 sync
+    # Filter firings to the kept set. ``keep_all`` is data-dependent,
+    # so this is the one sync-inducing op (masked_select). The flat
+    # layout means we get the per-rule split for free via
+    # bincount + cumsum, no per-rule Python loop.
+    body_pool_idx_kept = A_in_all[keep_all]
+    head_pool_idx_kept = A_out_all[keep_all]
+    body_atom_valid_kept = body_atom_valid[keep_all]
+    rule_idx_kept = rule_idx_all[keep_all].long()
 
-    new_A_in: Dict[int, Tensor] = {}
-    new_A_out: Dict[int, Tensor] = {}
-    offset = 0
-    for i, r in enumerate(rule_keys):
-        K_r_kept = sizes_cpu[i]
-        end = offset + K_r_kept
-        new_A_in[r] = A_in_kept[offset:end]                      # view, 0 kernels
-        new_A_out[r] = A_out_kept[offset:end].unsqueeze(-1)       # view, 0 kernels
-        offset = end
+    sizes = torch.bincount(rule_idx_kept, minlength=rg.num_rules)
+    rule_offsets = torch.zeros(
+        rg.num_rules + 1, dtype=torch.long, device=device)
+    rule_offsets[1:] = torch.cumsum(sizes, dim=0)
+    firing_valid_kept = torch.ones(
+        rule_idx_kept.size(0), dtype=torch.bool, device=device)
 
     return RuleGroundings(
         atom_table=rg.atom_table,
-        A_in=new_A_in,
-        A_out=new_A_out,
+        body_pool_idx=body_pool_idx_kept,
+        body_atom_valid=body_atom_valid_kept,
+        head_pool_idx=head_pool_idx_kept,
+        rule_idx=rule_idx_kept,
+        rule_offsets=rule_offsets,
+        firing_valid=firing_valid_kept,
         num_atoms=rg.num_atoms,
         num_rules=rg.num_rules,
+        M_max=rg.M_max,
+        query_pool_idx=rg.query_pool_idx,
     )
 
 

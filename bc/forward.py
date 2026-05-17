@@ -198,10 +198,17 @@ def clone_grounder_output(out: GrounderOutput) -> GrounderOutput:
         rg = out.rule_groundings
         new_rg = RuleGroundings(
             atom_table=_c(rg.atom_table),
-            A_in={k: _c(v) for k, v in rg.A_in.items()},
-            A_out={k: _c(v) for k, v in rg.A_out.items()},
+            body_pool_idx=_c(rg.body_pool_idx),
+            body_atom_valid=_c(rg.body_atom_valid),
+            head_pool_idx=_c(rg.head_pool_idx),
+            rule_idx=_c(rg.rule_idx),
+            rule_offsets=_c(rg.rule_offsets),
+            firing_valid=_c(rg.firing_valid),
             num_atoms=rg.num_atoms,
             num_rules=rg.num_rules,
+            M_max=rg.M_max,
+            query_pool_idx=_c(rg.query_pool_idx) if rg.query_pool_idx is not None else None,
+            _has_real_firings_valid=rg._has_real_firings_valid,
         )
     return GrounderOutput(
         state=new_state,
@@ -521,15 +528,31 @@ def run_bc(
         # still covers the queries — pool-iter consumers can then
         # just gather KGE-init at every slot and produce a "no
         # proof" score (constant per atom) for every query.
-        rg = _RG(
-            atom_table=torch.zeros(
-                0, 3, dtype=torch.long, device=queries.device),
-            A_in={}, A_out={},
-            num_atoms=0,
+        rg = _RG.empty(
             num_rules=int(getattr(grounder.kb, "num_rules", 0) or 0),
+            device=queries.device,
         )
-    rg = populate_query_pool_idx(rg, queries, grounder.kb.padding_idx)
-    if pad_outputs:
+    # Idempotent: ``closure_to_rule_groundings_fast`` already populated
+    # ``query_pool_idx`` (queries occupy the first B rows of its
+    # purpose-built atom_table). Skip the legacy
+    # ``populate_query_pool_idx`` pass in that case to avoid a redundant
+    # ``torch.unique`` host sync.
+    if rg.query_pool_idx is None:
+        rg = populate_query_pool_idx(rg, queries, grounder.kb.padding_idx)
+    if pad_outputs and not getattr(grounder, "_closure_fast_rg", False):
+        # ``closure_fast_rg`` already produces a fully static-shape rg
+        # (``body_pool_idx`` is always ``[B*K, M_max]``, ``atom_table``
+        # is always ``[B + B*K*M_max + 1, 3]``). Forcing pow2 pad on
+        # top of that buys nothing — and is actively harmful, because
+        # ``G_pad = next_pow2(max_K_r)`` varies per batch (different
+        # rules fire on different slot counts), giving the downstream
+        # compiled reasoner a new shape variant per pow2 bucket. In
+        # benchmarking this took the MetaQA bs=8 closure SBR step
+        # from ~1 ms with 1 unique graph to ~3 ms with ~39 unique
+        # graphs (every transition between pow2 buckets recompiles).
+        # When ``_closure_fast_rg`` is on, the rg is already
+        # compile-friendly, so skip the pad path entirely.
+        #
         # Per-rule firings count after dedup can far exceed grounder.G_r
         # (the per-query-per-rule budget): batch aggregation + multi-step
         # state expansion drives the post-dedup K_r into the
@@ -539,17 +562,21 @@ def run_bc(
         # one per batch. The atom_table pad uses the same power-of-two
         # rule on its own range so atom-side compile captures are
         # bounded too.
-        if rg.A_in:
-            max_K_r = max(int(a.shape[0]) for a in rg.A_in.values())
-            G_pad = _next_pow2(max(max_K_r, 1))
-            cur_n = int(rg.atom_table.size(0))
-            atom_cap = _next_pow2(max(cur_n + 1, 16))
-            rg = pad_rule_groundings(
-                rg,
-                pad_per_rule_to=G_pad,
-                pad_atom_table_to=atom_cap,
-                pad_idx_for_atoms=0,
-            )
+        if rg.rule_offsets.numel() > 1:
+            # Per-rule sizes are diff of offsets — one tensor reduce
+            # to find the max instead of iterating the dict shim.
+            sizes = rg.rule_offsets[1:] - rg.rule_offsets[:-1]
+            max_K_r = int(sizes.max().item()) if sizes.numel() else 0
+            if max_K_r > 0:
+                G_pad = _next_pow2(max(max_K_r, 1))
+                cur_n = int(rg.atom_table.size(0))
+                atom_cap = _next_pow2(max(cur_n + 1, 16))
+                rg = pad_rule_groundings(
+                    rg,
+                    pad_per_rule_to=G_pad,
+                    pad_atom_table_to=atom_cap,
+                    pad_idx_for_atoms=0,
+                )
     return rg
 
 

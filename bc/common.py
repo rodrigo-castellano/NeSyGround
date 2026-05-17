@@ -738,36 +738,62 @@ def build_rule_grounding_tensors(
         atom_table[idx, 1] = atom[1]
         atom_table[idx, 2] = atom[2]
 
-    # 2. Build per-rule A_in, A_out
-    A_in: Dict[int, Tensor] = {}
-    A_out: Dict[int, Tensor] = {}
-
+    # 2. Build flat per-firing tensors. ``M_max`` is the max body
+    # length across all firings. Body atoms shorter than ``M_max`` get
+    # padded with atom_table slot 0 (the consumer-side sentinel) and
+    # marked invalid in ``body_atom_valid``.
+    flat_rows: list = []  # (rule_idx, head_idx, [body_idx_padded], [body_valid])
+    M_max = 0
     for r in range(num_rules):
         groundings = rule2groundings.get(r, set())
         if not groundings:
-            A_in[r] = torch.zeros(0, 0, dtype=torch.long, device=device)
-            A_out[r] = torch.zeros(0, 1, dtype=torch.long, device=device)
             continue
+        for head, body in sorted(groundings):
+            M_max = max(M_max, len(body))
 
-        g_list = sorted(groundings)  # deterministic order
-        G_r = len(g_list)
-        M_r = max(len(body) for _, body in g_list)
+    if M_max == 0:
+        # Every rule empty.
+        return RuleGroundings.empty(num_rules=num_rules, device=device)
 
-        a_in = torch.zeros(G_r, M_r, dtype=torch.long, device=device)
-        a_out = torch.zeros(G_r, 1, dtype=torch.long, device=device)
+    body_rows: list = []
+    valid_rows: list = []
+    head_idxs: list = []
+    rule_idxs: list = []
+    for r in range(num_rules):
+        groundings = rule2groundings.get(r, set())
+        if not groundings:
+            continue
+        for head, body in sorted(groundings):
+            row = [all_atoms[a] for a in body] + [0] * (M_max - len(body))
+            vrow = [True] * len(body) + [False] * (M_max - len(body))
+            body_rows.append(row)
+            valid_rows.append(vrow)
+            head_idxs.append(all_atoms[head])
+            rule_idxs.append(r)
 
-        for g, (head, body) in enumerate(g_list):
-            a_out[g, 0] = all_atoms[head]
-            for m, atom in enumerate(body):
-                a_in[g, m] = all_atoms[atom]
+    if not body_rows:
+        return RuleGroundings.empty(num_rules=num_rules, device=device)
 
-        A_in[r] = a_in
-        A_out[r] = a_out
+    body_pool_idx = torch.tensor(body_rows, dtype=torch.long, device=device)
+    body_atom_valid = torch.tensor(valid_rows, dtype=torch.bool, device=device)
+    head_pool_idx = torch.tensor(head_idxs, dtype=torch.long, device=device)
+    rule_idx = torch.tensor(rule_idxs, dtype=torch.long, device=device)
+    sizes = torch.bincount(rule_idx, minlength=num_rules)
+    rule_offsets = torch.zeros(
+        num_rules + 1, dtype=torch.long, device=device)
+    rule_offsets[1:] = torch.cumsum(sizes, dim=0)
+    firing_valid = torch.ones(
+        rule_idx.size(0), dtype=torch.bool, device=device)
 
     return RuleGroundings(
         atom_table=atom_table,
-        A_in=A_in,
-        A_out=A_out,
+        body_pool_idx=body_pool_idx,
+        body_atom_valid=body_atom_valid,
+        head_pool_idx=head_pool_idx,
+        rule_idx=rule_idx,
+        rule_offsets=rule_offsets,
+        firing_valid=firing_valid,
         num_atoms=num_atoms,
         num_rules=num_rules,
+        M_max=M_max,
     )

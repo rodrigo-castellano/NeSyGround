@@ -179,34 +179,46 @@ def finalize(grounder) -> Optional[RuleGroundings]:
     head_atom_idx = inverse[:, 0]
     body_atom_idx = inverse[:, 1:]
 
-    # Bucket per rule via argsort + bincount + view-slicing instead of
-    # ``num_rules`` boolean-mask gathers. The previous form fired one
-    # gather kernel per rule (~48 launches on family), the new form
-    # fires ~3 launches plus one device→host sync independent of rule
-    # count. Stable sort preserves the original within-rule ordering
-    # the dedup pipeline produced. Skip rule_idx == num_rules (= the
-    # invalid sentinel).
-    sort_idx = torch.argsort(u_rule, stable=True)
-    rule_idx_sorted = u_rule[sort_idx]
-    body_atom_sorted = body_atom_idx[sort_idx]
-    head_atom_sorted = head_atom_idx[sort_idx]
-    sizes = torch.bincount(rule_idx_sorted, minlength=num_rules + 1)
-    sizes_cpu = sizes.tolist()                                 # 1 sync
-    A_in: Dict[int, Tensor] = {}
-    A_out: Dict[int, Tensor] = {}
-    offset = 0
-    for r in range(num_rules):
-        K_r = sizes_cpu[r]
-        end = offset + K_r
-        A_in[r] = body_atom_sorted[offset:end]                  # view, 0 kernels
-        A_out[r] = head_atom_sorted[offset:end].unsqueeze(-1)    # view, 0 kernels
-        offset = end
+    # Sort firings by rule_idx so each rule's slice in the flat tensors
+    # is contiguous. Drop the sentinel ``rule_idx == num_rules``: those
+    # are the invalid-rule rows from the dedup pipeline. ``bincount``
+    # gives per-rule sizes; cumsum gives the flat offset table.
+    keep = u_rule < num_rules
+    u_rule_keep = u_rule[keep]
+    head_atom_keep = head_atom_idx[keep]
+    body_atom_keep = body_atom_idx[keep]
+
+    sort_idx = torch.argsort(u_rule_keep, stable=True)
+    rule_idx_sorted = u_rule_keep[sort_idx]
+    body_atom_sorted = body_atom_keep[sort_idx]                 # [N, M]
+    head_atom_sorted = head_atom_keep[sort_idx]                 # [N]
+    sizes = torch.bincount(rule_idx_sorted, minlength=num_rules)
+    rule_offsets = torch.zeros(
+        num_rules + 1, dtype=torch.long,
+        device=rule_idx_sorted.device)
+    rule_offsets[1:] = torch.cumsum(sizes, dim=0)
+
+    # Body-atom validity: a body slot is invalid when it equals the
+    # padding sentinel in the atom_table. For consistency with
+    # ``evidence_to_rule_groundings`` we recompute from the body
+    # predicate (column 0 of the gathered atom row).
+    body_atoms_gathered = atom_table[body_atom_sorted]           # [N, M, 3]
+    body_atom_valid = body_atoms_gathered[..., 0] != pad        # [N, M]
+    firing_valid = torch.ones(
+        rule_idx_sorted.size(0), dtype=torch.bool,
+        device=rule_idx_sorted.device)
 
     return RuleGroundings(
         atom_table=atom_table.contiguous(),
-        A_in=A_in, A_out=A_out,
+        body_pool_idx=body_atom_sorted,
+        body_atom_valid=body_atom_valid,
+        head_pool_idx=head_atom_sorted,
+        rule_idx=rule_idx_sorted.long(),
+        rule_offsets=rule_offsets,
+        firing_valid=firing_valid,
         num_atoms=int(atom_table.size(0)),
         num_rules=num_rules,
+        M_max=int(M),
     )
 
 

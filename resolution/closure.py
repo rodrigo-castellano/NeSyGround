@@ -101,6 +101,17 @@ def init_closure(grounder, **kwargs) -> None:
         kwargs.get("compile_closure", False))
     grounder._closure_compiled_fn = None
 
+    # ``closure_fast_rg``: opt in to the dedup-free, compile-friendly
+    # ``closure_to_rule_groundings_fast`` builder instead of the legacy
+    # ``evidence_to_rule_groundings -> populate_query_pool_idx`` pair.
+    # The fast builder uses no ``torch.unique`` / ``nonzero`` so the
+    # whole ``run_bc -> rule_tail`` pipeline can be wrapped in a single
+    # ``torch.compile(mode='reduce-overhead')`` region without graph
+    # breaks. Semantic note: K_iter > 1 ``_rule_loop`` no longer
+    # propagates updates across shared atoms (non-dedup pool), so the
+    # default is OFF; opt in only when the consumer is K_iter=1 SBR.
+    grounder._closure_fast_rg = bool(kwargs.get("closure_fast_rg", False))
+
     # 4. Nominal BCGrounder attrs other helpers may read defensively.
     grounder.K = 0
     grounder.max_vars_per_rule = 3
@@ -360,11 +371,28 @@ def resolve_closure(
 
     rule_groundings: Optional[Any] = None
     if grounder._collect_rule_groundings:
-        rule_groundings = evidence.to_rule_groundings(
-            pad, num_rules=int(grounder.kb.num_rules))
-        if not closure_skip_inner_pool_idx:
-            rule_groundings = populate_query_pool_idx(
-                rule_groundings, queries, pad)
+        if getattr(grounder, "_closure_fast_rg", False):
+            # Static-shape, dedup-free, fully compile-friendly builder.
+            # Skips ``evidence_to_rule_groundings``'s ``torch.unique`` /
+            # ``nonzero`` calls and the follow-up
+            # ``populate_query_pool_idx`` (queries are slots 0..B-1 of
+            # the fresh atom_table). Closure-resolver only — see
+            # ``closure_to_rule_groundings_fast`` docstring for the
+            # K_iter > 1 semantic note.
+            from grounder.groundings import closure_to_rule_groundings_fast
+            rule_groundings = closure_to_rule_groundings_fast(
+                witness_rule=wr_K, witness_body=wb_K,
+                witness_count=wc_K, valid_rule=valid_rule,
+                queries=queries,
+                num_rules=int(grounder.kb.num_rules),
+                M_max=M, padding_idx=pad,
+            )
+        else:
+            rule_groundings = evidence.to_rule_groundings(
+                pad, num_rules=int(grounder.kb.num_rules))
+            if not closure_skip_inner_pool_idx:
+                rule_groundings = populate_query_pool_idx(
+                    rule_groundings, queries, pad)
 
     state = ProofState(
         proof_goals=torch.full(

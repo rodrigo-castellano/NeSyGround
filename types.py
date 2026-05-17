@@ -12,8 +12,8 @@ Internal pipeline types (NamedTuples for torch.compile safety):
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, NamedTuple, Optional
+from dataclasses import dataclass, field
+from typing import Dict, Iterator, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -133,16 +133,120 @@ class ProofEvidence:
         return evidence_to_rule_groundings(self, padding_idx, num_rules)
 
 
+class _PerRuleDictView:
+    """Lazy dict-like view over a flat ``RuleGroundings`` for legacy code.
+
+    Returns ``rg.body_pool_idx[offsets[r]:offsets[r+1]]`` for ``[r]``,
+    ``rg.head_pool_idx[offsets[r]:offsets[r+1]].unsqueeze(-1)``, etc.,
+    depending on the ``which`` flag. Adds **one host sync** per slice
+    (the offsets are a tensor scalar). Hot-path consumers (SBR /
+    DCR / R2N rule-loop) must NOT use this — they read the flat
+    tensors directly.
+
+    Trims trailing pad slots in ``body_pool_idx`` to a per-rule
+    ``M_r = max(active body length within rule r, 0)`` so that the
+    legacy ``A_in[r]`` shape matches the pre-flatten semantics
+    (variable per-rule M). Falls back to ``M_max`` when no firings
+    are active in the rule.
+    """
+    __slots__ = ("_rg", "_which")
+
+    def __init__(self, rg: "RuleGroundings", which: str) -> None:
+        self._rg = rg
+        self._which = which
+
+    def _rule_slice(self, r: int) -> Tuple[int, int]:
+        offsets = self._rg.rule_offsets
+        s = int(offsets[r].item())
+        e = int(offsets[r + 1].item())
+        return s, e
+
+    def _per_rule_M(self, r: int, s: int, e: int) -> int:
+        if e <= s:
+            return 0
+        valid = self._rg.body_atom_valid[s:e]                 # [G_r, M_max]
+        if valid.numel() == 0:
+            return 0
+        m_per_row = valid.long().sum(dim=-1)                  # [G_r]
+        return int(m_per_row.max().item())
+
+    def __getitem__(self, r: int) -> Tensor:
+        s, e = self._rule_slice(r)
+        if self._which == "A_in":
+            body = self._rg.body_pool_idx[s:e]                # [G_r, M_max]
+            M_r = self._per_rule_M(r, s, e)
+            return body[:, :M_r]
+        if self._which == "A_out":
+            return self._rg.head_pool_idx[s:e].unsqueeze(-1)
+        if self._which == "firings_valid":
+            return self._rg.firing_valid[s:e]
+        raise KeyError(self._which)
+
+    def __contains__(self, r: int) -> bool:
+        if r < 0 or r + 1 >= self._rg.rule_offsets.numel():
+            return False
+        s, e = self._rule_slice(r)
+        return e > s
+
+    def get(self, r: int, default=None):
+        if r in self:
+            return self[r]
+        return default
+
+    def keys(self) -> Iterator[int]:
+        n = int(self._rg.rule_offsets.numel()) - 1
+        if n <= 0:
+            return iter(())
+        # Compute non-empty rules once via tensor diff to avoid per-rule
+        # syncs in the common ``for r in rg.A_in:`` pattern.
+        offsets = self._rg.rule_offsets
+        sizes = (offsets[1:] - offsets[:-1]).tolist()         # 1 sync
+        return iter(i for i, s in enumerate(sizes) if s > 0)
+
+    def items(self):
+        for r in self.keys():
+            yield r, self[r]
+
+    def values(self):
+        for r in self.keys():
+            yield self[r]
+
+    def __iter__(self):
+        return self.keys()
+
+    def __len__(self) -> int:
+        # Number of non-empty rules.
+        n = int(self._rg.rule_offsets.numel()) - 1
+        if n <= 0:
+            return 0
+        offsets = self._rg.rule_offsets
+        sizes = (offsets[1:] - offsets[:-1]).tolist()         # 1 sync
+        return sum(1 for s in sizes if s > 0)
+
+    def __bool__(self) -> bool:
+        return len(self) > 0
+
+
 @dataclass
 class RuleGroundings:
     """Per-rule (A_in, A_out) grounding tensors — keras-compatible format.
 
-    Each rule application is a separate entry. Atoms are shared via a global
-    index table. Compatible with gather/scatter reasoning (SBR, R2N, DCR).
+    **Flat-tensor layout (canonical).** Each rule application is one
+    "firing". Firings from all rules are concatenated in sorted
+    ``rule_idx`` order; ``rule_offsets[r]:rule_offsets[r+1]`` slices
+    out rule ``r``'s firings. Body atoms are padded to ``M_max`` with
+    pad-slot 0 (the consumer-side sentinel); ``body_atom_valid`` and
+    ``firing_valid`` carry the per-slot / per-firing masks.
 
-    atom_table[i] = [pred, subj, obj] for atom i.
-    A_in[r][g, m]  = atom index of m-th body atom in grounding g of rule r.
-    A_out[r][g, 0] = atom index of head atom in grounding g of rule r.
+    Compatible with gather/scatter reasoning (SBR, R2N, DCR). The
+    legacy ``A_in`` / ``A_out`` / ``firings_valid`` dict interfaces
+    are provided as lazy properties for backward compatibility.
+
+    atom_table[i]              = [pred, subj, obj] for atom i.
+    body_pool_idx[f, m]        = atom index of m-th body atom of firing f.
+    head_pool_idx[f]           = atom index of head of firing f.
+    rule_idx[f]                = which rule firing f belongs to.
+    rule_offsets[r]..[r+1]     = slice covering firings of rule r.
 
     ``query_pool_idx`` is populated by :func:`run_bc` (the
     rule-evidence entry point used by SBR/DCR/R2N's pool-iter loop):
@@ -151,22 +255,71 @@ class RuleGroundings:
     ``pool[query_pool_idx]`` to read the final query score.
     Left ``None`` by the per-tree path (``evidence_to_rule_groundings``
     has no notion of queries).
+
+    ``firing_valid`` is False for padding firings produced by
+    ``pad_rule_groundings`` (``pad_outputs=True`` codepath); it's
+    True everywhere on the unpadded path.
     """
     atom_table: Tensor                # [num_atoms, 3]
-    A_in: Dict[int, Tensor]           # rule_idx → [G_r, M_r]
-    A_out: Dict[int, Tensor]          # rule_idx → [G_r, 1]
-    num_atoms: int
-    num_rules: int
+    # Flat firings (concatenated over rules in sorted rule_idx order).
+    body_pool_idx: Tensor             # [N_firings, M_max] long
+    body_atom_valid: Tensor           # [N_firings, M_max] bool
+    head_pool_idx: Tensor             # [N_firings] long
+    rule_idx: Tensor                  # [N_firings] long, sorted ascending
+    rule_offsets: Tensor              # [num_rules + 1] long, cumsum
+    firing_valid: Tensor              # [N_firings] bool
+    num_atoms: int = 0
+    num_rules: int = 0
+    M_max: int = 0
     query_pool_idx: Optional[Tensor] = None  # [B] indices into atom_table
-    # Optional per-rule validity mask, ``[G_r]`` bool per rule. Populated
-    # only when the grounder was configured with fixed-shape output
-    # padding (``pad_outputs=True``): the first K_r entries are real
-    # firings; the trailing G_r - K_r entries are padding rows whose
-    # ``A_in``/``A_out`` slots point at the atom_table padding sentinel
-    # and whose ``firings_valid[r][K_r:]`` is False. Consumers that build
-    # FiringsTensors from this dict must forward these flags into
-    # ``FiringsTensors.firing_valid`` so the rule loop masks padding out.
-    firings_valid: Optional[Dict[int, Tensor]] = None
+    _has_real_firings_valid: bool = False    # True when padded outputs
+
+    # ── Legacy dict-style accessors (read-only views) ───────────────
+    @property
+    def A_in(self) -> _PerRuleDictView:
+        return _PerRuleDictView(self, "A_in")
+
+    @property
+    def A_out(self) -> _PerRuleDictView:
+        return _PerRuleDictView(self, "A_out")
+
+    @property
+    def firings_valid(self) -> Optional[_PerRuleDictView]:
+        if not self._has_real_firings_valid:
+            return None
+        return _PerRuleDictView(self, "firings_valid")
+
+    @classmethod
+    def empty(
+        cls,
+        *,
+        num_rules: int = 0,
+        M_max: int = 0,
+        device: Optional[torch.device] = None,
+    ) -> "RuleGroundings":
+        """Build an empty (zero-firings) ``RuleGroundings``.
+
+        The returned object has an empty atom table, zero firings, and
+        a ``rule_offsets`` of length ``num_rules + 1`` filled with
+        zeros. Used as the default return for trees with no proofs.
+        """
+        if device is None:
+            device = torch.device("cpu")
+        return cls(
+            atom_table=torch.zeros(0, 3, dtype=torch.long, device=device),
+            body_pool_idx=torch.zeros(
+                0, max(M_max, 0), dtype=torch.long, device=device),
+            body_atom_valid=torch.zeros(
+                0, max(M_max, 0), dtype=torch.bool, device=device),
+            head_pool_idx=torch.zeros(0, dtype=torch.long, device=device),
+            rule_idx=torch.zeros(0, dtype=torch.long, device=device),
+            rule_offsets=torch.zeros(
+                max(num_rules, 0) + 1, dtype=torch.long, device=device),
+            firing_valid=torch.zeros(0, dtype=torch.bool, device=device),
+            num_atoms=0,
+            num_rules=int(max(num_rules, 0)),
+            M_max=int(max(M_max, 0)),
+        )
 
 
 @dataclass

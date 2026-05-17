@@ -61,9 +61,9 @@ class TestPopulateQueryPoolIdx:
         # Pool contains atom (2, 1, 3). Query at the same atom — should
         # land at slot 0 (the existing atom_table slot), not be appended.
         atom_table = torch.tensor([[2, 1, 3], [1, 1, 2]], dtype=torch.long)
-        rg = RuleGroundings(
-            atom_table=atom_table, A_in={}, A_out={},
-            num_atoms=2, num_rules=1)
+        rg = RuleGroundings.empty(num_rules=1)
+        rg.atom_table = atom_table
+        rg.num_atoms = 2
         queries = torch.tensor([[2, 1, 3]], dtype=torch.long)
         out = populate_query_pool_idx(rg, queries, padding_idx=PAD)
         assert out.atom_table.shape[0] == 2  # not extended
@@ -72,9 +72,9 @@ class TestPopulateQueryPoolIdx:
 
     def test_novel_query_extends_pool(self):
         atom_table = torch.tensor([[1, 1, 2]], dtype=torch.long)
-        rg = RuleGroundings(
-            atom_table=atom_table, A_in={}, A_out={},
-            num_atoms=1, num_rules=1)
+        rg = RuleGroundings.empty(num_rules=1)
+        rg.atom_table = atom_table
+        rg.num_atoms = 1
         queries = torch.tensor([[2, 5, 7]], dtype=torch.long)   # novel
         out = populate_query_pool_idx(rg, queries, padding_idx=PAD)
         assert out.atom_table.shape[0] == 2  # extended by 1
@@ -86,9 +86,9 @@ class TestPopulateQueryPoolIdx:
     def test_mixed_existing_and_novel_queries(self):
         atom_table = torch.tensor(
             [[1, 1, 2], [2, 3, 4]], dtype=torch.long)
-        rg = RuleGroundings(
-            atom_table=atom_table, A_in={}, A_out={},
-            num_atoms=2, num_rules=1)
+        rg = RuleGroundings.empty(num_rules=1)
+        rg.atom_table = atom_table
+        rg.num_atoms = 2
         queries = torch.tensor(
             [[2, 3, 4], [5, 7, 8], [1, 1, 2]], dtype=torch.long)
         out = populate_query_pool_idx(rg, queries, padding_idx=PAD)
@@ -100,9 +100,9 @@ class TestPopulateQueryPoolIdx:
 
     def test_duplicate_novel_queries_dedup_to_one_slot(self):
         atom_table = torch.tensor([[1, 1, 2]], dtype=torch.long)
-        rg = RuleGroundings(
-            atom_table=atom_table, A_in={}, A_out={},
-            num_atoms=1, num_rules=1)
+        rg = RuleGroundings.empty(num_rules=1)
+        rg.atom_table = atom_table
+        rg.num_atoms = 1
         queries = torch.tensor(
             [[5, 7, 8], [5, 7, 8]], dtype=torch.long)        # same atom twice
         out = populate_query_pool_idx(rg, queries, padding_idx=PAD)
@@ -112,10 +112,7 @@ class TestPopulateQueryPoolIdx:
         assert out.query_pool_idx[0].item() == out.query_pool_idx[1].item()
 
     def test_empty_pool_built_from_queries_only(self):
-        atom_table = torch.zeros(0, 3, dtype=torch.long)
-        rg = RuleGroundings(
-            atom_table=atom_table, A_in={}, A_out={},
-            num_atoms=0, num_rules=1)
+        rg = RuleGroundings.empty(num_rules=1)
         queries = torch.tensor([[2, 5, 7], [3, 8, 9]], dtype=torch.long)
         out = populate_query_pool_idx(rg, queries, padding_idx=PAD)
         # Pool now contains the padding sentinel + the unique queries.
@@ -124,9 +121,7 @@ class TestPopulateQueryPoolIdx:
         assert torch.equal(gathered, queries)
 
     def test_rejects_bad_query_shape(self):
-        rg = RuleGroundings(
-            atom_table=torch.zeros(0, 3, dtype=torch.long),
-            A_in={}, A_out={}, num_atoms=0, num_rules=1)
+        rg = RuleGroundings.empty(num_rules=1)
         with pytest.raises(ValueError, match=r"\[B, 3\]"):
             populate_query_pool_idx(
                 rg, torch.zeros(2, dtype=torch.long), padding_idx=PAD)
