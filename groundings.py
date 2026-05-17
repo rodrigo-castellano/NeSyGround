@@ -289,12 +289,22 @@ def evidence_to_rule_groundings(
 
     A_in: dict = {}
     A_out: dict = {}
-    for r in range(num_rules_):
-        sel = ridx == r
-        if not bool(sel.any()):
-            continue
-        A_in[r] = body_id[sel]                   # [G_r, M]
-        A_out[r] = head_id[sel].unsqueeze(-1)    # [G_r, 1]
+    # Compute per-rule firing presence in one shot — single host sync
+    # (``.tolist()``) instead of ``num_rules_`` ``bool(sel.any())``
+    # syncs. The per-rule ``body_id[sel]`` / ``head_id[sel]`` below
+    # still triggers one sync each (masked_select needs the runtime
+    # output size), but that's bounded by the number of *firing* rules
+    # rather than the total rule count.
+    if num_rules_ > 0:
+        rule_range = torch.arange(num_rules_, device=ridx.device)
+        sel_all = ridx.unsqueeze(0) == rule_range.unsqueeze(1)  # [R, N]
+        fired = sel_all.any(dim=1).tolist()                     # [R] Python
+        for r in range(num_rules_):
+            if not fired[r]:
+                continue
+            sel = sel_all[r]                                    # [N]
+            A_in[r] = body_id[sel]                              # [G_r, M]
+            A_out[r] = head_id[sel].unsqueeze(-1)               # [G_r, 1]
 
     return RuleGroundings(
         atom_table=repr_atoms,
