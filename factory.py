@@ -40,7 +40,7 @@ from grounder.bc.bc import BCGrounder
 # ======================================================================
 
 _PATTERN = re.compile(
-    r"^(?P<resolution>sld|rtf|enum)"
+    r"^(?P<resolution>sld|rtf|enum|closure)"
     r"(\.(?P<filter>fp_batch|fp_global|prune|provset|none))?"
     r"(?P<pd>\.pd)?"
     r"(\.full|\.w(?P<width>\d+))?"

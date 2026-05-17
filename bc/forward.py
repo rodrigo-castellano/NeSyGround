@@ -340,6 +340,9 @@ def forward_one_batch_inner(
     path needs captures to accumulate across all chunks. The public
     ``forward`` resets it once at the top.
     """
+    if grounder.resolution == "closure":
+        from grounder.resolution.closure import resolve_closure
+        return resolve_closure(grounder, queries, query_mask, **init_kwargs)
     states = init_states(grounder, queries, query_mask, **init_kwargs)
     for d in range(grounder.depth):
         states = step(grounder, states, d)
@@ -394,6 +397,9 @@ def forward_one_batch(
     the per-batch reset keeps semantics consistent between the
     single-batch and chunked entry paths.
     """
+    if grounder.resolution == "closure":
+        from grounder.resolution.closure import resolve_closure
+        return resolve_closure(grounder, queries, query_mask, **init_kwargs)
     states = init_states(grounder, queries, query_mask, **init_kwargs)
     for d in range(grounder.depth):
         states = step(grounder, states, d)

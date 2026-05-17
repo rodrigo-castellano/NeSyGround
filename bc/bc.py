@@ -114,7 +114,10 @@ class BCGrounder(nn.Module):
         # ``make_bcwd`` does this via its ``u`` parameter.
         # SLD/RTF have no parity story; default 'none'.
         if filter is None:
-            filter = "fp_batch" if resolution == "enum" else "none"
+            if resolution == "closure":
+                filter = "none"
+            else:
+                filter = "fp_batch" if resolution == "enum" else "none"
         self.filter_mode = filter
         # Compile mode is opt-in (default None = eager). The dense
         # ``enum`` path is the right pairing for ``'reduce-overhead'``
@@ -156,7 +159,9 @@ class BCGrounder(nn.Module):
         # the chunked path to leak ~100 MB / chunk on wn18rr (step_body /
         # step_head / step_ridx clones from every chunk's depth=1 step
         # piling up across all 293 chunks until ~24 GB OOM).
-        if resolution == "enum":
+        if resolution == "closure":
+            pass  # closure never touches enum-specific anchor variants
+        elif resolution == "enum":
             if not all_anchors:
                 all_anchors = True
         self._cartesian_product = cartesian_product

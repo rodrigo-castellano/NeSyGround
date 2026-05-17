@@ -34,6 +34,10 @@ def init_resolution(grounder, **kwargs) -> None:
       SLD/RTF: K (= K_f + K_r or K_f * K_r), K_f capping, vars_per_rule
       Enum: K_enum, G_use, K_per_fv, enum buffers
     """
+    if grounder.resolution == "closure":
+        from grounder.resolution.closure import init_closure
+        init_closure(grounder, **kwargs)
+        return
     if grounder.resolution in ("sld", "rtf"):
         from grounder.resolution.mgu import init_mgu
         cfg = init_mgu(
