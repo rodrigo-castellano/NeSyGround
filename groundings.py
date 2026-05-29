@@ -192,10 +192,18 @@ def evidence_unique_app_keys(
         row_hash = row_hash * P + body_sorted_h[:, m]
     uniq_h, inv = torch.unique(row_hash, return_inverse=True)
     n_uniq = uniq_h.size(0)
-    representatives = torch.empty(
-        n_uniq, keys.size(1), dtype=keys.dtype, device=keys.device)
-    representatives[inv] = keys
-    return representatives
+    # Deterministic representative: ``representatives[inv] = keys`` is a
+    # last-write-wins scatter whose CPU multi-thread write order races, so
+    # under hash collisions the surviving row varied run-to-run. Pick the
+    # highest-index row per group via scatter_reduce(amax) — deterministic
+    # and identical to the single-thread result. Count-neutral (n_uniq
+    # unchanged); only the collided-group representative is now stable.
+    n_rows = keys.size(0)
+    rep = torch.zeros(n_uniq, dtype=torch.long, device=keys.device)
+    rep.scatter_reduce_(
+        0, inv, torch.arange(n_rows, device=keys.device),
+        reduce="amax", include_self=False)
+    return keys[rep]
 
 
 def evidence_unique_app_count(
@@ -257,7 +265,16 @@ def evidence_to_rule_groundings(
     """
     keys = evidence_unique_app_keys(evidence, padding_idx)
     if keys.shape[0] == 0:
-        return RuleGroundings.empty(num_rules=int(num_rules or 0))
+        # Inherit device from the evidence so downstream consumers
+        # (e.g. SBR ``_rule_loop`` building ``firings`` from this rg)
+        # don't see a CPU/CUDA mismatch when no rule fires for any
+        # query — common when a closure-grounded batch contains only
+        # queries outside the FC closure.
+        return RuleGroundings.empty(
+            num_rules=int(num_rules or 0),
+            M_max=int(getattr(evidence, "M", 0) or 0),
+            device=keys.device,
+        )
 
     M = (keys.shape[1] - 4) // 3   # 1 ridx + 3 head + 3*M body
     N = keys.shape[0]
@@ -552,9 +569,16 @@ def populate_query_pool_idx(
     novel_atoms = queries[~in_pool_mask]
     novel_h = atom_hash(novel_atoms)
     novel_h_uniq, novel_inv = torch.unique(novel_h, return_inverse=True)
-    novel_repr = torch.zeros(
-        novel_h_uniq.shape[0], 3, dtype=torch.long, device=device)
-    novel_repr[novel_inv] = novel_atoms
+    # Deterministic representative (see _dedup-style fixes above): the
+    # ``novel_repr[novel_inv] = novel_atoms`` scatter races across CPU
+    # threads under hash collisions. amax picks the highest-index atom
+    # per group deterministically. Count-neutral.
+    _n_novel = novel_atoms.size(0)
+    _rep = torch.zeros(novel_h_uniq.shape[0], dtype=torch.long, device=device)
+    _rep.scatter_reduce_(
+        0, novel_inv, torch.arange(_n_novel, device=device),
+        reduce="amax", include_self=False)
+    novel_repr = novel_atoms[_rep]
     new_pool = torch.cat([pool, novel_repr], dim=0)
 
     # Final lookup: each query's index in new_pool, via sorted-hash

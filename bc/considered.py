@@ -158,9 +158,18 @@ def finalize(grounder) -> Optional[RuleGroundings]:
         row_hash = row_hash * P + body_h[:, m]
     uniq_row_h, inv_row = torch.unique(row_hash, return_inverse=True)
     n_uniq = uniq_row_h.size(0)
-    uniq = torch.empty(
-        n_uniq, combined.size(1), dtype=combined.dtype, device=combined.device)
-    uniq[inv_row] = combined
+    # Deterministic representative per hash group. ``uniq[inv_row] = combined``
+    # is a last-write-wins scatter: single-threaded the highest-index row per
+    # group wins, but the CPU multi-thread scatter races, so the surviving
+    # row (hence the grounding set) varied run-to-run once depth>=3 produced
+    # collisions. ``scatter_reduce(amax)`` over the row index picks the same
+    # highest-index representative deterministically, matching single-thread.
+    T_rows = combined.size(0)
+    rep_idx = torch.zeros(n_uniq, dtype=torch.long, device=combined.device)
+    rep_idx.scatter_reduce_(
+        0, inv_row, torch.arange(T_rows, device=combined.device),
+        reduce="amax", include_self=False)
+    uniq = combined[rep_idx]
     u_rule = uniq[:, 0].long()
     u_head = uniq[:, 1:4].long()
     u_body = uniq[:, 4:].reshape(-1, M, 3).long()
@@ -172,9 +181,14 @@ def finalize(grounder) -> Optional[RuleGroundings]:
     atom_h = atom_hash(all_atoms_flat)                            # [U*(M+1)]
     uniq_atom_h, inverse = torch.unique(atom_h, return_inverse=True)
     n_uniq_atom = uniq_atom_h.size(0)
-    atom_table = torch.empty(
-        n_uniq_atom, 3, dtype=all_atoms_flat.dtype, device=all_atoms_flat.device)
-    atom_table[inverse] = all_atoms_flat
+    # Same deterministic-representative fix as the row dedup above:
+    # ``atom_table[inverse] = all_atoms_flat`` races across CPU threads.
+    n_at = all_atoms_flat.size(0)
+    rep_at = torch.zeros(n_uniq_atom, dtype=torch.long, device=all_atoms_flat.device)
+    rep_at.scatter_reduce_(
+        0, inverse, torch.arange(n_at, device=all_atoms_flat.device),
+        reduce="amax", include_self=False)
+    atom_table = all_atoms_flat[rep_at]
     inverse = inverse.reshape(-1, M + 1)
     head_atom_idx = inverse[:, 0]
     body_atom_idx = inverse[:, 1:]
