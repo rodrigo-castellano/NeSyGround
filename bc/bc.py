@@ -103,6 +103,10 @@ class BCGrounder(nn.Module):
     ) -> None:
         super().__init__()
         self.kb = kb
+        # Expose num_rules on the grounder (consumers read it for buffer
+        # sizing; the torch-ns adapter previously fell back to 0 via
+        # ``getattr(grounder, 'num_rules', 0)`` because it was never set).
+        self.num_rules = kb.num_rules
 
         self.depth = depth
         self.width = width
@@ -241,6 +245,15 @@ class BCGrounder(nn.Module):
         if standardization is not None:
             from grounder.resolution.standardization import build_standardize_fn
             self._standardize_fn = build_standardize_fn(standardization, self.kb.device_)
+
+    @classmethod
+    def from_config(cls, kb: KB, config) -> "BCGrounder":
+        """Construct from a :class:`grounder.config.GrounderConfig`.
+
+        The clean construction entry point (Phase 2a). Behavior-neutral:
+        expands the config to the exact legacy constructor kwargs.
+        """
+        return cls(kb, **config.as_kwargs())
 
     @torch.no_grad()
     def forward(
