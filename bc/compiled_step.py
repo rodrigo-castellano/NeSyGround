@@ -43,12 +43,11 @@ def fn_step_for_depth(grounder, d: int):
     else:
         key = "init"
     if key not in grounder._fn_steps_by_depth:
-        import torch._dynamo as _dynamo
-        if getattr(_dynamo.config, "recompile_limit", 0) < 64:
-            _dynamo.config.recompile_limit = 64
-        grounder._fn_steps_by_depth[key] = torch.compile(
+        from grounder.bc.compile import Compiler
+        grounder._fn_steps_by_depth[key] = Compiler.wrap(
             lambda *args: step_impl(grounder, *args),
-            fullgraph=True, mode=grounder.compile_mode, dynamic=False,
+            mode=grounder.compile_mode, fullgraph=True, dynamic=False,
+            bump_recompile_limit=True,
         )
     return grounder._fn_steps_by_depth[key]
 

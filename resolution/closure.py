@@ -339,10 +339,10 @@ def resolve_closure(
         key = bool(include_open_var)
         fn = cache.get(key)
         if fn is None:
-            fn = torch.compile(
+            from grounder.bc.compile import Compiler
+            fn = Compiler.wrap(
                 _resolve_closure_tensors,
-                mode="reduce-overhead",
-                dynamic=False,
+                mode="reduce-overhead", fullgraph=False, dynamic=False,
             )
             cache[key] = fn
     else:

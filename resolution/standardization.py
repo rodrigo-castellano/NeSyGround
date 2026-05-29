@@ -293,5 +293,6 @@ def build_standardize_fn(
             f"Unknown standardization mode '{config.mode}'. Expected 'offset' or 'canonical'.")
 
     if device.type == "cuda":
-        _fn = torch.compile(_fn, mode=config.compile_mode, fullgraph=True)
+        from grounder.bc.compile import Compiler
+        _fn = Compiler.wrap(_fn, mode=config.compile_mode, fullgraph=True)
     return _fn

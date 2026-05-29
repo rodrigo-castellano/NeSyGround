@@ -123,7 +123,8 @@ def forward_chunked(
             # Compile the bound method so dynamo's per-instance
             # specialization keys on ``grounder`` identity (the same
             # behavior the pre-extraction bc.py path had).
-            grounder._compiled_inner = torch.compile(
+            from grounder.bc.compile import Compiler
+            grounder._compiled_inner = Compiler.wrap(
                 grounder._forward_one_batch_inner,
                 mode=grounder.compile_mode, fullgraph=True)
         inner_fn = grounder._compiled_inner
