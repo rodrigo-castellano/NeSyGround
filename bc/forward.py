@@ -25,7 +25,7 @@ from typing import List, Optional
 import torch
 from torch import Tensor
 
-from grounder.bc.state import init_states
+from grounder.bc.buffers import init_states
 from grounder.bc.step import step
 from grounder.bc.terminal import filter_terminal
 from grounder.types import (
