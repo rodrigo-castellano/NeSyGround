@@ -38,15 +38,28 @@ def reset_accumulator(grounder) -> None:
     grounder._considered_acc_rule: List[Tensor] = []
     grounder._considered_acc_head: List[Tensor] = []
     grounder._considered_acc_body: List[Tensor] = []
+    # Global query index per captured firing — used by the per-query
+    # tabling cache (task #47) to partition the accumulator rows by the
+    # query that produced them. ``b_idx`` is batch-local; adding
+    # ``grounder._chunk_query_offset`` makes it a global query index that
+    # is stable across chunks. Always maintained (cheap) so the cache can
+    # be toggled on without re-running a forward pass.
+    grounder._considered_acc_bidx: List[Tensor] = []
 
 
-def capture_step(grounder, resolved, states: Dict[str, Tensor]) -> None:
-    """Append (rule_idx, head, sorted_body) for each candidate child.
+def _extract_considered_rows(grounder, resolved, states: Dict[str, Tensor]):
+    """Pure extraction: ``(resolved, states) -> valid considered rows``.
 
-    Called between :func:`resolve` and :func:`pack` in :func:`step`.
-    Filters out rows with ``rule_idx < 0`` (no rule fired) or empty
-    body. Sorts body atoms by per-atom hash so anchor variants of
-    the same logical app share a key (= match keras-ns dedup).
+    Returns ``(rule_idx[V], head[V,3], body[V,M,3], b_idx[V])`` restricted
+    to the VALID candidate rows (a rule fired with a non-empty body), with
+    ``rule_idx`` already mapped through ``_variant_to_orig`` and ``head``
+    set to the selected-goal atom of each row's ``(b, s)``. ``b_idx`` is
+    the batch-local query index (NOT yet lifted by
+    ``_chunk_query_offset``).
+
+    This is the shared core of the considered accumulator: :func:`capture_step`
+    appends these rows directly, and the per-subgoal memo (task #48) keys /
+    replays them. Body atoms are in canonical RULE ORDER.
     """
     pad = grounder.kb.padding_idx
     M = grounder.kb.M
@@ -108,9 +121,39 @@ def capture_step(grounder, resolved, states: Dict[str, Tensor]) -> None:
     # tuples without needing a sort. (The earlier sort-by-hash here
     # collapsed firings keras-ns kept distinct on multi-rule programs
     # like countries_s3.)
-    grounder._considered_acc_rule.append(rule_idx[valid])
-    grounder._considered_acc_head.append(head[valid])
-    grounder._considered_acc_body.append(body[valid])
+    return (rule_idx[valid], head[valid], body[valid],
+            b_idx[valid].long())
+
+
+def capture_step(grounder, resolved, states: Dict[str, Tensor],
+                 d: Optional[int] = None) -> None:
+    """Append (rule_idx, head, body) for each valid candidate child.
+
+    Called between :func:`resolve` and :func:`pack` in :func:`step`.
+    Filters out rows with ``rule_idx < 0`` (no rule fired) or empty body.
+
+    When the per-subgoal memo (task #48) is active, the valid rows are
+    routed through :mod:`grounder.bc.subgoal` (memoize MISS-goal rows,
+    replay HIT-goal rows) before being appended; otherwise they are
+    appended directly. ``d`` is the current depth (needed to compute the
+    ``is_last`` component of the subgoal memo key).
+    """
+    r_rule, r_head, r_body, r_bidx = _extract_considered_rows(
+        grounder, resolved, states)
+
+    from grounder.bc import subgoal
+    if subgoal.subgoal_active(grounder):
+        subgoal.route_rows(grounder, r_rule, r_head, r_body, r_bidx, d)
+        return
+
+    grounder._considered_acc_rule.append(r_rule)
+    grounder._considered_acc_head.append(r_head)
+    grounder._considered_acc_body.append(r_body)
+    # Global query index per firing (for the per-query tabling cache).
+    # ``b_idx`` is batch-local; ``_chunk_query_offset`` lifts it to a
+    # global index stable across chunks.
+    grounder._considered_acc_bidx.append(
+        r_bidx + grounder._chunk_query_offset)
 
 
 def finalize(grounder) -> Optional[RuleGroundings]:

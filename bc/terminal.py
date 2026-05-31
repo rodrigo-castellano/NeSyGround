@@ -50,9 +50,15 @@ def filter_terminal(grounder, states: Dict[str, Tensor]):
 
     head = states.get("collected_head")  # [B, C, D, 3] or None
 
+    # Inner body dim is ``D * M``; compute it explicitly rather than via
+    # ``-1`` so the reshape is well-defined even when ``B == 0`` (the
+    # all-cache-hit case under the per-query tabling cache, where the
+    # depth loop runs on an empty miss subset).
+    G_body = body.shape[2] * body.shape[3]
+
     if grounder.filter_mode == "fp_batch":
         from grounder.filters.soundness.fp_batch import apply_fp_batch
-        body_flat = body.reshape(B, C, -1, 3)
+        body_flat = body.reshape(B, C, G_body, 3)
         # Use per-grounding heads if available (grounded collection mode)
         grounding_heads = None
         if head is not None:
@@ -64,7 +70,7 @@ def filter_terminal(grounder, states: Dict[str, Tensor]):
 
     elif grounder.filter_mode == "fp_global":
         from grounder.filters.soundness.fp_global import apply_fp_global
-        body_flat = body.reshape(B, C, -1, 3)
+        body_flat = body.reshape(B, C, G_body, 3)
         # NOTE: fp_global_hashes is built by run_forward_chaining with
         # E = num_entities (= constant_no + 1), so body atoms must be
         # hashed with that same base — NOT fact_index.pack_base, which

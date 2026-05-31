@@ -261,6 +261,7 @@ def resolve_enum_step(
     arg_source_dep: Optional[Tensor] = None,
     body_preds_dep: Optional[Tensor] = None,
     flat_intermediate: bool = False,
+    dedup_goals: bool = False,
 ) -> ResolvedChildren:
     """Adapter: resolve_enum output -> common 9-tensor format used by _pack.
 
@@ -368,6 +369,7 @@ def resolve_enum_step(
             V=V, fv_any_valid=fv_any_valid,
             arg_source_dep=arg_source_dep, body_preds_dep=body_preds_dep,
             collect_evidence=collect_evidence, w_last_depth=w_last_depth,
+            dedup_goals=dedup_goals,
         )
 
     # 2. Flatten [B, S, 3] -> [N, 3]
@@ -1282,6 +1284,35 @@ def _apply_enum_filters(
 # ═══════════════════════════════════════════════════════════════════════
 
 
+# Cache for constant ``torch.arange(n)`` tensors keyed by (n, device).
+# These index/compare-only constants (atom_idx, K_r, B aranges) recur on
+# every flat step but never depend on data, so caching them once removes a
+# fresh ``arange`` launch (kernel + the host-side dispatch) per use. Returned
+# tensors MUST be treated read-only — every call site only indexes, compares,
+# or broadcasts against them, never mutates in place. Only the eager FLAT
+# path calls this (compile gates to the dense path), but the ``is_compiling``
+# guard keeps a cached tensor from ever aliasing inside a CUDA graph.
+_ARANGE_CACHE: Dict[Tuple[int, str], Tensor] = {}
+
+
+def _arange_cached(n: int, device) -> Tensor:
+    """Return a cached ``torch.arange(n, device=device, dtype=long)`` view.
+
+    Read-only: callers must not mutate the result. ``n`` is a static
+    (rule-derived) dimension so the cache stays tiny and bounded. Materialised
+    fresh under ``torch.compile`` — a persistent cached tensor is not
+    CUDA-graph-safe (it aliases across graph replays).
+    """
+    if torch.compiler.is_compiling():
+        return torch.arange(n, device=device)
+    key = (int(n), str(device))
+    t = _ARANGE_CACHE.get(key)
+    if t is None:
+        t = torch.arange(n, device=device)
+        _ARANGE_CACHE[key] = t
+    return t
+
+
 def _cumcount_flat(keys: Tensor) -> Tensor:
     """Compute 0-based position within each group of equal keys.
 
@@ -1295,10 +1326,15 @@ def _cumcount_flat(keys: Tensor) -> Tensor:
     sort_perm = torch.argsort(keys, stable=True)
     sorted_keys = keys[sort_perm]
     running_idx = torch.arange(T, device=dev)
-    group_change = torch.ones(T, dtype=torch.bool, device=dev)
-    group_change[1:] = sorted_keys[1:] != sorted_keys[:-1]
-    group_starts = torch.where(group_change, running_idx,
-                               torch.zeros_like(running_idx))
+    # ``group_change[0]=True``, then ``sorted[i] != sorted[i-1]``. Built via
+    # cat (alloc + concat) instead of a full ones-alloc + indexed
+    # scatter-write. ``group_starts = running_idx`` where a group begins else
+    # 0 == ``running_idx * group_change`` (running_idx ≥ 0, change ∈ {0,1}),
+    # dropping the ``where`` + ``zeros_like`` alloc.
+    ne = sorted_keys[1:] != sorted_keys[:-1]
+    group_change = torch.cat(
+        [torch.ones(1, dtype=torch.bool, device=dev), ne], dim=0)
+    group_starts = running_idx * group_change
     group_starts, _ = group_starts.cummax(0)
     group_pos = running_idx - group_starts
     result = torch.zeros(T, dtype=torch.long, device=dev)
@@ -1319,12 +1355,23 @@ def _resolve_enum_step_flat(
     V: int, fv_any_valid: Optional[list],
     arg_source_dep: Optional[Tensor], body_preds_dep: Optional[Tensor],
     collect_evidence: bool, w_last_depth: int,
+    dedup_goals: bool = False,
 ) -> ResolvedChildren:
     """Flat intermediate path for resolve_enum_step.
 
     Enumerates ALL valid candidates (no G_r cap), fills body atoms,
     checks exists, filters — all on flat tensors. Then converts the
     surviving entries into dense [B, S, K_cap, G, 3] for pack_states.
+
+    ``dedup_goals`` (task #48 Phase-2, resolve-SKIP): when True, the
+    expensive survivor pipeline (enumerate → fill → exists → filter) runs
+    over the DISTINCT selected goals only, then each distinct goal's
+    survivors are scattered back to every active state sharing that goal.
+    The survivor set is a pure function of ``(goal_triple, is_last)`` +
+    fixed rule/fact buffers, so this is byte-identical (the per-state child
+    is reconstructed as survivors ⊕ that state's own remaining goals +
+    grounding_body). Skips the ~Nx redundancy when many states share a
+    goal (674x at d>=1 on countries_s3 BC13).
     """
     B, S, _ = queries.shape
     G = remaining.shape[2]
@@ -1358,18 +1405,35 @@ def _resolve_enum_step_flat(
     if N_eff == 0:
         G_body = grounding_body.shape[2]
         return _empty_flat_resolved(B, S, G, G_body, pad, dev)
-    flat_q = flat_q_full[active_pos]                       # [N_eff, 3]
+    flat_q_active = flat_q_full[active_pos]                 # [N_eff, 3]
+
+    # 1c. Resolve-SKIP (task #48 Phase-2): the survivor set is a pure
+    # function of the goal triple (+ is_last via width_d/head_pred_mask_d).
+    # Dedup the active goals so the expensive enumerate/fill/exists/filter
+    # pipeline runs ONCE per distinct goal; survivors are scattered back to
+    # every active state sharing that goal in step 8b. ``state_to_goal``
+    # maps each active row -> its distinct-goal index (used for expansion).
+    if dedup_goals:
+        distinct_goals, state_to_goal = torch.unique(
+            flat_q_active, dim=0, return_inverse=True)      # [D,3], [N_eff]
+        flat_q = distinct_goals                             # pipeline operates on goals
+    else:
+        state_to_goal = None
+        flat_q = flat_q_active
     qp, qs, qo = flat_q[:, 0], flat_q[:, 1], flat_q[:, 2]
+    N_goals = flat_q.size(0)   # == D (distinct) when dedup, else N_eff
 
     # 2. Rule clustering (same as dense path) — over compacted rows.
-    active_idx = pred_rule_indices[qp]                     # [N_eff, K_r]
+    active_idx = pred_rule_indices[qp]                     # [N_goals, K_r]
     K_r = active_idx.size(1)
     # All compacted rows are valid by construction, so the per-(state,K_r)
     # mask reduces to ``pred_rule_mask`` (which K_r slots correspond to
     # a real rule for the query's predicate).
     amask = pred_rule_mask[qp]                             # [N_eff, K_r]
     has_free_q = has_free[active_idx]
-    num_body_q = num_body_atoms[active_idx]                # [N_eff, K_r]
+    # (per-(state,K_r) ``num_body_atoms`` is not needed here — the flat path
+    # gathers ``nbody_flat`` per surviving candidate from ``rule_global_idx``
+    # below; the dense [N_eff, K_r] gather was dead.)
 
     # Gather per-free-var metadata
     fv_pred_q = fv_enum_pred[active_idx]
@@ -1377,9 +1441,12 @@ def _resolve_enum_step_flat(
     fv_dir_q = fv_enum_direction[active_idx]
     fv_valid_q = fv_enum_valid[active_idx]
 
-    # 3. Flat Cartesian enumeration (zero waste) over compacted rows
-    flat_source, flat_br_idx, flat_b_idx = _enumerate_cartesian_flat(
-        N_eff, K_r, qs, qo,
+    # 3. Flat Cartesian enumeration (zero waste) over compacted rows.
+    # Enumerate returns the row index (``n_eff`` per active state, or the
+    # distinct-goal index when ``dedup_goals``) and the K_r-position
+    # directly — no encode/decode round-trip needed here.
+    flat_source, flat_n_idx_eff, flat_r_idx = _enumerate_cartesian_flat(
+        N_goals, K_r, qs, qo,
         fv_pred_q, fv_bound_q, fv_dir_q, fv_valid_q,
         has_free_q, amask, fact_index,
         V=V,
@@ -1397,13 +1464,9 @@ def _resolve_enum_step_flat(
                else check_arg_source_a)
     dep_bpreds = (body_preds_dep if body_preds_dep is not None
                   else body_preds)
-
-    # Map flat_br_idx to (n_eff, r) for gathering rule metadata.
-    # ``n_eff`` indexes the compacted rows; convert back to the full
-    # [B*S] index via ``active_pos`` only at the boundary where
+    # ``flat_n_idx_eff`` indexes the compacted rows; it is converted back to
+    # the full [B*S] index via ``active_pos`` only at the boundary where
     # b_idx / s_idx for the dense state layout are needed.
-    flat_n_idx_eff = flat_br_idx // K_r  # [T] — compacted query index
-    flat_r_idx = flat_br_idx % K_r       # [T] — which K_r rule
 
     # Gather per-entry arg_source and body_preds
     # dep_src: [R_total, M, 2], active_idx: [N_eff, K_r] → per (n,r): active_idx[n,r]
@@ -1418,16 +1481,18 @@ def _resolve_enum_step_flat(
     # 6. Exists check
     flat_exists = fact_index.exists(flat_body.reshape(-1, 3)).reshape(T, M)
 
-    # Mask inactive body atoms with padding
-    atom_idx = torch.arange(M, device=dev).unsqueeze(0)
-    body_active = atom_idx < nbody_flat.unsqueeze(1)
+    # Mask inactive body atoms with padding. ``body_active`` is reused
+    # by ``_apply_filters_flat`` below (identical ``atom_idx < nbody``),
+    # so it's computed once here instead of twice.
+    atom_idx = _arange_cached(M, dev)  # [M], cached constant
+    body_active = atom_idx.unsqueeze(0) < nbody_flat.unsqueeze(1)
     flat_body = flat_body.masked_fill(~body_active.unsqueeze(-1), pad)
 
     # 7. Filters
     # Need queries [N_eff, 3] indexed by flat_n_idx_eff (compacted index).
     fmask = _apply_filters_flat(
         flat_body, flat_exists, flat_n_idx_eff, nbody_flat,
-        flat_q, width_d, head_pred_mask_d, M)
+        flat_q, width_d, head_pred_mask_d, M, body_active=body_active)
 
     # 8. Extract surviving entries
     surv_idx = torch.nonzero(fmask, as_tuple=False).squeeze(1)  # [T_surv]
@@ -1438,12 +1503,62 @@ def _resolve_enum_step_flat(
         return _empty_flat_resolved(B, S, G, G_body, pad, dev)
 
     surv_body = flat_body[surv_idx]                    # [T_surv, M, 3]
-    surv_n_idx_eff = flat_n_idx_eff[surv_idx]          # [T_surv] — compacted
+    surv_g_idx = flat_n_idx_eff[surv_idx]              # [T_surv] — row index
+    surv_rule_idx = rule_global_idx[surv_idx]          # [T_surv]
+
+    # 8b. Resolve-SKIP expansion: when ``dedup_goals``, each survivor was
+    # computed for a DISTINCT goal; replicate it to every active state
+    # sharing that goal. The per-state child = these (goal-determined)
+    # survivors ⊕ that state's own remaining goals + grounding_body
+    # (attached in steps 9+). Build the join by sorting survivors and
+    # states by goal and gathering via offsets (vectorised, no python loop).
+    if dedup_goals:
+        # states grouped by goal: st_cnt[g] = #active states with goal g.
+        # survivors grouped by goal: sv_cnt[g] = #survivors for goal g.
+        D = N_goals
+        # active-state compacted indices grouped by their goal:
+        st_order = torch.argsort(state_to_goal, stable=True)     # [N_eff]
+        st_cnt = torch.bincount(state_to_goal, minlength=D)      # [D]
+        st_off = torch.zeros(D + 1, dtype=torch.long, device=dev)
+        st_off[1:] = torch.cumsum(st_cnt, 0)
+        # survivors grouped by goal:
+        sv_order = torch.argsort(surv_g_idx, stable=True)        # [T_surv]
+        sv_cnt = torch.bincount(surv_g_idx, minlength=D)         # [D]
+        sv_off = torch.zeros(D + 1, dtype=torch.long, device=dev)
+        sv_off[1:] = torch.cumsum(sv_cnt, 0)
+        # For each (survivor j of goal g, state k of goal g) emit one row.
+        # Total expanded rows = sum_g sv_cnt[g]*st_cnt[g]. Build index lists.
+        per_goal_total = sv_cnt * st_cnt                         # [D]
+        E_tot = int(per_goal_total.sum().item())
+        if E_tot == 0:
+            G_body = grounding_body.shape[2]
+            return _empty_flat_resolved(B, S, G, G_body, pad, dev)
+        # position within the flattened expansion -> (goal, sv_local, st_local)
+        e_goal = torch.repeat_interleave(
+            torch.arange(D, device=dev), per_goal_total)         # [E_tot]
+        e_within = (torch.arange(E_tot, device=dev)
+                    - torch.repeat_interleave(
+                        torch.cumsum(per_goal_total, 0) - per_goal_total,
+                        per_goal_total))                          # [E_tot] 0..(sv*st-1)
+        g_st_cnt = st_cnt[e_goal]                                 # [E_tot]
+        sv_local = e_within // g_st_cnt                           # which survivor
+        st_local = e_within % g_st_cnt                            # which state
+        # gather the survivor row (in sv_order space) and state (in st_order):
+        sv_pos = sv_off[e_goal] + sv_local                        # idx into sv_order
+        st_pos = st_off[e_goal] + st_local                        # idx into st_order
+        sv_rows = sv_order[sv_pos]                                # [E_tot] -> survivor row
+        st_rows_eff = st_order[st_pos]                            # [E_tot] -> active-state compacted idx
+        surv_body = surv_body[sv_rows]
+        surv_rule_idx = surv_rule_idx[sv_rows]
+        surv_n_idx_eff = st_rows_eff
+    else:
+        surv_n_idx_eff = surv_g_idx
+    # After (optional) expansion the row count is E_tot; rebind T_surv so
+    # steps 9+ allocate the right shapes on either path.
+    T_surv = surv_body.size(0)
     # Map compacted index back to full [B*S] index for the dense
     # b/s decomposition expected by the downstream pack.
-    surv_n_idx = active_pos[surv_n_idx_eff]            # [T_surv]
-    surv_rule_idx = rule_global_idx[surv_idx]          # [T_surv]
-    surv_r_local = flat_r_idx[surv_idx]                # [T_surv] — K_r position
+    surv_n_idx = active_pos[surv_n_idx_eff]            # [T_surv (or E_tot)]
 
     # Body atoms are already in canonical order via ``arg_source_dep`` /
     # ``body_preds_dep`` (which the ``_PatternVariant`` _orig_body_patterns
@@ -1467,12 +1582,15 @@ def _resolve_enum_step_flat(
         rem = remaining[surv_b_idx, surv_s_idx, 1:1 + n_rem, :]  # [T_surv, n_rem, 3]
         flat_goals[:, M:M + n_rem, :] = rem
 
-    # Grounding body (parent's, for evidence tracking)
+    # Grounding body field (shape [T_surv, G_body, 3]). The downstream
+    # ``pack_states_flat`` rebuilds out_gbody from ``flat_goals[:M_rule]`` and
+    # never reads this field, and no other consumer touches it — so the
+    # expensive ``grounding_body[surv_b_idx, surv_s_idx]`` parent gather it
+    # used to hold (under collect_evidence) was dead. A same-shape zeros
+    # placeholder keeps the FlatResolvedChildren contract byte-identically
+    # for the grounding output while dropping that gather from the hot path.
     G_body = grounding_body.shape[2]
-    if collect_evidence:
-        flat_gbody = grounding_body[surv_b_idx, surv_s_idx]  # [T_surv, G_body, 3]
-    else:
-        flat_gbody = torch.zeros(T_surv, G_body, 3, dtype=torch.long, device=dev)
+    flat_gbody = torch.zeros(T_surv, G_body, 3, dtype=torch.long, device=dev)
 
     flat_subs = torch.full(
         (T_surv, 2, 2), pad, dtype=torch.long, device=dev)
@@ -1528,9 +1646,9 @@ def _enumerate_cartesian_flat(
     Returns:
         flat_source: [total_valid, 2 + V]
             Each row: [qs, qo, fv0_cand, fv1_cand, ...]
-        flat_query_idx: [total_valid]
-            Which flattened (b, r) pair each entry belongs to (0..B*K_r-1).
-        flat_rule_idx: [total_valid]
+        b_idx: [total_valid]
+            Compacted query index (0..B-1) each entry belongs to.
+        r_idx: [total_valid]
             Which K_r-position (rule) each entry belongs to (into active_idx).
     """
     dev = query_subjs.device
@@ -1598,11 +1716,16 @@ def _enumerate_cartesian_flat(
         # No dedup in flat path — keep all entries including duplicates.
         # The flat→dense conversion handles dedup via the K_cap topk.
 
-    # Combined mask: valid if all RELEVANT free vars have valid candidates
-    combined_mask = torch.ones(B, K_r, G_current, dtype=torch.bool, device=dev)
+    # Combined mask: valid if all RELEVANT free vars have valid candidates.
+    # Seed from the first free-var term instead of a ``torch.ones`` alloc +
+    # redundant leading ``&`` (``ones & X == X``); fold the remaining terms in.
+    combined_mask: Optional[Tensor] = None
     for fv_idx in range(V):
         fv_relevant = fv_valid_q[:, :, fv_idx].unsqueeze(2)
-        combined_mask = combined_mask & (all_masks[fv_idx] | ~fv_relevant)
+        term = all_masks[fv_idx] | ~fv_relevant
+        combined_mask = term if combined_mask is None else combined_mask & term
+    if combined_mask is None:
+        combined_mask = torch.ones(B, K_r, G_current, dtype=torch.bool, device=dev)
 
     combined_mask = combined_mask & has_free_q.unsqueeze(2)
     combined_mask[:, :, 0] = combined_mask[:, :, 0] | (~has_free_q & active_mask)
@@ -1632,10 +1755,11 @@ def _enumerate_cartesian_flat(
         flat_parts.append(c[b_idx, r_idx, g_idx])
     flat_source = torch.stack(flat_parts, dim=1)  # [total_valid, 2+Fv]
 
-    # flat_query_idx: which (b, r) pair — used for query exclusion and scatter
-    flat_br_idx = b_idx * K_r + r_idx  # [total_valid] in 0..B*K_r-1
-
-    return flat_source, flat_br_idx, b_idx
+    # Return the compacted-query index (``b_idx``) and the K_r-position
+    # (``r_idx``) directly. The caller previously recombined them into
+    # ``b_idx * K_r + r_idx`` only to split them back out with ``// K_r`` /
+    # ``% K_r`` — returning both avoids the encode + two decodes per step.
+    return flat_source, b_idx, r_idx
 
 
 def _fill_body_flat(
@@ -1674,16 +1798,23 @@ def _apply_filters_flat(
     width: Optional[int],
     head_pred_mask: Optional[Tensor],   # [P] bool, None to skip head-pred prune
     M: int,
+    body_active: Optional[Tensor] = None,  # [total_valid, M] precomputed
 ) -> Tensor:
     """Apply width filtering, query exclusion, head pred pruning on flat body.
 
     Returns: [total_valid] bool mask of surviving entries.
+
+    ``body_active`` (``atom_idx < flat_num_body``) is recomputed here only
+    when the caller did not already build it. The flat resolve path builds
+    the identical mask to pad inactive body atoms and passes it through,
+    eliminating a redundant arange + broadcast-compare per step.
     """
     T = flat_body.size(0)
     dev = flat_body.device
 
-    atom_idx = torch.arange(M, device=dev).unsqueeze(0)  # [1, M]
-    body_active = atom_idx < flat_num_body.unsqueeze(1)   # [T, M]
+    if body_active is None:
+        atom_idx = _arange_cached(M, dev).unsqueeze(0)  # [1, M]
+        body_active = atom_idx < flat_num_body.unsqueeze(1)   # [T, M]
 
     # Width filtering
     if width is None:

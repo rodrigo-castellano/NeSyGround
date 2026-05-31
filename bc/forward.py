@@ -59,6 +59,17 @@ def forward(
     if grounder._collect_rule_groundings:
         from grounder.bc.considered import reset_accumulator
         reset_accumulator(grounder)
+    # Per-query tabling cache (task #47): reset the per-call query-index
+    # offset + hit counter. The offset reconciles the considered
+    # accumulator's batch-local ``b_idx`` with the ``miss_positions`` map
+    # in the write-back; it is 0 for the single-batch path and reset per
+    # chunk (see ``forward_chunked``).
+    grounder._chunk_query_offset = 0
+    grounder._tabling_last_hits = 0
+    grounder._tabling_last_misses = 0
+    # Per-subgoal memo (task #48) per-call stats.
+    grounder._subgoal_last_hits = 0
+    grounder._subgoal_last_misses = 0
     N = queries.size(0)
     if grounder._uses_outer_compile:
         if batch_size is None or batch_size <= 0:
@@ -134,6 +145,13 @@ def forward_chunked(
     chunk_outputs: List[GrounderOutput] = []
     chunk_sizes: List[int] = []
     for start in range(0, N, batch_size):
+        # Tabling: each chunk's ``split_queries`` sees chunk-local queries,
+        # so ``miss_positions`` are chunk-local (0..n_real) and the
+        # considered ``b_idx`` are chunk-local too — keep the offset 0 per
+        # chunk so the write-back's ``miss_local = b_idx - offset`` map is
+        # self-consistent within the chunk. (The atom_hash cache KEYS are
+        # global per atom, so cross-chunk caching / hits work regardless.)
+        grounder._chunk_query_offset = 0
         end = min(start + batch_size, N)
         q = queries[start:end]
         m = query_mask[start:end]
@@ -347,11 +365,33 @@ def forward_one_batch_inner(
     NOTE: does NOT reset the considered accumulator — the chunked
     path needs captures to accumulate across all chunks. The public
     ``forward`` resets it once at the top.
+
+    When ``grounder._tabling_enabled`` is True, runs the depth loop over
+    cache-MISS queries only and replays cache HITs into the considered
+    accumulator (per-chunk, suffix-scoped). See :mod:`grounder.bc.tabling`.
     """
     if grounder.resolution == "closure":
         from grounder.resolution.closure import resolve_closure
         return resolve_closure(grounder, queries, query_mask, **init_kwargs)
-    states = init_states(grounder, queries, query_mask, **init_kwargs)
+
+    from grounder.bc import tabling
+    use_tabling = tabling.tabling_active(grounder)
+    if use_tabling:
+        marker = tabling.accumulator_marker(grounder)
+        (loop_queries, loop_mask, keys,
+         miss_positions, hit_positions, hit_keys) = tabling.split_queries(
+            grounder, queries, query_mask)
+        n_active_miss = int(query_mask.index_select(
+            0, torch.tensor(miss_positions, device=query_mask.device,
+                            dtype=torch.long)).sum().item()) if miss_positions else 0
+        grounder._tabling_last_hits = (
+            getattr(grounder, "_tabling_last_hits", 0) + len(hit_positions))
+        grounder._tabling_last_misses = (
+            getattr(grounder, "_tabling_last_misses", 0) + n_active_miss)
+    else:
+        loop_queries, loop_mask = queries, query_mask
+
+    states = init_states(grounder, loop_queries, loop_mask, **init_kwargs)
     for d in range(grounder.depth):
         states = step(grounder, states, d)
         if grounder.step_hook is not None:
@@ -361,6 +401,12 @@ def forward_one_batch_inner(
             states["collected_body"] = cb
             states["collected_mask"] = cm
             states["collected_ridx"] = cr
+
+    if use_tabling:
+        tabling.writeback_and_replay(
+            grounder, queries, keys,
+            miss_positions, hit_positions, hit_keys, marker=marker)
+
     evidence = filter_terminal(grounder, states)
     if isinstance(evidence, dict):
         if grounder.collect_evidence:
@@ -404,11 +450,31 @@ def forward_one_batch(
     ``forward`` already does that at the top of the call. Skipping
     the per-batch reset keeps semantics consistent between the
     single-batch and chunked entry paths.
+
+    When ``grounder._tabling_enabled`` is True, the per-query grounding
+    cache (task #47) runs the depth loop over cache-MISS queries only;
+    cache HITs replay their stored RAW considered firings. See
+    :mod:`grounder.bc.tabling`.
     """
     if grounder.resolution == "closure":
         from grounder.resolution.closure import resolve_closure
         return resolve_closure(grounder, queries, query_mask, **init_kwargs)
-    states = init_states(grounder, queries, query_mask, **init_kwargs)
+
+    from grounder.bc import tabling
+    use_tabling = tabling.tabling_active(grounder)
+    if use_tabling:
+        (loop_queries, loop_mask, keys,
+         miss_positions, hit_positions, hit_keys) = tabling.split_queries(
+            grounder, queries, query_mask)
+        grounder._tabling_last_hits = len(hit_positions)
+        n_active_miss = int(query_mask.index_select(
+            0, torch.tensor(miss_positions, device=query_mask.device,
+                            dtype=torch.long)).sum().item()) if miss_positions else 0
+        grounder._tabling_last_misses = n_active_miss
+    else:
+        loop_queries, loop_mask = queries, query_mask
+
+    states = init_states(grounder, loop_queries, loop_mask, **init_kwargs)
     for d in range(grounder.depth):
         states = step(grounder, states, d)
         if grounder.step_hook is not None:
@@ -418,6 +484,15 @@ def forward_one_batch(
             states["collected_body"] = cb
             states["collected_mask"] = cm
             states["collected_ridx"] = cr
+
+    # Tabling write-back (store MISS firings) + replay (append HIT firings),
+    # BEFORE the considered finalize so the accumulator's bidx are ORIGINAL
+    # query indices and finalize/prune run over the full reconstituted set.
+    if use_tabling:
+        tabling.writeback_and_replay(
+            grounder, queries, keys,
+            miss_positions, hit_positions, hit_keys)
+
     evidence = filter_terminal(grounder, states)
     if isinstance(evidence, dict):
         if grounder.collect_evidence:

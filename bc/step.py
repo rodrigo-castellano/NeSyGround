@@ -95,7 +95,7 @@ def step(
     if (grounder._collect_rule_groundings
             and not torch.compiler.is_compiling()):
         from grounder.bc.considered import capture_step
-        capture_step(grounder, resolved, states)
+        capture_step(grounder, resolved, states, d)
 
     states, sync = pack(grounder, resolved, states)
     states = postprocess(grounder, states, sync, d)
@@ -205,6 +205,7 @@ def resolve(
             arg_source_dep=getattr(grounder, "arg_source_dep", None),
             body_preds_dep=getattr(grounder, "body_preds_dep", None),
             flat_intermediate=getattr(grounder, "_flat_intermediate", False),
+            dedup_goals=getattr(grounder, "_resolve_skip_enabled", False),
         )
 
 
@@ -265,7 +266,13 @@ def pack(
             M_rule=grounder.kb.M,
             dedup=grounder._pack_dedup,
         )
+        # The flat resolve emits all-padding substitutions (``flat_subs`` is
+        # ``torch.full(..., pad)`` in every branch), so ``winning_subs`` is
+        # guaranteed all-pad. ``apply_substitutions`` is then the identity,
+        # letting ``sync_accumulated`` skip 3 no-op substitution passes.
+        grounder._winning_subs_noop = True
     else:
+        grounder._winning_subs_noop = False
         packed = pack_states(
             *resolved,
             states["top_ridx"], states["grounding_body"],
@@ -324,6 +331,12 @@ def sync_accumulated(
     pad = grounder.kb.padding_idx
     dev = parent_map.device
 
+    # The flat resolve always emits all-pad ``winning_subs`` (set in
+    # ``pack``), making ``apply_substitutions`` the identity. Skipping the
+    # three substitution passes below is byte-identical for that path and
+    # removes ~30 no-op tensor dispatches per step on the eager hot path.
+    subs_noop = getattr(grounder, "_winning_subs_noop", False)
+
     # a. Gather accumulated_body [B, S_out, D, M, 3] from parents
     pi = parent_map[:, :, None, None, None].expand(-1, -1, D_dim, M_acc, 3)
     acc = states["accumulated_body"].gather(1, pi)
@@ -336,10 +349,13 @@ def sync_accumulated(
     bc = states["body_count"].gather(1, rpi)
 
     # d. Apply substitutions to entire accumulated body
-    acc_flat = acc.reshape(B * S_out, D_dim * M_acc, 3)
-    subs_flat = winning_subs.reshape(B * S_out, 2, 2)
-    acc_flat = apply_substitutions(acc_flat, subs_flat, pad)
-    acc = acc_flat.reshape(B, S_out, D_dim, M_acc, 3)
+    if subs_noop:
+        subs_flat = winning_subs.reshape(B * S_out, 2, 2)
+    else:
+        acc_flat = acc.reshape(B * S_out, D_dim * M_acc, 3)
+        subs_flat = winning_subs.reshape(B * S_out, 2, 2)
+        acc_flat = apply_substitutions(acc_flat, subs_flat, pad)
+        acc = acc_flat.reshape(B, S_out, D_dim, M_acc, 3)
 
     # e. Write new body atoms at depth slot d
     new_atoms = states["grounding_body"]  # [B, S_out, M_work, 3]
@@ -406,16 +422,18 @@ def sync_accumulated(
     # h. Gather and write head_per_depth at depth d
     hpi = parent_map[:, :, None, None].expand(-1, -1, D_dim, 3)
     head = states["head_per_depth"].gather(1, hpi)
-    head_flat = head.reshape(B * S_out, D_dim, 3)
-    head_flat = apply_substitutions(head_flat, subs_flat, pad)
-    head = head_flat.reshape(B, S_out, D_dim, 3)
+    if not subs_noop:
+        head_flat = head.reshape(B * S_out, D_dim, 3)
+        head_flat = apply_substitutions(head_flat, subs_flat, pad)
+        head = head_flat.reshape(B, S_out, D_dim, 3)
     if "_selected_goal" in states:
         sel = states["_selected_goal"]  # [B, S_in, 3]
         sel_parent = sel.gather(
             1, parent_map.unsqueeze(-1).expand(-1, -1, 3))
-        sel_flat = sel_parent.reshape(B * S_out, 1, 3)
-        sel_flat = apply_substitutions(sel_flat, subs_flat, pad)
-        sel_parent = sel_flat.reshape(B, S_out, 3)
+        if not subs_noop:
+            sel_flat = sel_parent.reshape(B * S_out, 1, 3)
+            sel_flat = apply_substitutions(sel_flat, subs_flat, pad)
+            sel_parent = sel_flat.reshape(B, S_out, 3)
         if isinstance(d, torch.Tensor):
             d_arange_h = torch.arange(D_dim, device=dev)
             is_slot_h = (d_arange_h == d).view(1, 1, D_dim, 1)

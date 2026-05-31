@@ -17,6 +17,37 @@ from grounder.types import PackedStates
 from grounder.filters.search.prune_facts import prune_ground_facts
 
 
+# Cache for the constant polynomial-hash power vectors ``P ** arange(n,-1,-1)``.
+# The hash bases (P4/P5) and the slot count ``n`` (G / M / D / G_body) are all
+# static per grounder, so the power vector recurs identically on every pack /
+# dedup call. Caching it removes a fresh ``arange`` + ``pow`` (two kernel
+# launches) per use on the eager hot path. Read-only — never mutated in place.
+#
+# Used ONLY in eager mode (see ``_pow_desc``): ``_dedup_groundings`` runs
+# inside ``collect_groundings_step`` which is part of the compiled ``step``
+# unit, and a persistent cached tensor captured inside a CUDA graph aliases
+# across replays ("accessing tensor output of CUDAGraphs that has been
+# overwritten"). Under compile the power vector is materialised fresh in-graph.
+_POW_CACHE: Dict[Tuple[int, int, str], Tensor] = {}
+
+
+def _pow_desc(base: int, n: int, device) -> Tensor:
+    """Return ``base ** torch.arange(n - 1, -1, -1, device)`` (read-only).
+
+    Eager: served from ``_POW_CACHE`` (one fewer arange+pow per call on the
+    hot path). Compiling: materialised fresh — a persistent cached tensor is
+    not CUDA-graph-safe (it aliases across graph replays).
+    """
+    if torch.compiler.is_compiling():
+        return base ** torch.arange(n - 1, -1, -1, device=device)
+    key = (int(base), int(n), str(device))
+    t = _POW_CACHE.get(key)
+    if t is None:
+        t = base ** torch.arange(n - 1, -1, -1, device=device)
+        _POW_CACHE[key] = t
+    return t
+
+
 # ---------------------------------------------------------------------------
 # Packing and compaction (from packing.py)
 # ---------------------------------------------------------------------------
@@ -328,11 +359,11 @@ def pack_states_flat(
     dev = flat_resolved.flat_goals.device
 
     flat_goals = flat_resolved.flat_goals       # [T, G, 3]
-    flat_gbody = flat_resolved.flat_gbody       # [T, A, 3]
     flat_ridx = flat_resolved.flat_rule_idx     # [T]
     flat_b = flat_resolved.flat_b_idx           # [T]
     flat_s = flat_resolved.flat_s_idx           # [T]
-    flat_subs = flat_resolved.flat_subs         # [T, 2, 2]
+    # ``flat_resolved.flat_gbody`` / ``.flat_subs`` are intentionally unused:
+    # out_gbody is rebuilt from flat_goals[:M_rule] and out_subs stays all-pad.
     T = flat_goals.size(0)
     G = flat_goals.size(1)
     M_work = grounding_body.shape[2]
@@ -374,28 +405,36 @@ def pack_states_flat(
             atom_h = torch.cat([body_h, atom_h[:, M_rule:]], dim=-1)
         elif M_rule > 0 and G > 0:
             atom_h, _ = atom_h.sort(dim=-1)
-        powers = P4 ** torch.arange(G - 1, -1, -1, device=dev)
+        powers = _pow_desc(P4, G, dev)
         goal_hash = (atom_h * powers).sum(dim=-1)          # [T]
         compound = flat_b.long() * P1 + goal_hash
         sorted_c, sort_idx = compound.sort()
-        is_dup = torch.zeros(T, dtype=torch.bool, device=dev)
-        is_dup[1:] = sorted_c[1:] == sorted_c[:-1]
+        # ``is_dup[i] = sorted_c[i] == sorted_c[i-1]`` with is_dup[0]=False.
+        # Built via cat (one alloc + concat) instead of zeros + indexed
+        # scatter-write, which dispatched two kernels for the same result.
+        eq = sorted_c[1:] == sorted_c[:-1]                 # [T-1]
+        is_dup = torch.cat(
+            [eq.new_zeros(1), eq], dim=0)                  # [T]
         is_dup_orig = is_dup[sort_idx.argsort()]
         keep = ~is_dup_orig
 
+        # ``flat_gbody`` / ``flat_subs`` are never read after dedup (out_gbody
+        # is rebuilt from flat_goals[:M_rule]; out_subs stays all-pad), so
+        # their boolean-mask gathers are dropped — pure dead work.
         flat_goals = flat_goals[keep]
-        flat_gbody = flat_gbody[keep]
         flat_ridx = flat_ridx[keep]
         flat_b = flat_b[keep]
         flat_s = flat_s[keep]
-        flat_subs = flat_subs[keep]
         T = flat_goals.size(0)
 
     # ── Dynamic S_out: max unique children per batch element ──
     from grounder.resolution.enum import _cumcount_flat
-    counts = torch.zeros(B, dtype=torch.long, device=dev)
+    # ``bincount`` is a single kernel and gives the identical per-batch
+    # counts as the previous zeros + ones + scatter_add_ trio.
     if T > 0:
-        counts.scatter_add_(0, flat_b, torch.ones(T, dtype=torch.long, device=dev))
+        counts = torch.bincount(flat_b, minlength=B)
+    else:
+        counts = torch.zeros(B, dtype=torch.long, device=dev)
     S_out = max(int(counts.max().item()), 1)  # one .item() graph break
 
     # Per-batch cumcount: assign each child a sequential position
@@ -426,12 +465,16 @@ def pack_states_flat(
                 new_body, (0, 0, 0, M_work - M_rule), value=pad)
         out_gbody[flat_b, pos] = new_body
 
-        parent_ridx = top_ridx[flat_b, flat_s]
-        first = (parent_ridx == -1)
-        out_ridx[flat_b, pos] = torch.where(first, flat_ridx, flat_ridx)
+        # ``torch.where(first, flat_ridx, flat_ridx)`` is the identity on
+        # ``flat_ridx`` regardless of ``first``, so the parent-ridx gather +
+        # eq + where (3 dead kernels) are dropped — the result is unchanged.
+        out_ridx[flat_b, pos] = flat_ridx
         out_bcount[flat_b, pos] = body_count[flat_b, flat_s]
         out_parents[flat_b, pos] = flat_s
-        out_subs[flat_b, pos] = flat_subs
+        # ``out_subs`` stays all-pad: ``flat_subs`` is all-padding in the flat
+        # path and ``out_subs`` is already initialised to pad, so the old
+        # ``out_subs[flat_b, pos] = flat_subs`` scatter wrote pad over pad — a
+        # byte-identical no-op and is dropped.
         out_has_new[flat_b, pos] = True
         out_cur_ridx[flat_b, pos] = flat_ridx  # current depth's rule index
 
@@ -599,12 +642,12 @@ def _dedup_groundings(
         M = G_body // D
         # Sort atom hashes within each depth's M slot → canonical order.
         ah_sorted, _ = atom_hashes.view(B, N, D, M).sort(dim=-1)
-        m_powers = P4 ** torch.arange(M - 1, -1, -1, device=dev)
+        m_powers = _pow_desc(P4, M, dev)
         per_depth_hash = (ah_sorted * m_powers).sum(dim=-1)   # [B, N, D]
-        d_powers = P5 ** torch.arange(D - 1, -1, -1, device=dev)
+        d_powers = _pow_desc(P5, D, dev)
         body_hash = (per_depth_hash * d_powers).sum(dim=-1)   # [B, N]
     else:
-        powers = P4 ** torch.arange(G_body - 1, -1, -1, device=dev)
+        powers = _pow_desc(P4, G_body, dev)
         body_hash = (atom_hashes * powers).sum(dim=-1)        # [B, N]
 
     # Remap variant rule indices to originals so anchor variants collapse.
@@ -621,7 +664,7 @@ def _dedup_groundings(
     # Rule index hash: include all D dimensions if structured.
     if ridx.dim() == 3:
         D = ridx.shape[2]
-        r_powers = P4 ** torch.arange(D - 1, -1, -1, device=dev)
+        r_powers = _pow_desc(P4, D, dev)
         ridx_hash = (ridx_eff * r_powers).sum(dim=-1)         # [B, N]
     else:
         ridx_hash = ridx_eff                                  # [B, N]

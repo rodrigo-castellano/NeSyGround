@@ -487,6 +487,14 @@ class BlockSparseFactIndex(InvertedFactIndex):
 
         self._use_dense = True
         self._K = K
+        # Constant ``arange(K)`` reused by enumerate/exists every step — cached
+        # once so the eager flat hot path doesn't re-dispatch an arange per
+        # call. Read-only; only compared/broadcast against, never mutated.
+        # Used ONLY in eager mode (see ``_k_arange_for``): a persistent tensor
+        # captured inside a CUDA graph aliases across replays and trips
+        # "accessing tensor output of CUDAGraphs that has been overwritten",
+        # so the compiled/dense step path always allocates a fresh arange.
+        self._k_arange = torch.arange(K, device=device)
 
         def _fill_blocks(
             group_a: Tensor, group_b: Tensor, values: Tensor,
@@ -552,6 +560,18 @@ class BlockSparseFactIndex(InvertedFactIndex):
     def max_fact_pairs(self) -> int:
         return self._K if self._use_dense else self._max_facts_per_query
 
+    def _k_arange_for(self, device) -> Tensor:
+        """Return the constant ``arange(K)`` for enumerate/exists.
+
+        Eager: the cached ``self._k_arange`` (one fewer kernel per call on
+        the hot path). Compiling: a fresh ``torch.arange`` — a persistent
+        cached tensor is not CUDA-graph-safe (it aliases across graph
+        replays), so the compiled path must materialise it inside the graph.
+        """
+        if torch.compiler.is_compiling():
+            return torch.arange(self._K, device=device)
+        return self._k_arange
+
     def enumerate(self, preds, bound_args, direction):
         if not self._use_dense:
             return super().enumerate(preds, bound_args, direction)
@@ -573,7 +593,7 @@ class BlockSparseFactIndex(InvertedFactIndex):
             self._ps_counts[sp, sa],
             self._po_counts[sp, sa])
         counts = torch.where(valid_input, counts, torch.zeros_like(counts))
-        valid = torch.arange(K, device=preds.device).unsqueeze(0) < counts.unsqueeze(1)
+        valid = self._k_arange_for(preds.device).unsqueeze(0) < counts.unsqueeze(1)
         return cands, valid
 
     def exists(self, atoms: Tensor) -> Tensor:
@@ -624,7 +644,7 @@ class BlockSparseFactIndex(InvertedFactIndex):
         in_range = (preds < P) & (subjs < E)
         block = self._ps_blocks[preds.clamp(max=P - 1), subjs.clamp(max=E - 1)]
         counts = self._ps_counts[preds.clamp(max=P - 1), subjs.clamp(max=E - 1)]
-        pos = torch.arange(K, device=atoms.device).unsqueeze(0)
+        pos = self._k_arange_for(atoms.device).unsqueeze(0)
         matched = ((block == atoms[:, 2].unsqueeze(1)) & (pos < counts.unsqueeze(1))).any(1)
         return matched & in_range
 
