@@ -40,10 +40,26 @@ def prune_rule_groundings(rg, *, facts_idx: Tensor, depth: int,
     # on GPU — replaces the old ``unique_dim`` + ``.item()``-sized
     # fact_mask buffer, which was slow per-row-sort plus a host sync.
     if facts_idx.numel() > 0:
-        from grounder.groundings import atom_hash
+        import os as _os
         fi_dev = facts_idx.to(device)
-        atom_h = atom_hash(atom_table)                      # [num_atoms]
-        fact_h = atom_hash(fi_dev)                          # [F]
+        if _os.environ.get("GROUNDER_EXACT_FACT_MEMBERSHIP") == "1":
+            # COLLISION-FREE fact membership (eval-only, env-gated default OFF).
+            # The default ``atom_hash`` packs (p,a0,a1) with three NEAR-EQUAL
+            # primes; on large eval atom_tables (exhaustive candidate pools)
+            # this yields FALSE-POSITIVE "facts", seeding spurious proofs that
+            # boost distractor scores and suppress exhaustive MRR. Pack
+            # injectively into int64 with a base > every component so
+            # membership is exact. Default (hash) path kept for byte-identity.
+            base = int(torch.maximum(atom_table.max(), fi_dev.max()).item()) + 1
+            bb = base * base
+            atom_h = (atom_table[:, 0].long() * bb
+                      + atom_table[:, 1].long() * base + atom_table[:, 2].long())
+            fact_h = (fi_dev[:, 0].long() * bb
+                      + fi_dev[:, 1].long() * base + fi_dev[:, 2].long())
+        else:
+            from grounder.groundings import atom_hash
+            atom_h = atom_hash(atom_table)                  # [num_atoms]
+            fact_h = atom_hash(fi_dev)                       # [F]
         is_fact = torch.isin(atom_h, fact_h)                # [num_atoms]
     else:
         is_fact = torch.zeros(num_atoms, dtype=torch.bool, device=device)

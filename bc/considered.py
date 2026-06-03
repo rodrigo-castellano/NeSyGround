@@ -236,11 +236,48 @@ def finalize(grounder) -> Optional[RuleGroundings]:
     head_atom_idx = inverse[:, 0]
     body_atom_idx = inverse[:, 1:]
 
+    # Binding-consistency guard (eval-only, env-gated ``GROUNDER_BINDING_GUARD``,
+    # default OFF -> byte-identical). The ``all_anchors`` flat/dense body-fill
+    # can leak cross-variant / padded-K_r candidates recorded under the wrong
+    # rule (rule_idx clamped via ``_variant_to_orig``), producing firings whose
+    # body predicates don't match the rule template — e.g. rule0
+    # ``aunt<-aunt,brother`` (body-pred multiset {1,2}) getting a body
+    # [aunt, father] ({1,4}) or [aunt, aunt] ({1,1}). Such impossible firings
+    # sometimes have all-fact bodies, seeding spurious derivations that inflate
+    # the exhaustive-eval candidate set ~13x and suppress MRR. Drop any firing
+    # whose sorted body-predicate multiset != its rule's template multiset; a
+    # correct rule application can never fail this, so natural-query grounding
+    # is unchanged. Runs PRE-prune so broken seeds can't chain through fp_batch.
+    import os as _os
+    if _os.environ.get("GROUNDER_BINDING_GUARD") == "1":
+        ri = grounder.kb.rule_index
+        src_preds = ri.rules_bodies_sorted[:, :, 0].long().to(u_rule.device)  # [R_pos, Bmax]
+        Bmax = src_preds.size(1)
+        if Bmax < M:
+            src_preds = torch.cat([
+                src_preds,
+                torch.full((src_preds.size(0), M - Bmax), pad,
+                           dtype=torch.long, device=u_rule.device)], dim=1)
+        elif Bmax > M:
+            src_preds = src_preds[:, :M]
+        templ = torch.full((num_rules, M), pad, dtype=torch.long,
+                           device=u_rule.device)
+        templ[ri.rules_idx_sorted.long().to(u_rule.device)] = src_preds
+        templ_sorted = templ.sort(dim=1).values                      # [num_rules, M]
+        actual = atom_table[body_atom_idx][..., 0].long()            # [U, M]
+        actual_sorted = actual.sort(dim=1).values
+        exp = templ_sorted[u_rule.clamp(max=num_rules - 1)]          # [U, M]
+        guard_ok = (actual_sorted == exp).all(dim=1)                 # [U]
+    else:
+        guard_ok = None
+
     # Sort firings by rule_idx so each rule's slice in the flat tensors
     # is contiguous. Drop the sentinel ``rule_idx == num_rules``: those
     # are the invalid-rule rows from the dedup pipeline. ``bincount``
     # gives per-rule sizes; cumsum gives the flat offset table.
     keep = u_rule < num_rules
+    if guard_ok is not None:
+        keep = keep & guard_ok
     u_rule_keep = u_rule[keep]
     head_atom_keep = head_atom_idx[keep]
     body_atom_keep = body_atom_idx[keep]
