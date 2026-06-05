@@ -81,6 +81,7 @@ class GrounderConfig:
     step_prune_dead: bool = False
 
     def __post_init__(self) -> None:
+        # ── Validate ──
         if self.resolution not in _RESOLUTIONS:
             raise ValueError(
                 f"resolution must be one of {_RESOLUTIONS}, got {self.resolution!r}")
@@ -92,6 +93,50 @@ class GrounderConfig:
             raise ValueError(
                 f"resolution='closure' requires filter in (None,'none'), "
                 f"got {self.filter!r}")
+        if self.init_state_shape not in ("minimal", "full"):
+            raise ValueError(
+                f"init_state_shape must be 'minimal' or 'full', "
+                f"got {self.init_state_shape!r}")
+
+        # ── Derive the resolved configuration (kb-independent). This is the
+        # single home for the forced/defaulted values BCGrounder used to
+        # compute inline in its constructor. ──
+        # Default filter: paper BC_{w,d,u=0} convention. enum -> 'fp_batch'
+        # (keras prune_incomplete_proofs=True); closure/sld/rtf -> 'none'.
+        if self.filter is None:
+            self.filter = ("none" if self.resolution == "closure"
+                           else ("fp_batch" if self.resolution == "enum"
+                                 else "none"))
+        # all_anchors is forced True for enum: anchoring only on the first
+        # body atom misses bindings keras finds (the dedup collapses the
+        # K_r anchor variants of one logical application to a single entry).
+        if self.resolution == "enum":
+            self.all_anchors = True
+        # u (= w_last_depth) defaults to 0 — every leaf body atom must be a
+        # fact at the terminal step (paper convention).
+        if self.w_last_depth is None:
+            self.w_last_depth = 0
+
+        # ── Derived (non-field) attributes consumed by BCGrounder ──
+        # Per-step width filter applies to SLD/RTF only (enum filters by w).
+        self.step_width: Optional[int] = (
+            self.width if self.resolution in ("sld", "rtf")
+            and self.width is not None else None)
+        # prune_dead is meaningful only for SLD/RTF (enum body atoms are all
+        # ground), so it's silently a no-op for enum — warn and disable.
+        if self.step_prune_dead and self.resolution == "enum":
+            import warnings
+            warnings.warn(
+                "step_prune_dead has no effect with enum resolution "
+                "(all body atoms are ground). Ignoring.",
+                stacklevel=2,
+            )
+        self.step_prune_dead_effective: bool = (
+            self.step_prune_dead and self.resolution in ("sld", "rtf"))
+        # Standardization mode (None when no standardization is configured).
+        self.standardization_mode = (
+            self.standardization.mode if self.standardization is not None
+            else None)
 
     @classmethod
     def from_kwargs(cls, **kwargs: Any) -> "GrounderConfig":

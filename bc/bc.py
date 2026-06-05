@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from grounder.config import GrounderConfig
 from grounder.data.kb import KB
 from grounder.resolution.standardization import StandardizationConfig
 from grounder.types import GrounderOutput, ResolvedChildren
@@ -100,6 +101,9 @@ class BCGrounder(nn.Module):
         #     all depths (no d=0 specialization). Recommended when
         #     ``compile_mode`` is set.
         init_state_shape: str = "minimal",
+        # Internal: a pre-built, already-validated GrounderConfig. ``from_config``
+        # passes this to avoid re-deriving; public callers pass the kwargs above.
+        _config: Optional["GrounderConfig"] = None,
     ) -> None:
         super().__init__()
         self.kb = kb
@@ -107,6 +111,31 @@ class BCGrounder(nn.Module):
         # sizing; the torch-ns adapter previously fell back to 0 via
         # ``getattr(grounder, 'num_rules', 0)`` because it was never set).
         self.num_rules = kb.num_rules
+
+        # GrounderConfig is the single validated construction surface: its
+        # ``__post_init__`` owns every kb-independent derivation (filter
+        # default, forced all_anchors for enum, w_last_depth, step_width,
+        # step_prune_dead, standardization_mode) and all combo validation.
+        # BCGrounder just consumes the resolved config + does kb-dependent
+        # wiring below.
+        self.config = _config if _config is not None else GrounderConfig(
+            resolution=resolution, filter=filter, depth=depth, width=width,
+            max_total_groundings=max_total_groundings,
+            max_groundings_per_query=max_groundings_per_query,
+            max_groundings_per_rule=max_groundings_per_rule,
+            max_goals=max_goals, max_states=max_states, K_MAX=K_MAX,
+            max_derived_per_state=max_derived_per_state,
+            w_last_depth=w_last_depth, compile_mode=compile_mode,
+            init_state_shape=init_state_shape, bump_s_to_k=bump_s_to_k,
+            collect_evidence=collect_evidence, collect_mode=collect_mode,
+            collect_rule_groundings=collect_rule_groundings,
+            pack_dedup=pack_dedup, hooks=hooks, fact_hook=fact_hook,
+            rule_hook=rule_hook, fc_method=fc_method, fc_depth=fc_depth,
+            cartesian_product=cartesian_product, all_anchors=all_anchors,
+            flat_intermediate=flat_intermediate, standardization=standardization,
+            prune_facts=prune_facts, step_prune_dead=step_prune_dead,
+        )
+        cfg = self.config
 
         # ── Per-query grounding tabling cache (task #47, Design #2) ──
         # Grounding is weight-independent (facts + rules are fixed for the
@@ -151,111 +180,42 @@ class BCGrounder(nn.Module):
         # Default OFF. See ``resolution/enum.py:_resolve_enum_step_flat``.
         self._resolve_skip_enabled = False
 
-        self.depth = depth
-        self.width = width
-        self.resolution = resolution
-        # Default filter is the paper BC_{w,d,u=0} convention for enum:
-        # 'fp_batch' (keras ``prune_incomplete_proofs=True`` equivalent).
-        # Callers that want u>0 semantics (admit unknown leaves) should
-        # pass ``filter='none'`` explicitly along with ``w_last_depth>0``;
-        # ``make_bcwd`` does this via its ``u`` parameter.
-        # SLD/RTF have no parity story; default 'none'.
-        if filter is None:
-            if resolution == "closure":
-                filter = "none"
-            else:
-                filter = "fp_batch" if resolution == "enum" else "none"
-        self.filter_mode = filter
-        # Compile mode is opt-in (default None = eager). The dense
-        # ``enum`` path is the right pairing for ``'reduce-overhead'``
-        # (static shapes, CUDA-graph capture); the flat path stays
-        # eager because its ``torch.nonzero`` produces dynamic shapes
-        # incompatible with reduce-overhead. Multi-grounder sweeps
-        # should NOT enable compile globally — torch's CUDA-graph
-        # weakref bookkeeping accumulates across grounders.
-        self.compile_mode = compile_mode
-        self.hooks = hooks or []
-        self.fact_hook = fact_hook
-        self.rule_hook = rule_hook
+        # ── Resolved configuration (all derivation done in GrounderConfig) ──
+        self.depth = cfg.depth
+        self.width = cfg.width
+        self.resolution = cfg.resolution
+        self.filter_mode = cfg.filter
+        # Compile mode is opt-in (default None = eager). The dense enum path
+        # pairs with 'reduce-overhead' (static shapes); the flat path stays
+        # eager (its torch.nonzero is dynamic-shaped). Don't enable compile
+        # globally in sweeps — CUDA-graph weakref bookkeeping accumulates.
+        self.compile_mode = cfg.compile_mode
+        self.hooks = list(cfg.hooks) if cfg.hooks else []
+        self.fact_hook = cfg.fact_hook
+        self.rule_hook = cfg.rule_hook
         self.step_hook = None  # Optional StepHook (nn.Module), set externally
-        self.collect_evidence = collect_evidence
-        self.prune_facts = prune_facts
-        # Enum defaults:
-        #   all_anchors=True              — try every body atom as anchor
-        #                                    (matches keras's per-i loop;
-        #                                    forced for correctness because
-        #                                    anchoring only on the first body
-        #                                    atom misses bindings keras finds)
-        #   cartesian_product=False       — fact-anchored enumeration: candidates
-        #                                    come from ``fact_index.enumerate``
-        #                                    (the partial atom lookup), not from
-        #                                    the full entity domain. This
-        #                                    matches keras's
-        #                                    ``fact_index._index.get(partial_atom)``
-        #                                    and keeps the d=1 body tensor
-        #                                    bounded by ``G_r`` (typically
-        #                                    ``min(K_f, max_groundings_per_query)``)
-        #                                    instead of ``E`` (entity count).
-        # Callers may opt back into ``cartesian_product=True`` for full-domain
-        # exploration; the count is identical (after filtering) because both
-        # admit the same set of valid groundings.
-        #
-        # ``collect_rule_groundings`` is NOT forced for enum: speed-only
-        # callers (test_speed.py) pass ``False`` so the per-step
-        # ``_step_compiled`` accumulators stay empty. Forcing True caused
-        # the chunked path to leak ~100 MB / chunk on wn18rr (step_body /
-        # step_head / step_ridx clones from every chunk's depth=1 step
-        # piling up across all 293 chunks until ~24 GB OOM).
-        if resolution == "closure":
-            pass  # closure never touches enum-specific anchor variants
-        elif resolution == "enum":
-            if not all_anchors:
-                all_anchors = True
-        self._cartesian_product = cartesian_product
-        self._all_anchors = all_anchors
-        self._flat_intermediate_flag = flat_intermediate
-        self._pack_dedup = pack_dedup
-        self._collect_rule_groundings = collect_rule_groundings
-        self._bump_s_to_k = bump_s_to_k
-        if init_state_shape not in ("minimal", "full"):
-            raise ValueError(
-                f"init_state_shape must be 'minimal' or 'full', "
-                f"got {init_state_shape!r}")
-        self._init_state_shape = init_state_shape
-        # Paper BC_{w,d,u} convention: u (= w_last_depth) defaults to 0.
-        # All body atoms at the last (= terminal) step must be facts;
-        # any rule application with leftover unknown leaves is dropped
-        # by terminal collection. Callers that want u>0 (admit unknown
-        # leaves; e.g. depth=1 with width>0 to surface single-rule
-        # applications as in keras-ns ``prune_incomplete_proofs=False``
-        # tests) pass ``w_last_depth=u`` explicitly. ``make_bcwd``
-        # exposes this as the ``u`` parameter.
-        if w_last_depth is None:
-            w_last_depth = 0
-        self._w_last_depth = w_last_depth
-        self._collect_mode = collect_mode
+        self.collect_evidence = cfg.collect_evidence
+        self.prune_facts = cfg.prune_facts
+        self._cartesian_product = cfg.cartesian_product
+        self._all_anchors = cfg.all_anchors          # forced True for enum
+        self._flat_intermediate_flag = cfg.flat_intermediate
+        self._pack_dedup = cfg.pack_dedup
+        self._collect_rule_groundings = cfg.collect_rule_groundings
+        self._bump_s_to_k = cfg.bump_s_to_k
+        self._init_state_shape = cfg.init_state_shape
+        self._w_last_depth = cfg.w_last_depth        # defaulted to 0 (u=0)
+        self._collect_mode = cfg.collect_mode
+        self._step_width = cfg.step_width            # SLD/RTF only
+        self._step_prune_dead = cfg.step_prune_dead_effective
+        self.standardization_mode = cfg.standardization_mode
 
-        # Per-step search filters
-        self._step_width = width if resolution in ("sld", "rtf") and width is not None else None
-
-        # prune_dead: only for SLD/RTF
-        if step_prune_dead and resolution == "enum":
-            import warnings
-            warnings.warn(
-                "step_prune_dead has no effect with enum resolution "
-                "(all body atoms are ground). Ignoring.",
-                stacklevel=2,
-            )
-        self._step_prune_dead = step_prune_dead and resolution in ("sld", "rtf")
-
-        self.standardization_mode = standardization.mode if standardization else None
-
-        # ── Shared layout: G, A, S, C ──
+        # ── Shared layout: G, A, S, C (kb-dependent) ──
         # Standard symbols (see grounder/CLAUDE.md "Naming Convention").
         M = self.kb.M
-        D = depth
+        D = cfg.depth
 
         # G (max goals per state): M + (M-1)*D.
+        max_goals = cfg.max_goals
         if max_goals is None:
             max_goals = M + (M - 1) * D
         self.max_goals = max(max_goals, M)
@@ -264,39 +224,40 @@ class BCGrounder(nn.Module):
         self.A = D * M
 
         # S (max states per depth step).  Default 256.
-        if max_states is None:
-            max_states = 256
+        max_states = cfg.max_states if cfg.max_states is not None else 256
         self.S = max_states
 
         # C (collected groundings budget).
-        self.C = max_total_groundings
+        self.C = cfg.max_total_groundings
 
         # Init resolution-specific params + compilation
         from grounder.bc.init_resolution import init_resolution
         init_resolution(
             self,
-            max_states=max_states, K_MAX=K_MAX,
-            max_derived_per_state=max_derived_per_state,
-            max_total_groundings=max_total_groundings,
-            max_groundings_per_rule=max_groundings_per_rule,
-            max_groundings_per_query=max_groundings_per_query,
-            fc_method=fc_method, fc_depth=fc_depth,
+            max_states=max_states, K_MAX=cfg.K_MAX,
+            max_derived_per_state=cfg.max_derived_per_state,
+            max_total_groundings=cfg.max_total_groundings,
+            max_groundings_per_rule=cfg.max_groundings_per_rule,
+            max_groundings_per_query=cfg.max_groundings_per_query,
+            fc_method=cfg.fc_method, fc_depth=cfg.fc_depth,
         )
 
         # Output variable standardization
         self._standardize_fn: Optional[Callable] = None
-        if standardization is not None:
+        if cfg.standardization is not None:
             from grounder.resolution.standardization import build_standardize_fn
-            self._standardize_fn = build_standardize_fn(standardization, self.kb.device_)
+            self._standardize_fn = build_standardize_fn(
+                cfg.standardization, self.kb.device_)
 
     @classmethod
-    def from_config(cls, kb: KB, config) -> "BCGrounder":
+    def from_config(cls, kb: KB, config: GrounderConfig) -> "BCGrounder":
         """Construct from a :class:`grounder.config.GrounderConfig`.
 
-        The clean construction entry point (Phase 2a). Behavior-neutral:
-        expands the config to the exact legacy constructor kwargs.
+        The clean construction entry point. The config is already validated +
+        derived (in its ``__post_init__``), so it's passed straight through —
+        BCGrounder consumes it without re-deriving.
         """
-        return cls(kb, **config.as_kwargs())
+        return cls(kb, _config=config)
 
     @torch.no_grad()
     def forward(
