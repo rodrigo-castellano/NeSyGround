@@ -137,48 +137,8 @@ class BCGrounder(nn.Module):
         )
         cfg = self.config
 
-        # ── Per-query grounding tabling cache (task #47, Design #2) ──
-        # Grounding is weight-independent (facts + rules are fixed for the
-        # grounder's lifetime), so each query atom's RAW (pre-prune)
-        # "considered" firing set is byte-identical across calls. When
-        # ``_tabling_enabled`` is True the forward chain serves recurring
-        # queries from ``_grounding_cache`` instead of re-running the depth
-        # loop. Default OFF — the existing path is untouched unless a caller
-        # flips ``grounder._tabling_enabled = True``.
-        self._tabling_enabled = False
-        self._grounding_cache: Dict[int, Any] = {}
-        # Query-index offset for the considered accumulator's bidx column.
-        # Reset per public ``forward`` (and per chunk); reconciles the
-        # accumulator's batch-local ``b_idx`` with the write-back's
-        # ``miss_positions`` map. 0 for the single-batch path.
-        self._chunk_query_offset = 0
-        # KB-immutability stamp — the cache is only valid while facts + rules
-        # are unchanged. Asserted on every consult.
-        self._tabling_kb_stamp = (id(self.kb.fact_index), int(self.kb.num_rules))
-        # Cap on distinct cached query keys. When full, stop inserting new
-        # keys but keep serving hits + computing misses fresh (passthrough).
-        self._tabling_max_entries = 2_000_000
-        self._tabling_full_warned = False
-
-        # ── Per-subgoal grounding memo (task #48, Design #2) ──
-        # Memoizes each SELECTED SUBGOAL's considered firing set keyed by
-        # ``(selected_goal_atom_hash, is_last)`` — finer granularity than the
-        # per-query cache, so subgoals shared ACROSS queries (and across
-        # epochs) reuse one stored set. Default OFF; built on top of #47.
-        # See :mod:`grounder.bc.subgoal`.
-        self._subgoal_enabled = False
-        self._subgoal_memo: Dict[Any, Any] = {}
-        self._subgoal_max_entries = 2_000_000
-        self._subgoal_full_warned = False
-
-        # ── Resolve-SKIP (task #48 Phase-2) ──
-        # Within-batch goal dedup in the flat enum resolve: run the
-        # expensive enumerate/fill/exists/filter pipeline ONCE per distinct
-        # selected goal, then scatter survivors to every state sharing it.
-        # Byte-identical (survivor set is goal-determined; per-state child =
-        # survivors + that state's own remaining goals + grounding_body).
-        # Default OFF. See ``resolution/enum.py:_resolve_enum_step_flat``.
-        self._resolve_skip_enabled = False
+        # Optional (default-OFF) grounding-memoization state.
+        self._init_grounding_caches()
 
         # ── Resolved configuration (all derivation done in GrounderConfig) ──
         self.depth = cfg.depth
@@ -248,6 +208,46 @@ class BCGrounder(nn.Module):
             from grounder.resolution.standardization import build_standardize_fn
             self._standardize_fn = build_standardize_fn(
                 cfg.standardization, self.kb.device_)
+
+    def _init_grounding_caches(self) -> None:
+        """Initialise the (default-OFF) grounding-memoization state used by the
+        optional tabling (#47) / subgoal-memo (#48) / resolve-skip fast paths.
+
+        All three are OFF by default — the standard depth-loop path is
+        untouched unless a caller flips the corresponding ``_*_enabled`` flag.
+        The state lives on the grounder because it is the context object every
+        ``bc/`` function reads (see :mod:`grounder.bc.tabling` / ``.subgoal``).
+        """
+        # Per-query tabling cache (#47): grounding is weight-independent, so a
+        # query atom's RAW (pre-prune) considered firing set is byte-identical
+        # across calls; hits replay it instead of re-running the depth loop.
+        self._tabling_enabled = False
+        self._grounding_cache: Dict[int, Any] = {}
+        # Query-index offset reconciling the accumulator's batch-local b_idx
+        # with the write-back miss_positions map (reset per forward/chunk;
+        # 0 for the single-batch path).
+        self._chunk_query_offset = 0
+        # KB-immutability stamp — the cache is valid only while facts + rules
+        # are unchanged (asserted on every consult).
+        self._tabling_kb_stamp = (id(self.kb.fact_index), int(self.kb.num_rules))
+        # Cap on distinct cached keys; when full, serve hits + compute misses
+        # fresh (passthrough) instead of inserting.
+        self._tabling_max_entries = 2_000_000
+        self._tabling_full_warned = False
+
+        # Per-subgoal memo (#48): keyed by (selected_goal_hash, is_last) —
+        # finer than per-query, so subgoals shared across queries/epochs reuse
+        # one stored set. Built on top of #47.
+        self._subgoal_enabled = False
+        self._subgoal_memo: Dict[Any, Any] = {}
+        self._subgoal_max_entries = 2_000_000
+        self._subgoal_full_warned = False
+
+        # Resolve-SKIP (#48 Phase-2): within-batch goal dedup in the flat enum
+        # resolve — run the enumerate/fill/exists/filter pipeline once per
+        # distinct selected goal, then scatter survivors to every state sharing
+        # it (byte-identical). See ``resolution/enum.py:_resolve_enum_step_flat``.
+        self._resolve_skip_enabled = False
 
     @classmethod
     def from_config(cls, kb: KB, config: GrounderConfig) -> "BCGrounder":
