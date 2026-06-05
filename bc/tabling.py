@@ -40,6 +40,7 @@ import torch
 from torch import Tensor
 
 from grounder.groundings import atom_hash
+from grounder.bc.cache_common import verify_cache_preconditions
 
 
 def tabling_active(grounder) -> bool:
@@ -51,29 +52,7 @@ def tabling_active(grounder) -> bool:
     """
     if not getattr(grounder, "_tabling_enabled", False):
         return False
-    # MANDATORY guardrails — assert rather than silently degrade.
-    assert grounder.resolution == "enum", (
-        "tabling requires resolution=='enum', "
-        f"got {grounder.resolution!r}")
-    assert getattr(grounder, "_flat_intermediate", False) \
-        or getattr(grounder, "_flat_intermediate_flag", False), (
-        "tabling requires the enum FLAT path (flat_intermediate=True)")
-    assert not torch.compiler.is_compiling(), (
-        "tabling must not run inside torch.compile tracing")
-    assert not getattr(grounder, "_compiled", False), (
-        "tabling is incompatible with the compiled/dense step path "
-        "(it uses evidence-derived rule_groundings, not considered)")
-    assert grounder._collect_rule_groundings, (
-        "tabling requires collect_rule_groundings=True (it caches the "
-        "considered accumulator)")
-    # KB-immutability: the cache is only valid while facts + rules are
-    # unchanged for the grounder's lifetime.
-    stamp = (id(grounder.kb.fact_index), int(grounder.kb.num_rules))
-    assert stamp == grounder._tabling_kb_stamp, (
-        "tabling KB-immutability stamp changed "
-        f"(was {grounder._tabling_kb_stamp}, now {stamp}); the fact index "
-        "or rule count was mutated, invalidating every cached entry")
-    return True
+    return verify_cache_preconditions(grounder, "tabling")
 
 
 def split_queries(

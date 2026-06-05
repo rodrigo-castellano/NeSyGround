@@ -40,6 +40,7 @@ import torch
 from torch import Tensor
 
 from grounder.groundings import atom_hash
+from grounder.bc.cache_common import verify_cache_preconditions
 
 
 def subgoal_active(grounder) -> bool:
@@ -50,24 +51,7 @@ def subgoal_active(grounder) -> bool:
     """
     if not getattr(grounder, "_subgoal_enabled", False):
         return False
-    assert grounder.resolution == "enum", (
-        "subgoal memo requires resolution=='enum', "
-        f"got {grounder.resolution!r}")
-    assert getattr(grounder, "_flat_intermediate", False) \
-        or getattr(grounder, "_flat_intermediate_flag", False), (
-        "subgoal memo requires the enum FLAT path (flat_intermediate=True)")
-    assert not torch.compiler.is_compiling(), (
-        "subgoal memo must not run inside torch.compile tracing")
-    assert not getattr(grounder, "_compiled", False), (
-        "subgoal memo is incompatible with the compiled/dense step path")
-    assert grounder._collect_rule_groundings, (
-        "subgoal memo requires collect_rule_groundings=True")
-    stamp = (id(grounder.kb.fact_index), int(grounder.kb.num_rules))
-    assert stamp == grounder._tabling_kb_stamp, (
-        "subgoal memo KB-immutability stamp changed "
-        f"(was {grounder._tabling_kb_stamp}, now {stamp}); the fact index "
-        "or rule count was mutated, invalidating every memo entry")
-    return True
+    return verify_cache_preconditions(grounder, "subgoal memo")
 
 
 def route_rows(
