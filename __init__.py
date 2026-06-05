@@ -57,11 +57,8 @@ from grounder.data.fact_index import (
 from grounder.data.rule_index import RuleIndex, RuleIndexEnum, RulePattern, compile_rules
 
 # --- Packing + post-processing ---
-from grounder.bc.common import (
-    compact_atoms,
-    collect_groundings,
-    pack_states,
-)
+from grounder.bc.packing import compact_atoms, pack_states
+from grounder.bc.postprocessing import collect_groundings
 from grounder.filters.search.prune_facts import prune_ground_facts
 
 # --- Standardization ---

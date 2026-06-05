@@ -22,12 +22,9 @@ from typing import Dict, Tuple
 import torch
 from torch import Tensor
 
-from grounder.bc.common import (
-    collect_groundings,
-    compact_atoms,
-    pack_states,
-    prune_ground_facts,
-)
+from grounder.bc.packing import compact_atoms, pack_states
+from grounder.bc.postprocessing import collect_groundings
+from grounder.filters.search.prune_facts import prune_ground_facts
 from grounder.filters.search import filter_prune_dead, filter_width
 from grounder.resolution.enum import resolve_enum_step
 from grounder.resolution.primitives import apply_substitutions
@@ -256,7 +253,7 @@ def pack(
     Returns (states, sync) — no dict pollution with underscore keys.
     """
     if isinstance(resolved, FlatResolvedChildren):
-        from grounder.bc.common import pack_states_flat
+        from grounder.bc.packing import pack_states_flat
         packed = pack_states_flat(
             resolved,
             states["top_ridx"], states["grounding_body"],
