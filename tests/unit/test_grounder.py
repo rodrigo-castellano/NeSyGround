@@ -26,6 +26,46 @@ def _make_grounder(facts, heads, bodies, rule_lens, *,
     return BCGrounder(kb, **defaults)
 
 
+def test_from_config_roundtrip():
+    """``BCGrounder.from_config(GrounderConfig.from_kwargs(**kw))`` grounds
+    identically to ``BCGrounder(kb, **kw)`` — the config path is a faithful
+    mirror of the kwargs constructor."""
+    from grounder import GrounderConfig  # exercise the top-level export
+
+    facts = torch.cat([
+        torch.tensor([[1, 1, 2], [1, 2, 3]], dtype=torch.long), _PAD_FACTS])
+    heads = torch.tensor([[2, 24, 25]], dtype=torch.long)
+    bodies = torch.tensor([[[1, 24, 26], [1, 26, 25]]], dtype=torch.long)
+    rule_lens = torch.tensor([2], dtype=torch.long)
+
+    def build_kb():
+        return KB(facts, heads, bodies, rule_lens, constant_no=23,
+                  predicate_no=3, padding_idx=99, device=DEVICE,
+                  fact_index_type='arg_key')
+
+    kw = dict(resolution='sld', filter='none', max_goals=5, depth=3,
+              max_total_groundings=8, prune_facts=True,
+              collect_evidence=True, collect_rule_groundings=True)
+    q = torch.tensor([[2, 1, 3]], dtype=torch.long)
+    qm = torch.ones(1, dtype=torch.bool)
+
+    def signature(out):
+        rg = out.rule_groundings
+        n_fire = (0 if rg is None or rg.head_pool_idx is None
+                  else int(rg.head_pool_idx.numel()))
+        ev = out.evidence
+        n_proof = (0 if ev is None or ev.count is None
+                   else int(ev.count.sum().item()))
+        return (n_fire, n_proof)
+
+    with torch.no_grad():
+        out_direct = BCGrounder(build_kb(), **kw)(q, qm)
+        out_config = BCGrounder.from_config(
+            build_kb(), GrounderConfig.from_kwargs(**kw))(q, qm)
+    assert signature(out_direct) == signature(out_config)
+    assert signature(out_direct)[0] > 0  # the chain actually grounds
+
+
 class TestGrandparentChain:
     """gp(X,Z) :- parent(X,Y), parent(Y,Z)."""
 

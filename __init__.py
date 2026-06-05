@@ -96,6 +96,9 @@ from grounder.factory import create_grounder, make_bcwd
 # --- KB + Grounders ---
 from grounder.data.kb import KB
 from grounder.bc.bc import BCGrounder
+# GrounderConfig is a validated 1:1 mirror of the BCGrounder kwargs;
+# construct via ``BCGrounder.from_config(kb, GrounderConfig.from_kwargs(**kw))``.
+from grounder.config import GrounderConfig
 
 # --- NeSy hooks ---
 from grounder.nesy.hooks import (
@@ -110,6 +113,8 @@ from grounder.nesy.sampler import RandomSampler
 from grounder.utils import timed_warmup
 
 __all__ = [
+    # Grounder config
+    "GrounderConfig",
     # Primitives
     "apply_substitutions",
     "unify_one_to_one",
