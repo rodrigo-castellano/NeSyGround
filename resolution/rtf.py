@@ -15,6 +15,7 @@ from torch import Tensor
 
 from grounder.resolution.mgu import resolve_facts as mgu_resolve_facts
 from grounder.resolution.mgu import resolve_rules as mgu_resolve_rules
+from grounder.resolution.mgu import _empty_rule_results
 from grounder.types import ResolvedChildren
 
 if TYPE_CHECKING:
@@ -69,14 +70,12 @@ def resolve_rtf(
     fact_subs = torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev)
 
     if num_rules == 0:
+        rule_goals, rule_gbody, rule_success, sub_rule_idx, rule_subs = \
+            _empty_rule_results(B, S, G, M_g, pad, dev)
         return ResolvedChildren(
             fact_goals, fact_gbody, fact_success,
-            torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev),
-            torch.zeros(B, S, 0, M_g, 3, dtype=torch.long, device=dev),
-            torch.zeros(B, S, 0, dtype=torch.bool, device=dev),
-            torch.zeros(B, S, 0, dtype=torch.long, device=dev),
-            fact_subs,
-            torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev),
+            rule_goals, rule_gbody, rule_success, sub_rule_idx,
+            fact_subs, rule_subs,
         )
 
     # All MGU operations are pure index ops — no gradients needed

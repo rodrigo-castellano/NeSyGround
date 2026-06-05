@@ -19,6 +19,22 @@ from grounder.data.fact_index import ArgKeyFactIndex
 from grounder.resolution.primitives import apply_substitutions, unify_one_to_one
 
 
+def _empty_rule_results(
+    B: int, S: int, G: int, M_g: int, pad: int, dev,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """The 5 empty rule-resolution tensors for the ``num_rules == 0`` fast
+    path, shared by ``resolve_sld`` / ``resolve_rtf``:
+    ``(rule_goals, rule_gbody, rule_success, sub_rule_idx, rule_subs)``.
+    """
+    return (
+        torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev),
+        torch.zeros(B, S, 0, M_g, 3, dtype=torch.long, device=dev),
+        torch.zeros(B, S, 0, dtype=torch.bool, device=dev),
+        torch.zeros(B, S, 0, dtype=torch.long, device=dev),
+        torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev),
+    )
+
+
 def resolve_facts(
     goals: Tensor,              # [B, S, 3]
     remaining: Tensor,          # [B, S, G, 3]
