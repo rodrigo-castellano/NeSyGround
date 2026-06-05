@@ -1084,35 +1084,41 @@ def _enumerate_cartesian(
     return source, combined_mask, G_final
 
 
+def _fill_body_atoms(source_m: Tensor, check_arg_m: Tensor,
+                     body_preds_m: Tensor) -> Tensor:
+    """Rank-agnostic body-atom fill shared by the dense and flat paths.
+
+    ``source_m`` [..., M, W]; ``check_arg_m`` [..., M, 2] indexes the trailing
+    W axis (clamped to W-1 — indices >= W are unresolved free vars, filtered
+    out downstream by the exists-check); ``body_preds_m`` [..., M]. Returns
+    [..., M, 3] = (pred, arg0, arg1).
+    """
+    W = source_m.size(-1)
+    idx_0 = check_arg_m[..., 0].clamp(max=W - 1).unsqueeze(-1)
+    arg0 = source_m.gather(-1, idx_0).squeeze(-1)
+    idx_1 = check_arg_m[..., 1].clamp(max=W - 1).unsqueeze(-1)
+    arg1 = source_m.gather(-1, idx_1).squeeze(-1)
+    return torch.stack([body_preds_m, arg0, arg1], dim=-1)
+
+
 def _fill_body_extended(
     source: Tensor,                # [B, K_r, G_r, W]
     check_arg_source_q: Tensor,    # [B, K_r, M, 2]
     body_preds_q: Tensor,          # [B, K_r, M]
 ) -> Tensor:
-    """Fill body atoms from extended source tensor (no clamp needed).
+    """Fill body atoms from an extended dense source.
 
     check_arg_source_q values index into source's last dimension:
       0 = query subject, 1 = query object, 2 = fv0 candidate, 3 = fv1, ...
 
     Returns: [B, K_r, G_r, M, 3] body atoms.
     """
-    B, K_r, G_r, W = source.shape
+    G_r = source.size(2)
     M = body_preds_q.size(2)
-
-    source_exp = source.unsqueeze(3).expand(
-        -1, -1, -1, M, -1)                           # [B, K_r, G_r, M, W]
-
-    # No clamp(max=2): all binding indices have valid source slots
-    idx_0 = check_arg_source_q[:, :, :, 0].clamp(max=W - 1).view(
-        B, K_r, 1, M).expand(-1, -1, G_r, -1)
-    arg0 = source_exp.gather(4, idx_0.unsqueeze(-1)).squeeze(-1)
-
-    idx_1 = check_arg_source_q[:, :, :, 1].clamp(max=W - 1).view(
-        B, K_r, 1, M).expand(-1, -1, G_r, -1)
-    arg1 = source_exp.gather(4, idx_1.unsqueeze(-1)).squeeze(-1)
-
-    preds_exp = body_preds_q.unsqueeze(2).expand(-1, -1, G_r, -1)
-    return torch.stack([preds_exp, arg0, arg1], dim=-1)
+    source_m = source.unsqueeze(3).expand(-1, -1, -1, M, -1)        # [B,K_r,G_r,M,W]
+    check_m = check_arg_source_q.unsqueeze(2).expand(-1, -1, G_r, -1, -1)  # [B,K_r,G_r,M,2]
+    preds_m = body_preds_q.unsqueeze(2).expand(-1, -1, G_r, -1)     # [B,K_r,G_r,M]
+    return _fill_body_atoms(source_m, check_m, preds_m)
 
 
 def _enumerate_dir(
@@ -1176,20 +1182,9 @@ def _fill_body(
     q_s = query_subjs.view(B, 1, 1).expand(-1, K_r, G_r)
     q_o = query_objs.view(B, 1, 1).expand(-1, K_r, G_r)
     source = torch.stack([q_s, q_o, candidates], dim=3)       # [B, K_r, G_r, 3]
-    source_exp = source.unsqueeze(3).expand(-1, -1, -1, M, -1)  # [B, K_r, G_r, M, 3]
-
-    # Clamp source indices to [0, 2]: values >= 3 are unresolved free variables
-    # which produce invalid body atoms (safely filtered out by exists-check).
-    idx_0 = check_arg_source_q[:, :, :, 0].clamp(max=2).view(
-        B, K_r, 1, M).expand(-1, -1, G_r, -1)
-    arg0 = source_exp.gather(4, idx_0.unsqueeze(-1)).squeeze(-1)
-
-    idx_1 = check_arg_source_q[:, :, :, 1].clamp(max=2).view(
-        B, K_r, 1, M).expand(-1, -1, G_r, -1)
-    arg1 = source_exp.gather(4, idx_1.unsqueeze(-1)).squeeze(-1)
-
-    preds_exp = body_preds_q.unsqueeze(2).expand(-1, -1, G_r, -1)
-    return torch.stack([preds_exp, arg0, arg1], dim=-1)
+    # W=3 here, so _fill_body_extended's clamp(max=W-1) == the old clamp(max=2):
+    # indices >= 3 are unresolved free variables (filtered out by exists-check).
+    return _fill_body_extended(source, check_arg_source_q, body_preds_q)
 
 
 
@@ -1774,19 +1769,9 @@ def _fill_body_flat(
 
     Returns: [total_valid, M, 3]
     """
-    T = flat_source.size(0)  # total_valid
-    W = flat_source.size(1)
     M = body_preds_flat.size(1)
-
-    source_exp = flat_source.unsqueeze(1).expand(-1, M, -1)  # [T, M, W]
-
-    idx_0 = check_arg_source_flat[:, :, 0].clamp(max=W - 1)  # [T, M]
-    arg0 = source_exp.gather(2, idx_0.unsqueeze(-1)).squeeze(-1)  # [T, M]
-
-    idx_1 = check_arg_source_flat[:, :, 1].clamp(max=W - 1)  # [T, M]
-    arg1 = source_exp.gather(2, idx_1.unsqueeze(-1)).squeeze(-1)  # [T, M]
-
-    return torch.stack([body_preds_flat, arg0, arg1], dim=-1)  # [T, M, 3]
+    source_m = flat_source.unsqueeze(1).expand(-1, M, -1)  # [T, M, W]
+    return _fill_body_atoms(source_m, check_arg_source_flat, body_preds_flat)
 
 
 def _apply_filters_flat(
