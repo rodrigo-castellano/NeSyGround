@@ -150,7 +150,6 @@ def resolve(
             K_f=grounder.kb.K_f, K_r=grounder.kb.K_r,
             max_vars_per_rule=grounder.max_vars_per_rule,
             num_rules=grounder.kb.num_rules,
-            collect_evidence=grounder.collect_evidence,
             excluded_queries=states.get("excluded_queries"),
             fact_hook=fh, rule_hook=rh,
         )
@@ -167,7 +166,6 @@ def resolve(
             max_vars_per_rule=grounder.max_vars_per_rule,
             num_rules=grounder.kb.num_rules,
             max_fact_pairs_body=grounder._max_fact_pairs_body,
-            collect_evidence=grounder.collect_evidence,
             fact_hook=fh, rule_hook=rh,
         )
     else:

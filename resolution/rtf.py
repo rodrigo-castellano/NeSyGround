@@ -40,7 +40,6 @@ def resolve_rtf(
     max_vars_per_rule: int,
     num_rules: int,
     max_fact_pairs_body: int,
-    collect_evidence: bool = True,
     fact_hook: Optional[ResolutionFactHook] = None,
     rule_hook: Optional[ResolutionRuleHook] = None,
 ) -> ResolvedChildren:
@@ -126,8 +125,9 @@ def resolve_rtf(
         rule_goals = children.reshape(B, S, K_rtf, G, 3)
         rule_success_out = success.reshape(B, S, K_rtf)
 
-        # Propagate gbody and ridx from level-1 rule resolution
-        # Use actual M from resolution output (0 when collect_evidence=False)
+        # Propagate gbody and ridx from level-1 rule resolution.
+        # Take the actual body width M from the resolution output (it is 0
+        # when upstream resolution collected no evidence body).
         M_g_actual = rule_gbody_l1.shape[3]
         rule_gbody_out = rule_gbody_l1.unsqueeze(3).expand(
             B, S, K_r, K_f_actual, M_g_actual, 3).reshape(B, S, K_rtf, M_g_actual, 3)

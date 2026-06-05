@@ -39,7 +39,6 @@ def resolve_sld(
     K_r: int,
     max_vars_per_rule: int,
     num_rules: int,
-    collect_evidence: bool = True,
     excluded_queries: Optional[Tensor] = None,
     fact_hook: Optional[ResolutionFactHook] = None,
     rule_hook: Optional[ResolutionRuleHook] = None,
