@@ -27,7 +27,11 @@ from torch import Tensor
 
 from grounder.bc.buffers import init_states
 from grounder.bc.step import step
-from grounder.bc.terminal import filter_terminal
+from grounder.bc.finalize import (
+    build_proof_state,
+    finalize_evidence,
+    finalize_rule_groundings,
+)
 from grounder.types import (
     GrounderOutput,
     ProofEvidence,
@@ -320,34 +324,15 @@ def merge_chunk_outputs(
     # ``sync_accumulated`` propagates winning_subs across all depth
     # slots in evidence.body, so the substituted body atoms come
     # for free here (matching keras-ns).
-    rule_groundings = None
-    if grounder._collect_rule_groundings:
-        # "Considered" semantics: every rule application the BFS
-        # proposed (including ones whose proof tree doesn't complete
-        # within depth) — captured per-step in ``bc.considered``.
-        # Matches keras-ns ``ApproximateBackwardChainingGrounder``'s
-        # ``rule2groundings`` accumulator. The fp_batch fixpoint then
-        # drops apps whose body atoms aren't transitively groundable.
-        #
-        # FALLBACK: when ``capture_step`` was skipped (compiled trace,
-        # see ``bc.step.step``), the accumulator is empty. Build
-        # rule_groundings from ``evidence`` instead so callers still
-        # get a well-defined output — the cost is the in-proof-only
-        # set rather than the full considered set.
-        from grounder.bc.considered import finalize as considered_finalize
-        rule_groundings = considered_finalize(grounder)
-        if rule_groundings is None and evidence is not None:
-            from grounder.groundings import evidence_to_rule_groundings
-            rule_groundings = evidence_to_rule_groundings(
-                evidence, grounder.kb.padding_idx,
-                num_rules=grounder.kb.num_rules)
-        if rule_groundings is not None and grounder.filter_mode == "fp_batch":
-            from grounder.bc.pruning import prune_rule_groundings
-            rule_groundings = prune_rule_groundings(
-                rule_groundings,
-                facts_idx=grounder.kb.fact_index.facts_idx,
-                depth=grounder.depth,
-                padding_idx=grounder.kb.padding_idx)
+    # "Considered" semantics: every rule application the BFS proposed
+    # (including ones whose proof tree doesn't complete within depth) —
+    # captured per-step in ``bc.considered`` (keras-ns ``rule2groundings``).
+    # ``evidence_fallback=True``: when ``capture_step`` was skipped
+    # (compiled trace) the accumulator is empty, so rebuild from the merged
+    # ``evidence`` — the in-proof-only set rather than the full considered
+    # set — so callers still get a well-defined output.
+    rule_groundings = finalize_rule_groundings(
+        grounder, evidence, evidence_fallback=True)
 
     return GrounderOutput(state=state, evidence=evidence,
                           rule_groundings=rule_groundings)
@@ -407,36 +392,10 @@ def forward_one_batch_inner(
             grounder, queries, keys,
             miss_positions, hit_positions, hit_keys, marker=marker)
 
-    evidence = filter_terminal(grounder, states)
-    if isinstance(evidence, dict):
-        if grounder.collect_evidence:
-            evidence = ProofEvidence(
-                body=evidence["collected_body"],
-                mask=evidence["collected_mask"],
-                count=evidence["collected_mask"].sum(dim=1),
-                rule_idx=evidence["collected_ridx"],
-                body_count=evidence["collected_bcount"],
-                D=grounder.depth,
-                M=grounder.kb.M,
-                head=evidence.get("collected_head"),
-            )
-        else:
-            evidence = None
-    if evidence is not None:
-        for hook in grounder.hooks:
-            body, mask, ridx = hook.apply(
-                evidence.body_flat, evidence.mask, evidence.rule_idx_top)
-            evidence = ProofEvidence(
-                body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
-                body_count=evidence.body_count)
-    state = ProofState(
-        proof_goals=states["proof_goals"],
-        state_valid=states["state_valid"],
-        top_ridx=states["top_ridx"],
-        next_var_indices=(
-            states["next_var_indices"]
-            if grounder._standardize_fn is not None else None),
-    )
+    # Inner (per-chunk) path: build evidence + state but DEFER r2g
+    # finalisation to merge_chunk_outputs (the no-finalize contract).
+    evidence = finalize_evidence(grounder, states)
+    state = build_proof_state(grounder, states)
     return GrounderOutput(state=state, evidence=evidence,
                           rule_groundings=None)
 
@@ -493,54 +452,13 @@ def forward_one_batch(
             grounder, queries, keys,
             miss_positions, hit_positions, hit_keys)
 
-    evidence = filter_terminal(grounder, states)
-    if isinstance(evidence, dict):
-        if grounder.collect_evidence:
-            evidence = ProofEvidence(
-                body=evidence["collected_body"],
-                mask=evidence["collected_mask"],
-                count=evidence["collected_mask"].sum(dim=1),
-                rule_idx=evidence["collected_ridx"],
-                body_count=evidence["collected_bcount"],
-                D=grounder.depth,
-                M=grounder.kb.M,
-                head=evidence.get("collected_head"),
-            )
-        else:
-            evidence = None
-    if evidence is not None:
-        for hook in grounder.hooks:
-            body, mask, ridx = hook.apply(
-                evidence.body_flat, evidence.mask, evidence.rule_idx_top)
-            evidence = ProofEvidence(
-                body=body, mask=mask, count=mask.sum(dim=1), rule_idx=ridx,
-                body_count=evidence.body_count)
+    evidence = finalize_evidence(grounder, states)
     # Build RuleGroundings from the per-step "considered" accumulator
-    # captured by ``bc.considered.capture_step`` during BFS. Matches
-    # keras-ns ``rule2groundings`` semantics (every rule application
-    # the BFS proposed, regardless of proof-tree completion). The
-    # fp_batch fixpoint pruning then drops apps whose body atoms
-    # aren't transitively groundable.
-    rule_groundings = None
-    if grounder._collect_rule_groundings:
-        from grounder.bc.considered import finalize as considered_finalize
-        rule_groundings = considered_finalize(grounder)
-        if rule_groundings is not None and grounder.filter_mode == "fp_batch":
-            from grounder.bc.pruning import prune_rule_groundings
-            rule_groundings = prune_rule_groundings(
-                rule_groundings,
-                facts_idx=grounder.kb.fact_index.facts_idx,
-                depth=grounder.depth,
-                padding_idx=grounder.kb.padding_idx)
-
-    state = ProofState(
-        proof_goals=states["proof_goals"],
-        state_valid=states["state_valid"],
-        top_ridx=states["top_ridx"],
-        next_var_indices=(
-            states["next_var_indices"]
-            if grounder._standardize_fn is not None else None),
-    )
+    # captured by ``bc.considered.capture_step`` during BFS (keras-ns
+    # ``rule2groundings`` semantics), then fp_batch-prune. No evidence
+    # fallback on the single-batch path (preserved behaviour).
+    rule_groundings = finalize_rule_groundings(grounder)
+    state = build_proof_state(grounder, states)
     return GrounderOutput(state=state, evidence=evidence,
                           rule_groundings=rule_groundings)
 
