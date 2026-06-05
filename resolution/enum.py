@@ -1188,6 +1188,26 @@ def _fill_body(
 
 
 
+def _all_body_active_ok(ok: Tensor, body_active: Tensor) -> Tensor:
+    """Reduce a per-atom OK mask over body atoms: an entry survives when every
+    ACTIVE body atom is OK. ``ok`` / ``body_active`` are [..., M] → returns
+    [...]. Rank-agnostic (dense [B,K_r,G_r,M] and flat [T,M] both reduce the
+    trailing M axis)."""
+    return (ok | ~body_active).all(dim=-1)
+
+
+def _head_pred_all_ok(body_pred_vals: Tensor, exists: Tensor,
+                      body_active: Tensor, head_pred_mask: Tensor) -> Tensor:
+    """Head-predicate prune mask: every active body atom is either a fact
+    (``exists``) or carries a head predicate (provable at a later step).
+    Shared by the dense and flat filters. Padded body predicates are clamped
+    into range — the ``~body_active`` term admits padded slots regardless, so
+    the clamped value is never read."""
+    P = head_pred_mask.size(0)
+    head_pred_ok = head_pred_mask[body_pred_vals.clamp(max=P - 1)]
+    return _all_body_active_ok(exists | head_pred_ok, body_active)
+
+
 def _apply_enum_filters(
     body_atoms: Tensor,       # [B, K_r, G_r, M, 3]
     exists: Tensor,           # [B, K_r, G_r, M]
@@ -1237,17 +1257,8 @@ def _apply_enum_filters(
     # Head predicate pruning (only when width is bounded AND a mask is given)
     if width is not None:
         if head_pred_mask is not None:
-            body_pred_vals = body_atoms[..., 0]
-            # ``head_pred_mask`` is sized on actual predicates (small);
-            # padded body atoms carry ``predicate=padding_idx`` which
-            # can exceed that range. Clamp for the gather — the
-            # ``~body_active_exp`` term below admits padded slots
-            # regardless, so the clamped value is never read.
-            P = head_pred_mask.size(0)
-            safe_pred_vals = body_pred_vals.clamp(max=P - 1)
-            head_pred_ok = head_pred_mask[safe_pred_vals]
-            unknown_ok = exists | head_pred_ok
-            all_ok = (unknown_ok | ~body_active_exp).all(dim=-1)
+            all_ok = _head_pred_all_ok(
+                body_atoms[..., 0], exists, body_active_exp, head_pred_mask)
             if is_last is not None:
                 # Skip the prune at the last step (matches the eager
                 # ``head_pred_mask=None`` branch).
@@ -1262,13 +1273,13 @@ def _apply_enum_filters(
         # the compiled path).
         if isinstance(width, torch.Tensor):
             if is_last is not None:
-                all_exist = (exists | ~body_active_exp).all(dim=-1)
+                all_exist = _all_body_active_ok(exists, body_active_exp)
                 # Apply strict branch only when is_last (mirrors the
                 # eager ``width_d == 0 and last step``).
                 strict_mask = mask & all_exist
                 mask = torch.where(is_last, strict_mask, mask)
         elif width == 0:
-            all_exist = (exists | ~body_active_exp).all(dim=-1)
+            all_exist = _all_body_active_ok(exists, body_active_exp)
             mask = mask & all_exist
 
     return mask
@@ -1817,16 +1828,12 @@ def _apply_filters_flat(
     # Head predicate pruning (when width is bounded AND a mask is given)
     if width is not None:
         if head_pred_mask is not None:
-            body_pred_vals = flat_body[..., 0]  # [T, M]
-            P = head_pred_mask.size(0)
-            safe_pred_vals = body_pred_vals.clamp(max=P - 1)
-            head_pred_ok = head_pred_mask[safe_pred_vals]  # [T, M]
-            unknown_ok = flat_exists | head_pred_ok
-            all_ok = (unknown_ok | ~body_active).all(dim=-1)  # [T]
+            all_ok = _head_pred_all_ok(
+                flat_body[..., 0], flat_exists, body_active, head_pred_mask)
             mask = mask & all_ok
 
         if width == 0:
-            all_exist = (flat_exists | ~body_active).all(dim=-1)
+            all_exist = _all_body_active_ok(flat_exists, body_active)
             mask = mask & all_exist
 
     return mask
