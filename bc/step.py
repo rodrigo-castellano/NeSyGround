@@ -44,6 +44,8 @@ def step(
     grounder, states: Dict[str, Tensor], d: int,
 ) -> Dict[str, Tensor]:
     """One proof step: SELECT → RESOLVE → PACK → POSTPROCESS."""
+    # No rules in the KB → nothing to resolve; the step is a no-op and
+    # the incoming states pass through unchanged.
     if grounder.kb.num_rules == 0:
         return states
 
