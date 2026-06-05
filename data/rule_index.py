@@ -27,6 +27,75 @@ BINDING_HEAD_VAR1 = 1
 BINDING_FREE_VAR_OFFSET = 2
 
 
+def _build_csr_offsets(uniq: Tensor, cnts: Tensor, size: int,
+                       device) -> Tensor:
+    """CSR segment offsets over ``size`` predicates.
+
+    ``offsets[p+1] - offsets[p]`` is the count of predicate ``p`` (0 for
+    absent predicates, via the trailing ``cummax``). ``uniq``/``cnts`` come
+    from a ``unique``/``unique_consecutive`` over the sorted head-pred column.
+    """
+    seg = torch.zeros(size + 1, dtype=torch.long, device=device)
+    cum = cnts.cumsum(0)
+    mask = uniq < size
+    seg[uniq[mask] + 1] = cum[mask]
+    return seg.cummax(0).values
+
+
+def _atom_enum_meta(bp: dict, known: set) -> dict:
+    """Enum meta for one body atom given the currently-known bindings.
+
+    Mutates ``known`` to add the single free variable this atom introduces
+    (if exactly one of its two args is still unknown). Returns the meta
+    dict consumed by ``RuleIndexEnum``. An atom with neither arg known
+    (only reachable as a forced anchor) yields the inert ``introduces_fv=-1``
+    meta and leaves ``known`` unchanged.
+    """
+    b0, b1 = bp["arg0_binding"], bp["arg1_binding"]
+    if b0 in known and b1 in known:
+        return {"introduces_fv": -1, "enum_bound_src": 0,
+                "enum_direction": 0, "enum_pred": bp["pred_idx"]}
+    if b0 in known:
+        known.add(b1)
+        return {"introduces_fv": b1 - BINDING_FREE_VAR_OFFSET,
+                "enum_bound_src": b0, "enum_direction": 0,
+                "enum_pred": bp["pred_idx"]}
+    if b1 in known:
+        known.add(b0)
+        return {"introduces_fv": b0 - BINDING_FREE_VAR_OFFSET,
+                "enum_bound_src": b1, "enum_direction": 1,
+                "enum_pred": bp["pred_idx"]}
+    return {"introduces_fv": -1, "enum_bound_src": 0,
+            "enum_direction": 0, "enum_pred": bp["pred_idx"]}
+
+
+def _greedy_body_order(body_patterns: List[dict], remaining: List[int],
+                       known: set, order: List[int],
+                       meta: List[dict]) -> None:
+    """Greedy dependency reorder of the remaining body atoms.
+
+    Repeatedly appends the first atom with at least one already-known
+    binding (recording its enum meta and growing ``known``); when no
+    remaining atom is reachable, appends the rest with inert meta. Mutates
+    ``remaining`` / ``order`` / ``meta`` / ``known`` in place.
+    """
+    while remaining:
+        found = False
+        for idx in remaining:
+            bp = body_patterns[idx]
+            if bp["arg0_binding"] in known or bp["arg1_binding"] in known:
+                order.append(idx)
+                meta.append(_atom_enum_meta(bp, known))
+                remaining.remove(idx)
+                found = True
+                break
+        if not found:
+            for idx in remaining:
+                order.append(idx)
+                meta.append(_atom_enum_meta(body_patterns[idx], known))
+            break
+
+
 # ======================================================================
 # RuleIndex — base: sorted storage + segment lookup
 # ======================================================================
@@ -79,11 +148,7 @@ class RuleIndex(nn.Module):
         num_pred = (predicate_no + 1 if predicate_no is not None
                     else int(preds.max().item()) + 2)
         # CSR offsets: offsets[p] = start, offsets[p+1] - offsets[p] = count
-        seg_offsets = torch.zeros(num_pred + 1, dtype=torch.long, device=device)
-        cum = cnts.cumsum(0)
-        mask = uniq < num_pred
-        seg_offsets[uniq[mask] + 1] = cum[mask]
-        seg_offsets = seg_offsets.cummax(0).values
+        seg_offsets = _build_csr_offsets(uniq, cnts, num_pred, device)
 
         self._max_rule_pairs = int(cnts.max().item())
 
@@ -268,40 +333,9 @@ class RulePattern:
     def _reorder_body(self) -> None:
         known = {BINDING_HEAD_VAR0, BINDING_HEAD_VAR1}
         remaining = list(range(self.num_body))
-        order, meta = [], []
-
-        while remaining:
-            found = False
-            for idx in remaining:
-                bp = self.body_patterns[idx]
-                b0, b1 = bp["arg0_binding"], bp["arg1_binding"]
-                if b0 in known or b1 in known:
-                    if b0 in known and b1 in known:
-                        m = {"introduces_fv": -1, "enum_bound_src": 0,
-                             "enum_direction": 0, "enum_pred": bp["pred_idx"]}
-                    elif b0 in known:
-                        m = {"introduces_fv": b1 - BINDING_FREE_VAR_OFFSET,
-                             "enum_bound_src": b0, "enum_direction": 0,
-                             "enum_pred": bp["pred_idx"]}
-                        known.add(b1)
-                    else:
-                        m = {"introduces_fv": b0 - BINDING_FREE_VAR_OFFSET,
-                             "enum_bound_src": b1, "enum_direction": 1,
-                             "enum_pred": bp["pred_idx"]}
-                        known.add(b0)
-                    order.append(idx)
-                    meta.append(m)
-                    remaining.remove(idx)
-                    found = True
-                    break
-            if not found:
-                for idx in remaining:
-                    order.append(idx)
-                    meta.append({"introduces_fv": -1, "enum_bound_src": 0,
-                                 "enum_direction": 0,
-                                 "enum_pred": self.body_patterns[idx]["pred_idx"]})
-                break
-
+        order: List[int] = []
+        meta: List[dict] = []
+        _greedy_body_order(self.body_patterns, remaining, known, order, meta)
         self.enum_meta = meta
         self.body_patterns = [self.body_patterns[i] for i in order]
         self.body_pred_indices = [self.body_pred_indices[i] for i in order]
@@ -325,61 +359,12 @@ class RulePattern:
         order: List[int] = []
         meta: List[dict] = []
 
-        # ── Force the specified atom first ──
-        bp = self._orig_body_patterns[forced_first]
-        b0, b1 = bp["arg0_binding"], bp["arg1_binding"]
-        if b0 in known and b1 in known:
-            m = {"introduces_fv": -1, "enum_bound_src": 0,
-                 "enum_direction": 0, "enum_pred": bp["pred_idx"]}
-        elif b0 in known:
-            m = {"introduces_fv": b1 - BINDING_FREE_VAR_OFFSET,
-                 "enum_bound_src": b0, "enum_direction": 0,
-                 "enum_pred": bp["pred_idx"]}
-            known.add(b1)
-        elif b1 in known:
-            m = {"introduces_fv": b0 - BINDING_FREE_VAR_OFFSET,
-                 "enum_bound_src": b1, "enum_direction": 1,
-                 "enum_pred": bp["pred_idx"]}
-            known.add(b0)
-        else:
-            m = {"introduces_fv": -1, "enum_bound_src": 0,
-                 "enum_direction": 0, "enum_pred": bp["pred_idx"]}
+        # Force the specified atom first, then greedy-fill the rest with the
+        # same dependency logic as _reorder_body.
         order.append(forced_first)
-        meta.append(m)
+        meta.append(_atom_enum_meta(self._orig_body_patterns[forced_first], known))
         remaining.remove(forced_first)
-
-        # ── Greedy for the rest (same logic as _reorder_body) ──
-        while remaining:
-            found = False
-            for idx in remaining:
-                bp = self._orig_body_patterns[idx]
-                b0, b1 = bp["arg0_binding"], bp["arg1_binding"]
-                if b0 in known or b1 in known:
-                    if b0 in known and b1 in known:
-                        m = {"introduces_fv": -1, "enum_bound_src": 0,
-                             "enum_direction": 0, "enum_pred": bp["pred_idx"]}
-                    elif b0 in known:
-                        m = {"introduces_fv": b1 - BINDING_FREE_VAR_OFFSET,
-                             "enum_bound_src": b0, "enum_direction": 0,
-                             "enum_pred": bp["pred_idx"]}
-                        known.add(b1)
-                    else:
-                        m = {"introduces_fv": b0 - BINDING_FREE_VAR_OFFSET,
-                             "enum_bound_src": b1, "enum_direction": 1,
-                             "enum_pred": bp["pred_idx"]}
-                        known.add(b0)
-                    order.append(idx)
-                    meta.append(m)
-                    remaining.remove(idx)
-                    found = True
-                    break
-            if not found:
-                for idx in remaining:
-                    order.append(idx)
-                    meta.append({"introduces_fv": -1, "enum_bound_src": 0,
-                                 "enum_direction": 0,
-                                 "enum_pred": self._orig_body_patterns[idx]["pred_idx"]})
-                break
+        _greedy_body_order(self._orig_body_patterns, remaining, known, order, meta)
 
         return (
             [self._orig_body_patterns[i] for i in order],
@@ -599,12 +584,7 @@ class RuleIndexEnum(RuleIndex):
             sorted_hp = expanded_head_preds[sort_order]
             uniq_s, cnts_s = torch.unique_consecutive(
                 sorted_hp, return_counts=True)
-            seg_offsets_exp = torch.zeros(P + 1, dtype=torch.long,
-                                         device=device)
-            cum = cnts_s.cumsum(0)
-            mask = uniq_s < P
-            seg_offsets_exp[uniq_s[mask] + 1] = cum[mask]
-            seg_offsets_exp = seg_offsets_exp.cummax(0).values
+            seg_offsets_exp = _build_csr_offsets(uniq_s, cnts_s, P, device)
 
             all_preds_t = torch.arange(P, device=device).clamp(
                 0, seg_offsets_exp.shape[0] - 2)
