@@ -57,6 +57,31 @@ def _parse_triples(path: Path) -> List[Tuple[str, str, str]]:
     return triples
 
 
+def _parse_atom(s: str) -> Optional[Tuple[str, str, str]]:
+    """Parse a single ``pred(a, b)`` atom into ``(pred, a, b)`` (or None)."""
+    m = _ATOM_RE.search(s.strip())
+    if not m:
+        return None
+    return (m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
+
+
+def _parse_body_atoms(body_str: str) -> List[Tuple[str, str, str]]:
+    """Parse a comma-separated rule body into ``(pred, a, b)`` atoms.
+
+    Splits on ``),`` (re-appending the stripped ``)``) and matches each
+    fragment with ``_ATOM_RE``; unparseable fragments are skipped.
+    """
+    atoms: List[Tuple[str, str, str]] = []
+    for b in body_str.split("),"):
+        b = b.strip()
+        if not b.endswith(")"):
+            b += ")"
+        atom = _parse_atom(b)
+        if atom is not None:
+            atoms.append(atom)
+    return atoms
+
+
 def _parse_rules_arrow(
     path: Path,
 ) -> List[Tuple[Tuple[str, str, str], List[Tuple[str, str, str]]]]:
@@ -74,20 +99,10 @@ def _parse_rules_arrow(
             if "->" not in rest:
                 continue
             body_str, head_str = rest.rsplit("->", 1)
-            head_m = _ATOM_RE.search(head_str.strip())
-            if not head_m:
+            head = _parse_atom(head_str)
+            if head is None:
                 continue
-            head = (head_m.group(1).strip(), head_m.group(2).strip(),
-                    head_m.group(3).strip())
-            body_atoms: list[tuple[str, str, str]] = []
-            for b in body_str.split("),"):
-                b = b.strip()
-                if not b.endswith(")"):
-                    b += ")"
-                m = _ATOM_RE.search(b)
-                if m:
-                    body_atoms.append((m.group(1).strip(), m.group(2).strip(),
-                                       m.group(3).strip()))
+            body_atoms = _parse_body_atoms(body_str)
             if body_atoms:
                 rules.append((head, body_atoms))
     return rules
@@ -106,20 +121,10 @@ def _parse_rules_prolog(
             if ":-" not in line:
                 continue
             head_str, body_str = line.split(":-", 1)
-            head_m = _ATOM_RE.search(head_str.strip())
-            if not head_m:
+            head = _parse_atom(head_str)
+            if head is None:
                 continue
-            head = (head_m.group(1).strip(), head_m.group(2).strip(),
-                    head_m.group(3).strip())
-            body_atoms: list[tuple[str, str, str]] = []
-            for b in body_str.split("),"):
-                b = b.strip()
-                if not b.endswith(")"):
-                    b += ")"
-                m = _ATOM_RE.search(b)
-                if m:
-                    body_atoms.append((m.group(1).strip(), m.group(2).strip(),
-                                       m.group(3).strip()))
+            body_atoms = _parse_body_atoms(body_str)
             if body_atoms:
                 rules.append((head, body_atoms))
     return rules
