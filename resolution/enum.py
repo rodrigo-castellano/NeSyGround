@@ -926,6 +926,59 @@ def _extend_with_extra_fvs(
     return source, combined_mask, G_final
 
 
+def _cartesian_expand_one_fv(
+    B: int, K_r: int, query_subjs: Tensor, query_objs: Tensor, fact_index,
+    ep: Tensor, eb: Tensor, ed: Tensor, ev: Tensor,
+    all_cands: list, all_masks: list, G_current: int,
+    k_cap: Optional[int],
+) -> Tuple[list, list, int]:
+    """Enumerate one free variable's candidates and Cartesian-expand the
+    running ``(all_cands, all_masks)`` by it (interleaved layout so a later
+    topk picks diverse fv0 candidates before repeats).
+
+    Shared by the dense (``_enumerate_cartesian``) and flat
+    (``_enumerate_cartesian_flat``) paths; ``k_cap`` caps ``K_use`` to ``K_v``
+    on the dense path and is ``None`` (use the full ``K_f``) on the flat path.
+    Returns the grown ``(all_cands, all_masks, G_new)``.
+    """
+    # Build source for the bound-value lookup: [qs, qo, cand_0, cand_1, ...]
+    qs_exp = query_subjs.view(B, 1, 1).expand(B, K_r, G_current)
+    qo_exp = query_objs.view(B, 1, 1).expand(B, K_r, G_current)
+    src = torch.stack([qs_exp, qo_exp] + all_cands, dim=3)  # [B,K_r,G_current,2+]
+    W_cur = src.size(3)
+    eb_idx = eb.clamp(max=W_cur - 1).view(B, K_r, 1, 1).expand(
+        B, K_r, G_current, 1)
+    bound_vals = src.gather(3, eb_idx).squeeze(3)           # [B, K_r, G_current]
+
+    flat_pred = ep.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
+    flat_bound = bound_vals.reshape(-1)
+    flat_dir = ed.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
+
+    new_cands, new_mask = fact_index.enumerate(flat_pred, flat_bound, flat_dir)
+    K_fi = new_cands.size(1)
+    K_use = K_fi if k_cap is None else min(K_fi, k_cap)
+
+    new_cands = new_cands[:, :K_use].reshape(B, K_r, G_current, K_use)
+    new_mask = new_mask[:, :K_use].reshape(B, K_r, G_current, K_use)
+    # Mask rules that don't have this free variable
+    new_mask = new_mask & ev.view(B, K_r, 1, 1)
+
+    G_new = G_current * K_use
+    # Previous candidates: repeat each K_use times, interleaved.
+    expanded_cands = [
+        prev.unsqueeze(3).expand(B, K_r, G_current, K_use
+                                 ).transpose(2, 3).reshape(B, K_r, G_new)
+        for prev in all_cands]
+    expanded_masks = [
+        prev_m.unsqueeze(3).expand(B, K_r, G_current, K_use
+                                   ).transpose(2, 3).reshape(B, K_r, G_new)
+        for prev_m in all_masks]
+    # New candidates: each repeated G_current times (one per prev slot).
+    expanded_cands.append(new_cands.transpose(2, 3).reshape(B, K_r, G_new))
+    expanded_masks.append(new_mask.transpose(2, 3).reshape(B, K_r, G_new))
+    return expanded_cands, expanded_masks, G_new
+
+
 def _enumerate_cartesian(
     B: int, K_r: int,
     query_subjs: Tensor,     # [B]
@@ -987,63 +1040,10 @@ def _enumerate_cartesian(
         ed = fv_dir_q[:, :, fv_idx]     # [B, K_r]
         ev = fv_valid_q[:, :, fv_idx]   # [B, K_r]
 
-        # Build source for bound-value lookup: [qs, qo, cand_0, cand_1, ...]
-        qs_exp = query_subjs.view(B, 1, 1).expand(B, K_r, G_current)
-        qo_exp = query_objs.view(B, 1, 1).expand(B, K_r, G_current)
-        src_parts = [qs_exp, qo_exp] + all_cands   # each [B, K_r, G_current]
-        src = torch.stack(src_parts, dim=3)         # [B, K_r, G_current, 2+fv_idx]
-
-        # Gather bound values: eb indexes into the source stack
-        W_cur = src.size(3)
-        eb_idx = eb.clamp(max=W_cur - 1).view(B, K_r, 1, 1).expand(
-            B, K_r, G_current, 1)
-        bound_vals = src.gather(3, eb_idx).squeeze(3)   # [B, K_r, G_current]
-
-        # Flatten for fact_index.enumerate
-        flat_pred = ep.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
-        flat_bound = bound_vals.reshape(-1)
-        flat_dir = ed.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
-
-        new_cands, new_mask = fact_index.enumerate(
-            flat_pred, flat_bound, flat_dir)
-        K_fi = new_cands.size(1)
-        K_use = min(K_fi, K_v)
-
-        new_cands = new_cands[:, :K_use].reshape(B, K_r, G_current, K_use)
-        new_mask = new_mask[:, :K_use].reshape(B, K_r, G_current, K_use)
-
-        # Mask rules that don't have this free variable
-        new_mask = new_mask & ev.view(B, K_r, 1, 1)
-
-        # Cartesian expansion: G_current × K_use → G_new
-        G_new = G_current * K_use
-
-        # Cartesian expansion with interleaved layout so that topk
-        # naturally picks diverse fv0 candidates before repeats.
-        # Layout: [fv0[0]*fv1[0], fv0[1]*fv1[0], ..., fv0[G-1]*fv1[0],
-        #          fv0[0]*fv1[1], fv0[1]*fv1[1], ...]
-        # Previous candidates: repeat each K_use times, interleaved
-        expanded_cands = []
-        for prev in all_cands:
-            # [B,K_r,G_current] → [B,K_r,G_current,K_use] → transpose → [B,K_r,K_use,G_current] → flat
-            expanded_cands.append(
-                prev.unsqueeze(3).expand(B, K_r, G_current, K_use
-                                         ).transpose(2, 3).reshape(B, K_r, G_new))
-        expanded_masks = []
-        for prev_m in all_masks:
-            expanded_masks.append(
-                prev_m.unsqueeze(3).expand(B, K_r, G_current, K_use
-                                           ).transpose(2, 3).reshape(B, K_r, G_new))
-
-        # New candidates: each repeated G_current times (one per prev slot)
-        expanded_cands.append(
-            new_cands.transpose(2, 3).reshape(B, K_r, G_new))
-        expanded_masks.append(
-            new_mask.transpose(2, 3).reshape(B, K_r, G_new))
-
-        all_cands = expanded_cands
-        all_masks = expanded_masks
-        G_current = G_new
+        # Enumerate this fv + Cartesian-expand (dense: cap K_use to K_v).
+        all_cands, all_masks, G_current = _cartesian_expand_one_fv(
+            B, K_r, query_subjs, query_objs, fact_index,
+            ep, eb, ed, ev, all_cands, all_masks, G_current, K_v)
 
         # Cap G_current to G_cap via topk (keeps memory bounded).
         # For 1-free-var rules: G_current = K_v ≤ G_cap (no cap needed).
@@ -1677,50 +1677,12 @@ def _enumerate_cartesian_flat(
         ed = fv_dir_q[:, :, fv_idx]
         ev = fv_valid_q[:, :, fv_idx]
 
-        qs_exp = query_subjs.view(B, 1, 1).expand(B, K_r, G_current)
-        qo_exp = query_objs.view(B, 1, 1).expand(B, K_r, G_current)
-        src_parts = [qs_exp, qo_exp] + all_cands
-        src = torch.stack(src_parts, dim=3)
-
-        W_cur = src.size(3)
-        eb_idx = eb.clamp(max=W_cur - 1).view(B, K_r, 1, 1).expand(B, K_r, G_current, 1)
-        bound_vals = src.gather(3, eb_idx).squeeze(3)
-
-        flat_pred = ep.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
-        flat_bound = bound_vals.reshape(-1)
-        flat_dir = ed.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
-
-        new_cands, new_mask = fact_index.enumerate(flat_pred, flat_bound, flat_dir)
-        K_fi = new_cands.size(1)
-        K_use = K_fi  # no cap — use full K_f
-
-        new_cands = new_cands[:, :K_use].reshape(B, K_r, G_current, K_use)
-        new_mask = new_mask[:, :K_use].reshape(B, K_r, G_current, K_use)
-        new_mask = new_mask & ev.view(B, K_r, 1, 1)
-
-        G_new = G_current * K_use
-
-        # Interleaved Cartesian expansion
-        expanded_cands = []
-        for prev in all_cands:
-            expanded_cands.append(
-                prev.unsqueeze(3).expand(B, K_r, G_current, K_use
-                                         ).transpose(2, 3).reshape(B, K_r, G_new))
-        expanded_masks = []
-        for prev_m in all_masks:
-            expanded_masks.append(
-                prev_m.unsqueeze(3).expand(B, K_r, G_current, K_use
-                                           ).transpose(2, 3).reshape(B, K_r, G_new))
-
-        expanded_cands.append(new_cands.transpose(2, 3).reshape(B, K_r, G_new))
-        expanded_masks.append(new_mask.transpose(2, 3).reshape(B, K_r, G_new))
-
-        all_cands = expanded_cands
-        all_masks = expanded_masks
-        G_current = G_new
-
-        # No dedup in flat path — keep all entries including duplicates.
-        # The flat→dense conversion handles dedup via the K_cap topk.
+        # Enumerate this fv + Cartesian-expand (flat: no cap, use full K_f).
+        # No dedup in the flat path — keep all entries including duplicates;
+        # the flat→dense conversion handles dedup via the K_cap topk.
+        all_cands, all_masks, G_current = _cartesian_expand_one_fv(
+            B, K_r, query_subjs, query_objs, fact_index,
+            ep, eb, ed, ev, all_cands, all_masks, G_current, None)
 
     # Combined mask: valid if all RELEVANT free vars have valid candidates.
     # Seed from the first free-var term instead of a ``torch.ones`` alloc +
