@@ -243,6 +243,13 @@ def run_torch_bc(kb, queries: torch.Tensor, qmask: torch.Tensor,
         **grounder_kwargs)
     # Warmup (first call may allocate buffers); timed call is the second.
     fwd_kwargs = {"batch_size": bs} if bs > 0 else {}
+    # Outer-compile grounders (sld / rtf + compile_mode) require an
+    # explicit positive ``batch_size`` so the captured CUDA graph sees a
+    # stable per-chunk shape (guard in ``bc.forward.forward``). On small
+    # datasets ``_batch_size_for`` returns 0 ("full batch") and passes
+    # nothing — pass the full query count as a single chunk to satisfy it.
+    if getattr(g, "_uses_outer_compile", False) and "batch_size" not in fwd_kwargs:
+        fwd_kwargs["batch_size"] = int(queries.size(0))
     with torch.no_grad():
         _ = g(queries, qmask, **fwd_kwargs)
     _sync(queries.device)

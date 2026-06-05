@@ -120,9 +120,9 @@ def build_torch_grounder(
             ``collect_*=True`` is the right default for both count
             metrics and FC-closure-driven filtering.
     """
-    if kind == "SLD":
+    if kind in ("SLD", "RTF"):
         return BCGrounder(
-            kb, resolution="sld", filter="none",
+            kb, resolution="sld" if kind == "SLD" else "rtf", filter="none",
             depth=cfg["depth"],
             max_total_groundings=max_total_groundings,
             max_derived_per_state=max_derived_per_state,
