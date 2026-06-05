@@ -33,6 +33,64 @@ from torch import Tensor
 from grounder.types import FlatResolvedChildren, RuleGroundings
 
 
+def _binding_tables(grounder, num_rules: int, M: int, pad: int, device):
+    """Precompute (once, cached) the variable-binding constraints per rule.
+
+    A recorded firing ``(rule r, head Ha, body B[M])`` is a VALID rule application
+    iff there is ONE substitution making the rule's head = Ha and its body = B. We
+    encode that as: a slot vector ``[head_arg0, head_arg1, body0_arg0, body0_arg1,
+    ...]`` over entities, where every two slots holding the SAME rule variable must
+    carry the same entity. ``head`` slots are included, so this also enforces that
+    the recorded head is exactly the one the body entails — catching the all_anchors
+    leak where a body grounding for one head is stamped with the query goal's head.
+
+    Returns tensors keyed by orig rule index:
+      head_pred [R]      — rule head predicate
+      body_pred [R, M]   — rule body predicates in canonical order (pad past len)
+      slot_active [R, Nslot] bool — slot participates (head always; body atom m iff m<len)
+      canon_src  [R, Nslot] long  — first active slot sharing this slot's variable
+    Nslot = 2 + 2*M.
+    """
+    ri = grounder.kb.rule_index
+    heads = ri.rules_heads.to("cpu")        # [R, 3] (pred, v0, v1)
+    bodies = ri.rules_bodies.to("cpu")      # [R, M, 3]
+    lens = ri.rule_lens.to("cpu")
+    Nslot = 2 + 2 * M
+    head_pred = torch.full((num_rules,), pad, dtype=torch.long)
+    body_pred = torch.full((num_rules, M), pad, dtype=torch.long)
+    slot_active = torch.zeros((num_rules, Nslot), dtype=torch.bool)
+    canon_src = torch.arange(Nslot).unsqueeze(0).repeat(num_rules, 1).long()
+    for r in range(num_rules):
+        L = int(lens[r])
+        head_pred[r] = int(heads[r, 0])
+        # slot variable ids; inactive slots get a unique sentinel so they never match.
+        var = [-(s + 1) for s in range(Nslot)]
+        var[0] = int(heads[r, 1]); var[1] = int(heads[r, 2])
+        slot_active[r, 0] = slot_active[r, 1] = True
+        for m in range(M):
+            body_pred[r, m] = int(bodies[r, m, 0]) if m < L else pad
+            if m < L:
+                var[2 + 2 * m] = int(bodies[r, m, 1])
+                var[3 + 2 * m] = int(bodies[r, m, 2])
+                slot_active[r, 2 + 2 * m] = slot_active[r, 3 + 2 * m] = True
+        # canon_src[slot] = first active slot carrying the same variable.
+        first = {}
+        for s in range(Nslot):
+            if not bool(slot_active[r, s]):
+                continue
+            v = var[s]
+            if v in first:
+                canon_src[r, s] = first[v]
+            else:
+                first[v] = s
+                canon_src[r, s] = s
+    return {
+        "num_rules": num_rules, "M": M,
+        "head_pred": head_pred.to(device), "body_pred": body_pred.to(device),
+        "slot_active": slot_active.to(device), "canon_src": canon_src.to(device),
+    }
+
+
 def reset_accumulator(grounder) -> None:
     """Reset per-step accumulator at the start of a BFS forward pass."""
     grounder._considered_acc_rule: List[Tensor] = []
@@ -180,104 +238,91 @@ def finalize(grounder) -> Optional[RuleGroundings]:
     T = rule_idx.size(0)
     M = body.size(1)
 
-    # Encode (rule, head, body) as a row and dedup. Hash-based 1D
-    # unique replaces ``torch.unique(combined, dim=0)`` (slow per-row
-    # sort on a (1 + 3 + 3M)-wide int64 row): polynomial hash over
-    # column projections + 1D ``unique``. The same collision-rarity
-    # trade-off the rest of this module's ``atom_hash`` already accepts.
-    from grounder.groundings import atom_hash, _HASH_P0
+    # COLLISION-FREE dedup of (rule, head, body) firings + atom_table.
+    # The legacy ``atom_hash`` (three near-equal primes) collides distinct atoms on
+    # large accumulators, which (a) merges unrelated firings and (b) corrupts the
+    # atom_table so ``atom_table[head_pool_idx]`` reads back ANOTHER atom — a firing
+    # recorded under one rule reports a different rule's head predicate. Both are exact
+    # set operations, so do them exactly: dedup ATOMS by an injective int64 key (one
+    # atom fits int64), then dedup ROWS by their (rule, atom-index) tuple via an exact
+    # ``unique(dim=0)`` over a narrow (M+2)-column tensor (no overflow, no collisions).
     rule_idx_safe = torch.where(
-        rule_idx < 0, torch.full_like(rule_idx, num_rules), rule_idx)
-    combined = torch.cat([
-        rule_idx_safe.unsqueeze(-1),
-        head.long(),
-        body.long().reshape(T, M * 3),
-    ], dim=-1)
-    head_h = atom_hash(head)                                    # [T]
-    body_h = atom_hash(body.long())                             # [T, M]
-    P = _HASH_P0
-    row_hash = rule_idx_safe.long() * P + head_h
-    for m in range(M):
-        row_hash = row_hash * P + body_h[:, m]
-    uniq_row_h, inv_row = torch.unique(row_hash, return_inverse=True)
-    n_uniq = uniq_row_h.size(0)
-    # Deterministic representative per hash group. ``uniq[inv_row] = combined``
-    # is a last-write-wins scatter: single-threaded the highest-index row per
-    # group wins, but the CPU multi-thread scatter races, so the surviving
-    # row (hence the grounding set) varied run-to-run once depth>=3 produced
-    # collisions. ``scatter_reduce(amax)`` over the row index picks the same
-    # highest-index representative deterministically, matching single-thread.
-    T_rows = combined.size(0)
-    rep_idx = torch.zeros(n_uniq, dtype=torch.long, device=combined.device)
-    rep_idx.scatter_reduce_(
-        0, inv_row, torch.arange(T_rows, device=combined.device),
-        reduce="amax", include_self=False)
-    uniq = combined[rep_idx]
-    u_rule = uniq[:, 0].long()
-    u_head = uniq[:, 1:4].long()
-    u_body = uniq[:, 4:].reshape(-1, M, 3).long()
-
-    # Build atom_table = unique union of head + body atoms. 1D hash
-    # dedup over (p, a0, a1) triples — same speed-up vs ``unique_dim``.
-    all_atoms = torch.cat([u_head.unsqueeze(1), u_body], dim=1)   # [U, M+1, 3]
-    all_atoms_flat = all_atoms.reshape(-1, 3)
-    atom_h = atom_hash(all_atoms_flat)                            # [U*(M+1)]
-    uniq_atom_h, inverse = torch.unique(atom_h, return_inverse=True)
-    n_uniq_atom = uniq_atom_h.size(0)
-    # Same deterministic-representative fix as the row dedup above:
-    # ``atom_table[inverse] = all_atoms_flat`` races across CPU threads.
-    n_at = all_atoms_flat.size(0)
-    rep_at = torch.zeros(n_uniq_atom, dtype=torch.long, device=all_atoms_flat.device)
+        rule_idx < 0, torch.full_like(rule_idx, num_rules), rule_idx).long()
+    all_atoms_flat = torch.cat(
+        [head.long().unsqueeze(1), body.long()], dim=1).reshape(-1, 3)  # [T*(M+1), 3]
+    abase = int(all_atoms_flat.max().item()) + 1 if all_atoms_flat.numel() else 1
+    akey = (all_atoms_flat[:, 0] * abase + all_atoms_flat[:, 1]) * abase \
+        + all_atoms_flat[:, 2]
+    uniq_akey, ainv = torch.unique(akey, return_inverse=True)
+    n_atoms = uniq_akey.size(0)
+    rep_at = torch.zeros(n_atoms, dtype=torch.long, device=akey.device)
     rep_at.scatter_reduce_(
-        0, inverse, torch.arange(n_at, device=all_atoms_flat.device),
+        0, ainv, torch.arange(akey.size(0), device=akey.device),
         reduce="amax", include_self=False)
-    atom_table = all_atoms_flat[rep_at]
-    inverse = inverse.reshape(-1, M + 1)
-    head_atom_idx = inverse[:, 0]
-    body_atom_idx = inverse[:, 1:]
-
-    # Binding-consistency guard (eval-only, env-gated ``GROUNDER_BINDING_GUARD``,
-    # default OFF -> byte-identical). The ``all_anchors`` flat/dense body-fill
-    # can leak cross-variant / padded-K_r candidates recorded under the wrong
-    # rule (rule_idx clamped via ``_variant_to_orig``), producing firings whose
-    # body predicates don't match the rule template — e.g. rule0
-    # ``aunt<-aunt,brother`` (body-pred multiset {1,2}) getting a body
-    # [aunt, father] ({1,4}) or [aunt, aunt] ({1,1}). Such impossible firings
-    # sometimes have all-fact bodies, seeding spurious derivations that inflate
-    # the exhaustive-eval candidate set ~13x and suppress MRR. Drop any firing
-    # whose sorted body-predicate multiset != its rule's template multiset; a
-    # correct rule application can never fail this, so natural-query grounding
-    # is unchanged. Runs PRE-prune so broken seeds can't chain through fp_batch.
-    import os as _os
-    if _os.environ.get("GROUNDER_BINDING_GUARD") == "1":
-        ri = grounder.kb.rule_index
-        src_preds = ri.rules_bodies_sorted[:, :, 0].long().to(u_rule.device)  # [R_pos, Bmax]
-        Bmax = src_preds.size(1)
-        if Bmax < M:
-            src_preds = torch.cat([
-                src_preds,
-                torch.full((src_preds.size(0), M - Bmax), pad,
-                           dtype=torch.long, device=u_rule.device)], dim=1)
-        elif Bmax > M:
-            src_preds = src_preds[:, :M]
-        templ = torch.full((num_rules, M), pad, dtype=torch.long,
-                           device=u_rule.device)
-        templ[ri.rules_idx_sorted.long().to(u_rule.device)] = src_preds
-        templ_sorted = templ.sort(dim=1).values                      # [num_rules, M]
-        actual = atom_table[body_atom_idx][..., 0].long()            # [U, M]
-        actual_sorted = actual.sort(dim=1).values
-        exp = templ_sorted[u_rule.clamp(max=num_rules - 1)]          # [U, M]
-        guard_ok = (actual_sorted == exp).all(dim=1)                 # [U]
+    atom_table = all_atoms_flat[rep_at]                               # [n_atoms, 3]
+    ainv = ainv.reshape(T, M + 1)                                    # [T, M+1] atom indices
+    # Row = (rule, head_atom_idx, body_atom_idx[0..M-1]); dedup over small int indices.
+    # Pack injectively into one int64 (base > every column) so a FAST 1D unique replaces
+    # the O(T·log T) lexicographic ``unique(dim=0)`` row-sort (which blew BC13 to ~40s).
+    # Indices are < n_atoms and rule < num_rules+1, so the pack fits int64 whenever
+    # ``A**(M+1) * (num_rules+1) < 2**63``; otherwise fall back to the exact row-sort.
+    row = torch.cat([rule_idx_safe.unsqueeze(1), ainv], dim=1)        # [T, M+2]
+    A = max(int(num_rules) + 1, int(n_atoms))
+    if A ** (M + 1) * (int(num_rules) + 1) < (1 << 62):
+        key = rule_idx_safe.clone()
+        for c in range(M + 1):
+            key = key * A + ainv[:, c]
+        _, inv_row = torch.unique(key, return_inverse=True)
+        n_uniq = int(inv_row.max().item()) + 1 if inv_row.numel() else 0
+        rep = torch.zeros(n_uniq, dtype=torch.long, device=row.device)
+        rep.scatter_reduce_(0, inv_row, torch.arange(T, device=row.device),
+                            reduce="amax", include_self=False)
+        uniq_row = row[rep]
     else:
-        guard_ok = None
+        uniq_row, _ = torch.unique(row, dim=0, return_inverse=True)
+    u_rule = uniq_row[:, 0].long()
+    head_atom_idx = uniq_row[:, 1].long()                            # [U] -> atom_table
+    body_atom_idx = uniq_row[:, 2:].long()                          # [U, M] -> atom_table
+    u_head = atom_table[head_atom_idx]                              # [U, 3]
+    u_body = atom_table[body_atom_idx]                             # [U, M, 3]
+
+    # Binding-consistency: keep ONLY firings that are valid rule applications.
+    # The ``all_anchors`` enumeration can stamp a body grounding for one head with the
+    # QUERY goal's head (``_extract_considered_rows`` gathers the head from the selected
+    # goal, trusting resolution to be head-consistent — which the anchored variants are
+    # not). Result: firings like ``nephew(766,887) <- aunt(8,39), brother(86,39)`` whose
+    # body actually entails a DIFFERENT head. keras-ns never emits these. A firing is a
+    # valid application iff the rule's head predicate + body predicates match AND every
+    # rule variable binds to a single entity across all its occurrences (head slots
+    # included), i.e. the recorded head is the one the body entails. This is the grounder
+    # being correct by construction; there is no opt-out. Runs PRE-prune so a leaked seed
+    # can't chain. Correct applications are untouched (head==entailed, vars consistent),
+    # so gold-query counts / keras parity are preserved.
+    dev = u_rule.device
+    bt = getattr(grounder, "_binding_tables_cache", None)
+    if bt is None or bt["num_rules"] != num_rules or bt["M"] != M:
+        bt = _binding_tables(grounder, num_rules, M, pad, dev)
+        grounder._binding_tables_cache = bt
+    rule_c = u_rule.clamp(min=0, max=num_rules - 1)
+    # slot entity vector [U, 2+2M]: head args then body args, canonical rule order.
+    ent = torch.cat([u_head[:, 1:3], u_body[..., 1:].reshape(-1, 2 * M)], dim=1)
+    # predicate match (head + each body slot; inactive body slots are pad on both sides)
+    pred_ok = (u_head[:, 0] == bt["head_pred"][rule_c])
+    pred_ok = pred_ok & (u_body[..., 0] == bt["body_pred"][rule_c]).all(dim=1)
+    # variable consistency: every active slot must equal its canonical (first) occurrence,
+    # i.e. the recorded head is exactly the one the body entails under this rule.
+    cs = bt["canon_src"][rule_c]                                       # [U, Nslot]
+    sa = bt["slot_active"][rule_c]                                     # [U, Nslot]
+    bind_ok = ((ent == ent.gather(1, cs)) | ~sa).all(dim=1)           # [U]
+    guard_keep = pred_ok & bind_ok
 
     # Sort firings by rule_idx so each rule's slice in the flat tensors
     # is contiguous. Drop the sentinel ``rule_idx == num_rules``: those
     # are the invalid-rule rows from the dedup pipeline. ``bincount``
     # gives per-rule sizes; cumsum gives the flat offset table.
     keep = u_rule < num_rules
-    if guard_ok is not None:
-        keep = keep & guard_ok
+    if guard_keep is not None:
+        keep = keep & guard_keep
     u_rule_keep = u_rule[keep]
     head_atom_keep = head_atom_idx[keep]
     body_atom_keep = body_atom_idx[keep]

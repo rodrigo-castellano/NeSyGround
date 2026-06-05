@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-05-15T09:12:05+00:00",
+  "generated_at": "2026-06-05T05:45:41+00:00",
   "datasets": [
     "ablation_d2",
     "ablation_d3",
@@ -34,7 +34,7 @@
         "considered_rules": 0,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 1.34,
+        "ms": 1.42,
         "ok": true,
         "error": null,
         "count": null
@@ -43,7 +43,7 @@
         "considered_rules": 118,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 4.4,
+        "ms": 4.66,
         "ok": true,
         "error": null,
         "count": null
@@ -52,52 +52,52 @@
         "considered_rules": 377,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 7.04,
+        "ms": 7.21,
         "ok": true,
         "error": null,
         "count": null
       },
       "SLD:d1": {
-        "considered_rules": 25,
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 7.07,
-        "ok": true,
-        "error": null,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
         "count": 0
       },
       "SLD:d2": {
-        "considered_rules": 25,
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 12.05,
-        "ok": true,
-        "error": null,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
         "count": 0
       },
       "SLD:d3": {
-        "considered_rules": 102,
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 18.21,
-        "ok": true,
-        "error": null,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
         "count": 0
       },
       "SLD:d4": {
-        "considered_rules": 102,
-        "ground_rules": 106,
-        "ground_proofs": 76,
-        "ms": 24.11,
-        "ok": true,
-        "error": null,
-        "count": 106
+        "considered_rules": 0,
+        "ground_rules": 0,
+        "ground_proofs": 0,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
+        "count": 0
       },
       "enum-flat:w0d1": {
         "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.08,
+        "ms": 4.64,
         "ok": true,
         "error": null,
         "count": 0
@@ -106,7 +106,7 @@
         "considered_rules": 118,
         "ground_rules": 106,
         "ground_proofs": 76,
-        "ms": 13.33,
+        "ms": 12.26,
         "ok": true,
         "error": null,
         "count": 106
@@ -115,7 +115,7 @@
         "considered_rules": 377,
         "ground_rules": 226,
         "ground_proofs": 280,
-        "ms": 19.91,
+        "ms": 16.7,
         "ok": true,
         "error": null,
         "count": 226
@@ -124,25 +124,25 @@
         "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.21,
+        "ms": 5.39,
         "ok": true,
         "error": null,
         "count": 0
       },
       "enum-dense:w1d2": {
-        "considered_rules": 118,
+        "considered_rules": 0,
         "ground_rules": 106,
         "ground_proofs": 76,
-        "ms": 13.85,
+        "ms": 12.4,
         "ok": true,
         "error": null,
         "count": 106
       },
       "enum-dense:w1d3": {
-        "considered_rules": 377,
+        "considered_rules": 0,
         "ground_rules": 263,
         "ground_proofs": 367,
-        "ms": 22.11,
+        "ms": 11.4,
         "ok": true,
         "error": null,
         "count": 263
@@ -151,7 +151,7 @@
         "considered_rules": 1008,
         "ground_rules": 84,
         "ground_proofs": 84,
-        "ms": 6.93,
+        "ms": 6.94,
         "ok": true,
         "error": null,
         "count": 84
@@ -163,7 +163,7 @@
         "considered_rules": 0,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 0.92,
+        "ms": 1.03,
         "ok": true,
         "error": null,
         "count": null
@@ -172,7 +172,7 @@
         "considered_rules": 0,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 2.99,
+        "ms": 3.77,
         "ok": true,
         "error": null,
         "count": null
@@ -181,52 +181,52 @@
         "considered_rules": 252,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 5.47,
+        "ms": 19.13,
         "ok": true,
         "error": null,
         "count": null
       },
       "SLD:d1": {
-        "considered_rules": 25,
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 6.08,
-        "ok": true,
-        "error": null,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
         "count": 0
       },
       "SLD:d2": {
-        "considered_rules": 25,
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 11.53,
-        "ok": true,
-        "error": null,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
         "count": 0
       },
       "SLD:d3": {
-        "considered_rules": 105,
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 17.71,
-        "ok": true,
-        "error": null,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
         "count": 0
       },
       "SLD:d4": {
-        "considered_rules": 105,
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 23.76,
-        "ok": true,
-        "error": null,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
         "count": 0
       },
       "enum-flat:w0d1": {
         "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 4.88,
+        "ms": 5.64,
         "ok": true,
         "error": null,
         "count": 0
@@ -235,7 +235,7 @@
         "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 11.54,
+        "ms": 10.89,
         "ok": true,
         "error": null,
         "count": 0
@@ -244,7 +244,7 @@
         "considered_rules": 252,
         "ground_rules": 69,
         "ground_proofs": 46,
-        "ms": 20.0,
+        "ms": 28.33,
         "ok": true,
         "error": null,
         "count": 69
@@ -253,7 +253,7 @@
         "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 5.14,
+        "ms": 5.94,
         "ok": true,
         "error": null,
         "count": 0
@@ -262,16 +262,16 @@
         "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 13.06,
+        "ms": 11.6,
         "ok": true,
         "error": null,
         "count": 0
       },
       "enum-dense:w1d3": {
-        "considered_rules": 252,
+        "considered_rules": 0,
         "ground_rules": 80,
         "ground_proofs": 54,
-        "ms": 21.68,
+        "ms": 9.86,
         "ok": true,
         "error": null,
         "count": 80
@@ -280,7 +280,7 @@
         "considered_rules": 987,
         "ground_rules": 88,
         "ground_proofs": 88,
-        "ms": 6.65,
+        "ms": 6.75,
         "ok": true,
         "error": null,
         "count": 88
@@ -292,7 +292,7 @@
         "considered_rules": 67,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 2.51,
+        "ms": 2.7,
         "ok": true,
         "error": null,
         "count": null
@@ -301,7 +301,7 @@
         "considered_rules": 119,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 3.97,
+        "ms": 4.15,
         "ok": true,
         "error": null,
         "count": null
@@ -310,46 +310,46 @@
         "considered_rules": 165,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 5.82,
+        "ms": 6.13,
         "ok": true,
         "error": null,
         "count": null
       },
       "SLD:d1": {
-        "considered_rules": 48,
+        "considered_rules": 0,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 6.36,
-        "ok": true,
-        "error": null,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
         "count": 0
       },
       "SLD:d2": {
-        "considered_rules": 48,
-        "ground_rules": 67,
-        "ground_proofs": 67,
-        "ms": 11.55,
-        "ok": true,
-        "error": null,
-        "count": 67
+        "considered_rules": 0,
+        "ground_rules": 0,
+        "ground_proofs": 0,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
+        "count": 0
       },
       "SLD:d3": {
-        "considered_rules": 106,
-        "ground_rules": 67,
-        "ground_proofs": 67,
-        "ms": 17.8,
-        "ok": true,
-        "error": null,
-        "count": 67
+        "considered_rules": 0,
+        "ground_rules": 0,
+        "ground_proofs": 0,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
+        "count": 0
       },
       "SLD:d4": {
-        "considered_rules": 106,
-        "ground_rules": 118,
-        "ground_proofs": 145,
-        "ms": 24.49,
-        "ok": true,
-        "error": null,
-        "count": 118
+        "considered_rules": 0,
+        "ground_rules": 0,
+        "ground_proofs": 0,
+        "ms": 0.0,
+        "ok": false,
+        "error": "ValueError: resolution='sld' with compile_mode='reduce-overhead' requires an explicit positi",
+        "count": 0
       },
       "enum-flat:w0d1": {
         "considered_rules": 67,
@@ -364,7 +364,7 @@
         "considered_rules": 119,
         "ground_rules": 118,
         "ground_proofs": 145,
-        "ms": 13.21,
+        "ms": 12.07,
         "ok": true,
         "error": null,
         "count": 118
@@ -373,7 +373,7 @@
         "considered_rules": 165,
         "ground_rules": 156,
         "ground_proofs": 273,
-        "ms": 19.76,
+        "ms": 16.64,
         "ok": true,
         "error": null,
         "count": 156
@@ -382,25 +382,25 @@
         "considered_rules": 67,
         "ground_rules": 67,
         "ground_proofs": 67,
-        "ms": 6.77,
+        "ms": 7.53,
         "ok": true,
         "error": null,
         "count": 67
       },
       "enum-dense:w1d2": {
-        "considered_rules": 119,
+        "considered_rules": 0,
         "ground_rules": 118,
         "ground_proofs": 145,
-        "ms": 17.96,
+        "ms": 14.12,
         "ok": true,
         "error": null,
         "count": 118
       },
       "enum-dense:w1d3": {
-        "considered_rules": 165,
+        "considered_rules": 0,
         "ground_rules": 163,
         "ground_proofs": 311,
-        "ms": 31.01,
+        "ms": 13.5,
         "ok": true,
         "error": null,
         "count": 163
@@ -409,7 +409,7 @@
         "considered_rules": 1296,
         "ground_rules": 99,
         "ground_proofs": 99,
-        "ms": 7.08,
+        "ms": 6.76,
         "ok": true,
         "error": null,
         "count": 99
@@ -421,7 +421,7 @@
         "considered_rules": 42,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 33.37,
+        "ms": 35.92,
         "ok": true,
         "error": null,
         "count": null
@@ -430,7 +430,7 @@
         "considered_rules": 783,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 201.23,
+        "ms": 210.84,
         "ok": true,
         "error": null,
         "count": null
@@ -439,43 +439,43 @@
         "considered_rules": 3349,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 349.66,
+        "ms": 375.14,
         "ok": true,
         "error": null,
         "count": null
       },
       "SLD:d1": {
-        "considered_rules": 72,
+        "considered_rules": null,
         "ground_rules": 0,
         "ground_proofs": 0,
-        "ms": 6.53,
+        "ms": 5.14,
         "ok": true,
         "error": null,
         "count": 0
       },
       "SLD:d2": {
-        "considered_rules": 72,
+        "considered_rules": null,
         "ground_rules": 1,
         "ground_proofs": 1,
-        "ms": 12.05,
+        "ms": 7.7,
         "ok": true,
         "error": null,
         "count": 1
       },
       "SLD:d3": {
-        "considered_rules": 339,
+        "considered_rules": null,
         "ground_rules": 42,
         "ground_proofs": 42,
-        "ms": 18.48,
+        "ms": 11.76,
         "ok": true,
         "error": null,
         "count": 42
       },
       "SLD:d4": {
-        "considered_rules": 1494,
+        "considered_rules": null,
         "ground_rules": 189,
         "ground_proofs": 149,
-        "ms": 26.29,
+        "ms": 15.36,
         "ok": true,
         "error": null,
         "count": 189
@@ -484,7 +484,7 @@
         "considered_rules": 42,
         "ground_rules": 42,
         "ground_proofs": 42,
-        "ms": 8.37,
+        "ms": 8.04,
         "ok": true,
         "error": null,
         "count": 42
@@ -493,7 +493,7 @@
         "considered_rules": 783,
         "ground_rules": 599,
         "ground_proofs": 813,
-        "ms": 20.85,
+        "ms": 17.85,
         "ok": true,
         "error": null,
         "count": 599
@@ -502,7 +502,7 @@
         "considered_rules": 3349,
         "ground_rules": 1016,
         "ground_proofs": 2677,
-        "ms": 118.72,
+        "ms": 108.25,
         "ok": true,
         "error": null,
         "count": 1016
@@ -511,25 +511,25 @@
         "considered_rules": 41,
         "ground_rules": 41,
         "ground_proofs": 41,
-        "ms": 8.43,
+        "ms": 8.71,
         "ok": true,
         "error": null,
         "count": 41
       },
       "enum-dense:w1d2": {
-        "considered_rules": 751,
+        "considered_rules": 0,
         "ground_rules": 304,
         "ground_proofs": 307,
-        "ms": 37.83,
+        "ms": 18.97,
         "ok": true,
         "error": null,
         "count": 304
       },
       "enum-dense:w1d3": {
-        "considered_rules": 3123,
+        "considered_rules": 0,
         "ground_rules": 409,
         "ground_proofs": 577,
-        "ms": 70.6,
+        "ms": 22.49,
         "ok": true,
         "error": null,
         "count": 409
@@ -538,7 +538,7 @@
         "considered_rules": 4846,
         "ground_rules": 478,
         "ground_proofs": 478,
-        "ms": 8.47,
+        "ms": 7.68,
         "ok": true,
         "error": null,
         "count": 478
@@ -550,7 +550,7 @@
         "considered_rules": 18071,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 366.77,
+        "ms": 395.18,
         "ok": true,
         "error": null,
         "count": null
@@ -559,7 +559,7 @@
         "considered_rules": 34949,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 2147.54,
+        "ms": 2769.21,
         "ok": true,
         "error": null,
         "count": null
@@ -568,34 +568,34 @@
         "considered_rules": 39414,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 6207.9,
+        "ms": 6398.66,
         "ok": true,
         "error": null,
         "count": null
       },
       "SLD:d1": {
-        "considered_rules": 25480,
+        "considered_rules": null,
         "ground_rules": 318,
         "ground_proofs": 318,
-        "ms": 372.77,
+        "ms": 52.85,
         "ok": true,
         "error": null,
         "count": 318
       },
       "SLD:d2": {
-        "considered_rules": 59090,
+        "considered_rules": null,
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 954.96,
+        "ms": 190.76,
         "ok": true,
         "error": null,
         "count": 18071
       },
       "SLD:d3": {
-        "considered_rules": 296820,
+        "considered_rules": null,
         "ground_rules": 18199,
         "ground_proofs": 18206,
-        "ms": 1730.08,
+        "ms": 367.59,
         "ok": true,
         "error": null,
         "count": 18199
@@ -606,14 +606,14 @@
         "ground_proofs": 0,
         "ms": 0.0,
         "ok": false,
-        "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 2.06 GiB. GPU 0 has a total capacity of 23",
+        "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 704.00 MiB. GPU 0 has a total capacity of ",
         "count": 0
       },
       "enum-flat:w0d1": {
         "considered_rules": 18071,
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 478.0,
+        "ms": 324.01,
         "ok": true,
         "error": null,
         "count": 18071
@@ -622,7 +622,7 @@
         "considered_rules": 34949,
         "ground_rules": 32846,
         "ground_proofs": 61604,
-        "ms": 1088.59,
+        "ms": 626.6,
         "ok": true,
         "error": null,
         "count": 32846
@@ -631,7 +631,7 @@
         "considered_rules": 39414,
         "ground_rules": 36028,
         "ground_proofs": 148533,
-        "ms": 1975.37,
+        "ms": 1079.85,
         "ok": true,
         "error": null,
         "count": 36028
@@ -640,25 +640,25 @@
         "considered_rules": 18071,
         "ground_rules": 18071,
         "ground_proofs": 18071,
-        "ms": 464.71,
+        "ms": 334.39,
         "ok": true,
         "error": null,
         "count": 18071
       },
       "enum-dense:w1d2": {
-        "considered_rules": 34950,
+        "considered_rules": 34762,
         "ground_rules": 34766,
         "ground_proofs": 71314,
-        "ms": 4136.08,
+        "ms": 1073.59,
         "ok": true,
         "error": null,
         "count": 34766
       },
       "enum-dense:w1d3": {
-        "considered_rules": 39274,
+        "considered_rules": 35391,
         "ground_rules": 35400,
         "ground_proofs": 135402,
-        "ms": 8560.42,
+        "ms": 2414.97,
         "ok": true,
         "error": null,
         "count": 35400
@@ -667,7 +667,7 @@
         "considered_rules": 153999,
         "ground_rules": 30493,
         "ground_proofs": 30493,
-        "ms": 437.2,
+        "ms": 495.71,
         "ok": true,
         "error": null,
         "count": 30493
@@ -679,7 +679,7 @@
         "considered_rules": 1266,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 558.2,
+        "ms": 585.86,
         "ok": true,
         "error": null,
         "count": null
@@ -688,7 +688,7 @@
         "considered_rules": 2610,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 6558.79,
+        "ms": 7396.09,
         "ok": true,
         "error": null,
         "count": null
@@ -697,34 +697,34 @@
         "considered_rules": 4394,
         "ground_rules": null,
         "ground_proofs": null,
-        "ms": 26305.31,
+        "ms": 27464.98,
         "ok": true,
         "error": null,
         "count": null
       },
       "SLD:d1": {
-        "considered_rules": 10486,
+        "considered_rules": null,
         "ground_rules": 1088,
         "ground_proofs": 1088,
-        "ms": 1629.1,
+        "ms": 174.25,
         "ok": true,
         "error": null,
         "count": 1088
       },
       "SLD:d2": {
-        "considered_rules": 45301,
+        "considered_rules": null,
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 3990.18,
+        "ms": 757.24,
         "ok": true,
         "error": null,
         "count": 1266
       },
       "SLD:d3": {
-        "considered_rules": 242757,
+        "considered_rules": null,
         "ground_rules": 1369,
         "ground_proofs": 1370,
-        "ms": 6848.66,
+        "ms": 1616.63,
         "ok": true,
         "error": null,
         "count": 1369
@@ -733,7 +733,7 @@
         "considered_rules": null,
         "ground_rules": 2774,
         "ground_proofs": 2276,
-        "ms": 2541.18,
+        "ms": 2551.26,
         "ok": true,
         "error": null,
         "count": 2774
@@ -742,34 +742,34 @@
         "considered_rules": 1266,
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 1613.75,
+        "ms": 1525.87,
         "ok": true,
         "error": null,
         "count": 1266
       },
       "enum-flat:w1d2": {
-        "considered_rules": 2793,
+        "considered_rules": 2610,
         "ground_rules": 1989,
         "ground_proofs": 1727,
-        "ms": 3372.46,
+        "ms": 3007.12,
         "ok": true,
         "error": null,
         "count": 1989
       },
       "enum-flat:w1d3": {
         "considered_rules": 4394,
-        "ground_rules": 3122,
+        "ground_rules": 3117,
         "ground_proofs": 2336,
-        "ms": 5787.67,
+        "ms": 5249.19,
         "ok": true,
         "error": null,
-        "count": 3122
+        "count": 3117
       },
       "enum-dense:w0d1": {
         "considered_rules": 1266,
         "ground_rules": 1266,
         "ground_proofs": 1266,
-        "ms": 1537.32,
+        "ms": 1610.08,
         "ok": true,
         "error": null,
         "count": 1266
@@ -778,25 +778,25 @@
         "considered_rules": 2557,
         "ground_rules": 2557,
         "ground_proofs": 2037,
-        "ms": 1513.97,
+        "ms": 1527.64,
         "ok": true,
         "error": null,
         "count": 2557
       },
       "enum-dense:w1d3": {
-        "considered_rules": 0,
-        "ground_rules": 0,
-        "ground_proofs": 0,
-        "ms": 0.0,
-        "ok": false,
-        "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 480.00 MiB. GPU 0 has a total capacity of ",
-        "count": 0
+        "considered_rules": 3516,
+        "ground_rules": 3516,
+        "ground_proofs": 3019,
+        "ms": 3059.1,
+        "ok": true,
+        "error": null,
+        "count": 3516
       },
       "FC:fp_global": {
         "considered_rules": 33489363,
         "ground_rules": 33489363,
         "ground_proofs": null,
-        "ms": 1929.3,
+        "ms": 2184.22,
         "ok": true,
         "error": null,
         "count": 33489363
@@ -808,7 +808,7 @@
         "considered_rules": 256941207,
         "ground_rules": 256941207,
         "ground_proofs": null,
-        "ms": 239583.51,
+        "ms": 304162.38,
         "ok": true,
         "error": null,
         "count": 256941207

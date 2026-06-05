@@ -42,24 +42,27 @@ def prune_rule_groundings(rg, *, facts_idx: Tensor, depth: int,
     if facts_idx.numel() > 0:
         import os as _os
         fi_dev = facts_idx.to(device)
-        if _os.environ.get("GROUNDER_EXACT_FACT_MEMBERSHIP") == "1":
-            # COLLISION-FREE fact membership (eval-only, env-gated default OFF).
-            # The default ``atom_hash`` packs (p,a0,a1) with three NEAR-EQUAL
-            # primes; on large eval atom_tables (exhaustive candidate pools)
-            # this yields FALSE-POSITIVE "facts", seeding spurious proofs that
-            # boost distractor scores and suppress exhaustive MRR. Pack
-            # injectively into int64 with a base > every component so
-            # membership is exact. Default (hash) path kept for byte-identity.
+        if _os.environ.get("GROUNDER_LEGACY_HASH") == "1":
+            # LEGACY (collision-prone) fact membership — opt-in for A/B only.
+            # ``atom_hash`` packs (p,a0,a1) with three NEAR-EQUAL primes; on
+            # large atom_tables this yields FALSE-POSITIVE "facts" (a non-fact
+            # atom collides onto a real fact's hash), fabricating premises that
+            # let depth-2 chains spuriously prove triples — including negatives,
+            # which distorts the shared KGE during training. Kept only to
+            # reproduce pre-fix behavior.
+            from grounder.groundings import atom_hash
+            atom_h = atom_hash(atom_table)                  # [num_atoms]
+            fact_h = atom_hash(fi_dev)                       # [F]
+        else:
+            # DEFAULT: COLLISION-FREE fact membership. Pack (p,a0,a1) injectively
+            # into int64 with a base > every component, so torch.isin reports
+            # exact set membership — no fabricated facts.
             base = int(torch.maximum(atom_table.max(), fi_dev.max()).item()) + 1
             bb = base * base
             atom_h = (atom_table[:, 0].long() * bb
                       + atom_table[:, 1].long() * base + atom_table[:, 2].long())
             fact_h = (fi_dev[:, 0].long() * bb
                       + fi_dev[:, 1].long() * base + fi_dev[:, 2].long())
-        else:
-            from grounder.groundings import atom_hash
-            atom_h = atom_hash(atom_table)                  # [num_atoms]
-            fact_h = atom_hash(fi_dev)                       # [F]
         is_fact = torch.isin(atom_h, fact_h)                # [num_atoms]
     else:
         is_fact = torch.zeros(num_atoms, dtype=torch.bool, device=device)
