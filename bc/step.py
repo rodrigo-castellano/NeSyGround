@@ -37,6 +37,21 @@ from grounder.types import (
 )
 
 
+def capture_selected_goal(grounder, states: Dict[str, Tensor],
+                          proof_goals: Tensor) -> None:
+    """Capture the goal resolved at this depth (= head atom) into
+    ``states["_selected_goal"]`` so ``sync_accumulated`` can write per-depth
+    heads into ``head_per_depth``.
+
+    Single source of truth for the eager (``step``) and compiled
+    (``compiled_step.step_impl``) paths — they must use the identical
+    ``collect_evidence or _collect_rule_groundings`` gate, since skipping it
+    collapses every rule firing onto the padding head (val MRR stuck at 1/N).
+    """
+    if grounder.collect_evidence or grounder._collect_rule_groundings:
+        states["_selected_goal"] = proof_goals[:, :, 0, :].clone()
+
+
 def step(
     grounder, states: Dict[str, Tensor], d: int,
 ) -> Dict[str, Tensor]:
@@ -61,9 +76,7 @@ def step(
             from grounder.bc.compiled_step import step_compiled
             return step_compiled(grounder, states, d)
 
-    # Capture the goal being resolved at this depth (= head atom)
-    if grounder.collect_evidence or grounder._collect_rule_groundings:
-        states["_selected_goal"] = states["proof_goals"][:, :, 0, :].clone()
+    capture_selected_goal(grounder, states, states["proof_goals"])
 
     goal_queries, remaining, active_mask = select(grounder, states)
 

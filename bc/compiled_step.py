@@ -148,18 +148,13 @@ def step_impl(
         "collected_bcount": collected_bcount,
         "collected_head": collected_head,
     }
-    # Capture the goal being resolved at this depth (= head atom).
-    # Same conditional as eager ``step``: ``sync_accumulated`` reads
-    # ``states["_selected_goal"]`` to write per-depth heads into
-    # ``head_per_depth``. Skipping this caused all rule firings to
-    # share the padding head atom, collapsing the rule-path output
-    # to a constant pool and zeroing the gradient signal for SBR /
-    # DCR / R2N (val MRR stuck at 1/N from epoch 1).
-    if grounder.collect_evidence or grounder._collect_rule_groundings:
-        states["_selected_goal"] = proof_goals[:, :, 0, :].clone()
     from grounder.bc.step import (
+        capture_selected_goal,
         select, resolve, apply_search_filters, pack, postprocess,
     )
+    # Capture the goal being resolved at this depth (shared with eager
+    # ``step`` — the gate must stay identical; see ``capture_selected_goal``).
+    capture_selected_goal(grounder, states, proof_goals)
     queries, remaining, active_mask = select(grounder, states)
     resolved = resolve(
         grounder, queries, remaining, grounding_body, state_valid,
