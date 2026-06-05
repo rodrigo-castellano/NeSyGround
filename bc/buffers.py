@@ -9,12 +9,28 @@ place. The design is three tiers:
   ``collected_*`` …), allocated once at the top of each ``forward``.
   Relocated verbatim from ``bc/state.py`` (which now re-exports it for
   back-compat); behavior is unchanged.
-- Tier 1 (follow-up): ``allocate_step_buffers`` — reusable per-step
-  MGU/enum-dense pools, so ``resolution/mgu.py``'s ``resolve_facts`` /
-  ``resolve_rules`` write into views instead of self-allocating.
-- Tier 3 (follow-up): ``allocate_eager_flat`` — the data-dependent
-  ``nonzero``/``unique`` scratch of the flat path (explicitly
-  non-compilable).
+
+Tier 1 (reusable per-step MGU/enum-dense pools) and Tier 3 (eager-flat
+``nonzero``/``unique`` scratch) were **assessed and deliberately not
+pursued** — per-step buffer pooling is not a safe timing win here:
+
+* The compiled enum-dense step is CUDA-graph captured (reduce-overhead);
+  a persistent pool tensor reused across replays aliases ("accessing a
+  tensor output of CUDAGraphs that has been overwritten") — the same
+  hazard that forces ``_POW_CACHE`` / ``_ARANGE_CACHE`` to materialise
+  fresh under ``is_compiling``. The CUDA graph already manages those
+  buffers; pooling them externally is unsafe.
+* The eager-flat (paper) path sizes its scratch from data-dependent
+  ``nonzero`` results, so it cannot use a fixed-shape pool at all.
+* For the remaining eager fixed-shape allocations, torch's caching
+  allocator already amortises repeat same-size allocs after warmup, so
+  pooling saves only the (cheap) cache lookup, not the buffer write.
+
+So allocation is not the enum hot-path cost (the eager
+``nonzero``/``unique``/``.item()`` pipeline is — see the round-1 perf
+analysis); a real train speedup there needs the *compiled flat path*, a
+separate effort. ``init_states`` (Tier 2) remains the single allocation
+owner.
 """
 from __future__ import annotations
 
