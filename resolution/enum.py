@@ -355,7 +355,19 @@ def resolve_enum_step(
     else:
         head_pred_mask_d = head_pred_mask     # always pass; filter gates
 
-    # ── Flat intermediate path (zero grounding loss) ──
+    # ── Dispatch: two intentional materialization strategies ──
+    # The flat and dense paths are NOT duplicated logic — they share their
+    # inner computation (``_fill_body_atoms`` / ``_apply_grounding_filters``
+    # reductions / ``_cartesian_expand_one_fv``) and differ only in how they
+    # materialise candidates:
+    #   * flat: compact ``[T, M, 3]`` via ``torch.nonzero`` (no padding waste,
+    #     memory-efficient; necessarily eager — dynamic shapes).
+    #   * dense: static ``[B, K_r, G_r, M, 3]`` (``torch.compile`` / CUDA-graph
+    #     friendly; the keras count oracle exercises this path eager).
+    # ``flat_intermediate`` (path) and ``compile_mode`` (execution) are
+    # orthogonal knobs, so the branch stays binary by design — collapsing it
+    # into one parameterised function would scatter ``if flat`` throughout and
+    # erase the memory/compile tradeoff that is the whole point.
     if flat_intermediate and fv_enum_pred is not None and V >= 1:
         return _resolve_enum_step_flat(
             queries, remaining, grounding_body, state_valid, active_mask,
