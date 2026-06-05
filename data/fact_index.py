@@ -534,10 +534,8 @@ class BlockSparseFactIndex(InvertedFactIndex):
             s_vals = sorted_vals[valid]
             s_pos = within_pos[valid]
 
-            # Scatter into dense blocks
+            # Scatter into dense blocks (linear indexing into the flat view)
             blocks = torch.zeros(P * E, K, dtype=torch.long, device=facts.device)
-            flat_idx = s_keys.unsqueeze(1) * K + s_pos.unsqueeze(1)
-            # Use linear indexing
             blocks.view(-1)[s_keys * K + s_pos] = s_vals
 
             # Counts per group: min(actual_count, K)

@@ -320,9 +320,9 @@ def finalize(grounder) -> Optional[RuleGroundings]:
     # is contiguous. Drop the sentinel ``rule_idx == num_rules``: those
     # are the invalid-rule rows from the dedup pipeline. ``bincount``
     # gives per-rule sizes; cumsum gives the flat offset table.
-    keep = u_rule < num_rules
-    if guard_keep is not None:
-        keep = keep & guard_keep
+    # ``guard_keep`` (head-consistency: pred + variable-binding match) is
+    # always a tensor here, so the keep mask folds it in unconditionally.
+    keep = (u_rule < num_rules) & guard_keep
     u_rule_keep = u_rule[keep]
     head_atom_keep = head_atom_idx[keep]
     body_atom_keep = body_atom_idx[keep]
