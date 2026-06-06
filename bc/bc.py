@@ -23,6 +23,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from grounder.bc.cache import GroundingCache
 from grounder.config import GrounderConfig
 from grounder.data.kb import KB
 from grounder.resolution.standardization import StandardizationConfig
@@ -30,6 +31,13 @@ from grounder.types import GrounderOutput, ResolvedChildren
 
 if TYPE_CHECKING:
     from grounder.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
+
+
+def _cache_prop(name: str) -> property:
+    """Delegate ``BCGrounder._<…>`` reads/writes to ``self._cache.<name>``
+    (the :class:`grounder.bc.cache.GroundingCache`)."""
+    return property(lambda self: getattr(self._cache, name),
+                    lambda self, v: setattr(self._cache, name, v))
 
 
 class BCGrounder(nn.Module):
@@ -210,44 +218,36 @@ class BCGrounder(nn.Module):
                 cfg.standardization, self.kb.device_)
 
     def _init_grounding_caches(self) -> None:
-        """Initialise the (default-OFF) grounding-memoization state used by the
-        optional tabling (#47) / subgoal-memo (#48) / resolve-skip fast paths.
+        """Compose the optional, default-OFF grounding-memoization state.
 
-        All three are OFF by default — the standard depth-loop path is
-        untouched unless a caller flips the corresponding ``_*_enabled`` flag.
-        The state lives on the grounder because it is the context object every
-        ``bc/`` function reads (see :mod:`grounder.bc.tabling` / ``.subgoal``).
+        The state now lives in its own :class:`grounder.bc.cache.GroundingCache`
+        module rather than as ~15 attributes on the grounder; the standard
+        depth-loop path never touches it (all layers default OFF). The ``_*``
+        names the cache modules + external callers use are kept as thin
+        delegating properties (see below), so nothing else changes.
         """
-        # Per-query tabling cache (#47): grounding is weight-independent, so a
-        # query atom's RAW (pre-prune) considered firing set is byte-identical
-        # across calls; hits replay it instead of re-running the depth loop.
-        self._tabling_enabled = False
-        self._grounding_cache: Dict[int, Any] = {}
-        # Query-index offset reconciling the accumulator's batch-local b_idx
-        # with the write-back miss_positions map (reset per forward/chunk;
-        # 0 for the single-batch path).
-        self._chunk_query_offset = 0
-        # KB-immutability stamp — the cache is valid only while facts + rules
-        # are unchanged (asserted on every consult).
-        self._tabling_kb_stamp = (id(self.kb.fact_index), int(self.kb.num_rules))
-        # Cap on distinct cached keys; when full, serve hits + compute misses
-        # fresh (passthrough) instead of inserting.
-        self._tabling_max_entries = 2_000_000
-        self._tabling_full_warned = False
+        self._cache = GroundingCache(self.kb)
 
-        # Per-subgoal memo (#48): keyed by (selected_goal_hash, is_last) —
-        # finer than per-query, so subgoals shared across queries/epochs reuse
-        # one stored set. Built on top of #47.
-        self._subgoal_enabled = False
-        self._subgoal_memo: Dict[Any, Any] = {}
-        self._subgoal_max_entries = 2_000_000
-        self._subgoal_full_warned = False
-
-        # Resolve-SKIP (#48 Phase-2): within-batch goal dedup in the flat enum
-        # resolve — run the enumerate/fill/exists/filter pipeline once per
-        # distinct selected goal, then scatter survivors to every state sharing
-        # it (byte-identical). See ``resolution/enum.py:_resolve_enum_step_flat``.
-        self._resolve_skip_enabled = False
+    # ── Back-compat property surface over the GroundingCache module ──
+    # The cache modules (bc/tabling.py, bc/subgoal.py) and external callers
+    # (e.g. torch-ns's GROUNDER_RESOLVE_SKIP / GROUNDER_SUBGOAL_MEMO toggles)
+    # still read/write ``grounder._tabling_enabled`` etc.; these delegate to
+    # the single ``self._cache`` object so the state has one owner.
+    _tabling_enabled = _cache_prop("tabling_enabled")
+    _grounding_cache = _cache_prop("grounding_cache")
+    _chunk_query_offset = _cache_prop("chunk_query_offset")
+    _tabling_kb_stamp = _cache_prop("tabling_kb_stamp")
+    _tabling_max_entries = _cache_prop("tabling_max_entries")
+    _tabling_full_warned = _cache_prop("tabling_full_warned")
+    _tabling_last_hits = _cache_prop("tabling_last_hits")
+    _tabling_last_misses = _cache_prop("tabling_last_misses")
+    _subgoal_enabled = _cache_prop("subgoal_enabled")
+    _subgoal_memo = _cache_prop("subgoal_memo")
+    _subgoal_max_entries = _cache_prop("subgoal_max_entries")
+    _subgoal_full_warned = _cache_prop("subgoal_full_warned")
+    _subgoal_last_hits = _cache_prop("subgoal_last_hits")
+    _subgoal_last_misses = _cache_prop("subgoal_last_misses")
+    _resolve_skip_enabled = _cache_prop("resolve_skip_enabled")
 
     @classmethod
     def from_config(cls, kb: KB, config: GrounderConfig) -> "BCGrounder":
