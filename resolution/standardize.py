@@ -10,11 +10,17 @@ renumbering.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 import torch
 from torch import Tensor
+
+# Hot-path var-id range guards: each runs a `.all()` reduction + a launched
+# assert kernel per grounding step. Debug-only — off by default (set
+# GROUNDER_STD_ASSERTS=1 to re-enable). Output is unaffected either way.
+_STD_ASSERTS = os.environ.get("GROUNDER_STD_ASSERTS") == "1"
 
 
 @dataclass(frozen=True)
@@ -73,7 +79,7 @@ def standardize_vars_offset(
     offset_exp = offset.view(B, 1, 1, 1).expand(-1, K, M, 2)
     std_args = torch.where(is_var_out, args + offset_exp, args)
 
-    if enforce_runtime_range and runtime_var_end_index is not None:
+    if _STD_ASSERTS and enforce_runtime_range and runtime_var_end_index is not None:
         lo = ((~is_var_out) | (std_args >= (constant_no + 1))).all()
         hi = ((~is_var_out) | (std_args <= runtime_var_end_index)).all()
         torch._assert_async(lo, "standardize_offset: var id below runtime range")
@@ -92,8 +98,9 @@ def standardize_vars_offset(
     new_next_var = torch.maximum(max_in_shifted, max_gen_shifted) + 1
 
     if enforce_runtime_range and runtime_var_end_index is not None:
-        torch._assert_async((new_next_var <= runtime_var_end_index).all(),
-                            "standardize_offset: next-var beyond runtime range")
+        if _STD_ASSERTS:
+            torch._assert_async((new_next_var <= runtime_var_end_index).all(),
+                                "standardize_offset: next-var beyond runtime range")
     return standardized, new_next_var
 
 
@@ -172,13 +179,14 @@ def standardize_vars_canonical(
     next_end_B.scatter_reduce_(0, owners, next_end, reduce="amax", include_self=True)
     new_next_var = torch.maximum(next_var_indices, next_end_B)
 
-    is_var_out = (args_out > constant_no) & (args_out != padding_idx)
-    torch._assert_async(((~is_var_out) | (args_out >= (constant_no + 1))).all(),
-                        "standardize_canonical: var id below runtime range")
-    torch._assert_async(((~is_var_out) | (args_out <= runtime_var_end_index)).all(),
-                        "standardize_canonical: var id above runtime range")
-    torch._assert_async((new_next_var <= runtime_var_end_index).all(),
-                        "standardize_canonical: next-var beyond runtime range")
+    if _STD_ASSERTS:
+        is_var_out = (args_out > constant_no) & (args_out != padding_idx)
+        torch._assert_async(((~is_var_out) | (args_out >= (constant_no + 1))).all(),
+                            "standardize_canonical: var id below runtime range")
+        torch._assert_async(((~is_var_out) | (args_out <= runtime_var_end_index)).all(),
+                            "standardize_canonical: var id above runtime range")
+        torch._assert_async((new_next_var <= runtime_var_end_index).all(),
+                            "standardize_canonical: next-var beyond runtime range")
     return std_derived, new_next_var
 
 
