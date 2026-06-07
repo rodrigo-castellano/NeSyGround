@@ -131,7 +131,8 @@ def pack(plan, resolved, fr: Frontier) -> Tuple[Frontier, dict]:
             resolved, fr.top_rule_idx, fr.grounding_body,
             fr.body_count, plan.kb.padding_idx,
             collect_evidence=plan.collect_evidence, M_rule=plan.kb.M,
-            dedup=(plan.pack_dedup and subs_noop), subs_noop=subs_noop)
+            dedup=(plan.pack_dedup and subs_noop), subs_noop=subs_noop,
+            S_cap=(None if subs_noop else plan.S))
     else:
         subs_noop = False
         packed = pack_states(
@@ -139,13 +140,16 @@ def pack(plan, resolved, fr: Frontier) -> Tuple[Frontier, dict]:
             fr.body_count, plan.S, plan.kb.padding_idx,
             collect_evidence=plan.collect_evidence, M_rule=plan.kb.M)
 
-    S_in = packed.proof_goals.shape[1]
+    # next_var advances by the FIXED dense width on the sld/rtf flat path so the
+    # unbound-var labels match dense (enum-flat keeps the dynamic S_out advance).
+    S_adv = plan.S if (isinstance(resolved, FlatResolvedChildren)
+                       and not subs_noop) else packed.proof_goals.shape[1]
     fr = fr.replace(
         grounding_body=packed.grounding_body,
         proof_goals=packed.proof_goals,
         top_rule_idx=packed.top_ridx,
         state_valid=packed.state_valid,
-        next_var=fr.next_var + S_in * plan.max_vars_per_rule)
+        next_var=fr.next_var + S_adv * plan.max_vars_per_rule)
 
     sync = {
         "parent_map": packed.parent_map,

@@ -13,7 +13,7 @@ a glossary-registered output type.
 """
 from __future__ import annotations
 
-from typing import Dict, NamedTuple, Tuple
+from typing import Dict, NamedTuple, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -246,8 +246,13 @@ def pack_states_flat(
     M_rule: int = 0,
     dedup: bool = True,
     subs_noop: bool = True,
+    S_cap: Optional[int] = None,
 ) -> _Packed:
-    """Flat pack: polynomial-hash dedup, dynamic S_out, positions via cumcount."""
+    """Flat pack: polynomial-hash dedup, dynamic S_out, positions via cumcount.
+
+    ``S_cap`` (sld/rtf flat path) caps S_out at the fixed dense width and truncates
+    the per-batch tail in concat order to match dense pack_states' [:S] slice.
+    """
     B = flat_resolved.B
     pad = padding_idx
     dev = flat_resolved.flat_goals.device
@@ -308,9 +313,32 @@ def pack_states_flat(
         counts = torch.bincount(flat_b, minlength=B)
     else:
         counts = torch.zeros(B, dtype=torch.long, device=dev)
-    S_out = max(int(counts.max().item()), 1)
 
     pos = cumcount_flat(flat_b)
+
+    # SLD/RTF provenance fields (aligned to flat_goals; dedup is OFF here).
+    if not subs_noop:
+        flat_is_fact = flat_resolved.flat_is_fact
+        flat_top = flat_resolved.flat_top_ridx
+        flat_subs = flat_resolved.flat_subs
+    else:
+        flat_is_fact = flat_top = flat_subs = None
+
+    if S_cap is not None:
+        S_out = min(max(int(counts.max().item()), 1), int(S_cap))
+        keep = pos < S_out                              # truncate per-batch tail in concat order
+        flat_goals = flat_goals[keep]
+        flat_ridx = flat_ridx[keep]
+        flat_b = flat_b[keep]
+        flat_s = flat_s[keep]
+        pos = pos[keep]
+        if not subs_noop:
+            flat_is_fact = flat_is_fact[keep]
+            flat_top = flat_top[keep]
+            flat_subs = flat_subs[keep]
+        T = flat_goals.size(0)
+    else:
+        S_out = max(int(counts.max().item()), 1)
 
     out_goals = torch.full((B, S_out, G, 3), pad, dtype=torch.long, device=dev)
     out_gbody = torch.full((B, S_out, M_work, 3), pad, dtype=torch.long, device=dev)
@@ -341,8 +369,8 @@ def pack_states_flat(
             out_has_new[flat_b, pos] = True
             out_cur_ridx[flat_b, pos] = flat_ridx
         else:                                           # SLD/RTF — dense-equivalent provenance
-            is_fact = flat_resolved.flat_is_fact        # [T] bool (dedup OFF -> aligned to pos)
-            top = flat_resolved.flat_top_ridx           # [T] long
+            is_fact = flat_is_fact                       # [T] bool (dedup OFF -> aligned to pos)
+            top = flat_top                               # [T] long
             first = (top == -1)
             eff_ridx = torch.where(is_fact, top, torch.where(first, flat_ridx, top))
             out_ridx[flat_b, pos] = eff_ridx
@@ -351,7 +379,7 @@ def pack_states_flat(
                 is_fact, torch.full_like(flat_ridx, -1), flat_ridx)
             out_gbody[flat_b, pos] = torch.where(
                 is_fact.view(-1, 1, 1), torch.full_like(new_body, pad), new_body)
-            out_subs[flat_b, pos] = flat_resolved.flat_subs
+            out_subs[flat_b, pos] = flat_subs
 
     out_valid = torch.arange(S_out, device=dev).unsqueeze(0) < counts.clamp(max=S_out).unsqueeze(1)
 

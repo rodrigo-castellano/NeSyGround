@@ -97,6 +97,10 @@ class RunPlan:
                     and not getattr(grounder, "compile_enabled", False)):
                 want = Layout.FLAT if grounder._flat_intermediate else Layout.DENSE
                 strategy = ExecStrategy.explicit(row, Cell(want, EAGER), strategy.chunk)
+            # sld/rtf route layout via strategy.layout() (not flat_intermediate); under
+            # auto they always run dense, so keep the auto cell DENSE for them.
+            elif not is_pbc and strategy.cell.layout is Layout.FLAT:
+                strategy = ExecStrategy.explicit(row, Cell(Layout.DENSE, EAGER), strategy.chunk)
         return RunPlan(
             shapes=shapes, config=getattr(grounder, "config", None), kb=kb,
             output_spec=getattr(grounder, "output_spec", OutputSpec()),
