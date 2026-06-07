@@ -23,7 +23,12 @@ from grounder.execution.depth import DepthSelector
 from grounder.shapes import Shapes
 from grounder.types import Layout
 
-_PEAK_BUDGET_BYTES = 1_000_000_000   # ~1 GB per dense intermediate (chunk sizing)
+# Conservative default budget for the dense/flat enumeration peak when no explicit
+# chunk_size is given. Deliberately small: the static estimate under-counts the
+# V≥2 Cartesian (K_v^V) blowup, so a larger auto budget OOMs high-fanout cells.
+# The robust path is an explicit per-dataset chunk_size (see GrounderAdapter /
+# torch-ns DATASET_GROUNDER_CFG); this is only the unconfigured fallback.
+_PEAK_BUDGET_BYTES = 1_000_000_000   # ~1 GB
 
 
 @dataclass(frozen=True)
