@@ -30,10 +30,15 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "ablation_d3":  {},
     "nations":      {},
     "umls":         {},
-    # large / high-fanout — explicit chunk bounds the Cartesian peak (tuned by the
-    # scale runs; conservative starting points, refined there).
-    "fb15k237":     {"chunk_size": 64},
-    "yago310":      {"chunk_size": 32},
+    # large / high-fanout — use the join materialization (L3, set-equality
+    # equivalent to cartesian, ~10x lower enumeration peak) + a small chunk.
+    # Measured (GPU 24GB, depth, w=1, keep-all): yago310 d2 join chunk=16 fits
+    # at 11.7GB (1283 firings/50q, 15ms/q). fb15k237 d3 is memory-bound by a few
+    # very-high-fanout queries — light queries fit at chunk=2 but heavy ones can
+    # still exceed 24GB even with join; chunk=2 is the safe floor (deeper memory
+    # work / output streaming is the real fix for fb15k d3 keep-ALL).
+    "fb15k237":     {"chunk_size": 2, "materialization": "join"},
+    "yago310":      {"chunk_size": 16, "materialization": "join"},
 }
 
 
