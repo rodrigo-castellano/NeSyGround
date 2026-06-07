@@ -97,6 +97,15 @@ class RuleGroundings:
     num_rules: int
     M_max: int
     query_pool_idx: Optional[Tensor] = None   # [B]
+    firing_valid: Optional[Tensor] = None     # [N_firings] bool; tkk fast path
+
+    def __post_init__(self) -> None:
+        # tkk's to_firings_tensors fast path reads firing_valid; default all-True
+        # of length N_firings (pruning drops rows, never masks → always True here).
+        if self.firing_valid is None:
+            object.__setattr__(self, "firing_valid", torch.ones(
+                self.head_pool_idx.shape[0], dtype=torch.bool,
+                device=self.head_pool_idx.device))
 
     @staticmethod
     def empty(num_rules: int, M: int, device, dtype=torch.long) -> "RuleGroundings":

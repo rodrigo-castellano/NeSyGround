@@ -29,6 +29,12 @@ from grounder._build.types import Layout, RuleGroundings
 # Knob normalization maps (str surface -> internal layout/compile spec).
 _LAYOUT_KNOB = {"auto": None, "dense": Layout.DENSE, "flat": Layout.FLAT}
 _COMPILE_KNOB = {"off": EAGER, "graph": COMPILED_STEP, "dynamic": COMPILED_DYNAMIC}
+# Old torch.compile-mode strings (consumers' `compile_mode=`) -> new `compile` knob.
+# None is handled by the ctor guard (None -> "off"); new values pass through.
+_COMPILE_MODE_ALIAS = {
+    "none": "off", "off": "off", "graph": "graph", "dynamic": "dynamic",
+    "default": "graph", "reduce-overhead": "graph", "max-autotune": "graph",
+}
 
 
 class BackwardGrounder(nn.Module):
@@ -60,6 +66,7 @@ class BackwardGrounder(nn.Module):
         flat_intermediate: bool = False,
         layout: str = "auto",            # "auto" | "dense" | "flat"
         compile: str = "off",            # "off" | "graph" | "dynamic"
+        compile_mode: Optional[str] = None,  # consumer one-window alias for `compile`
         chunk_size: Optional[int] = None,
         pack_dedup: bool = True,
         prune_facts: bool = False,
@@ -73,6 +80,10 @@ class BackwardGrounder(nn.Module):
         standardization=None,
     ) -> None:
         super().__init__()
+        # `compile_mode` is the consumers' one-window alias for `compile` (old
+        # torch.compile mode strings). Only honored when `compile` is at default.
+        if compile_mode is not None and compile == "off":
+            compile = _COMPILE_MODE_ALIAS.get(compile_mode, compile_mode)
         # Capture the raw ctor inputs (sans kb) for rebound() — re-snapshot over a
         # rewritten KB with the IDENTICAL knobs (transform support).
         self._ctor_kwargs = dict(

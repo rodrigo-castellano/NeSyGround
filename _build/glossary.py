@@ -59,6 +59,7 @@ FIELDS: Mapping[str, str] = {
     "state_valid": "active proof-state mask [B,S]",
     "grounding_valid": "valid-grounding mask [B,C]",
     "body_atom_valid": "valid body-atom slots [..,M]",
+    "firing_valid": "per-firing validity mask [N_firings] (RuleGroundings; tkk fast path)",
     "fact_success": "fact-child unification succeeded [..,K_f]",
     "rule_success": "rule-child unification succeeded [..,K_r]",
     "has_new_body": "this state produced a new body atom this step",

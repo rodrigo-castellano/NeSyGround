@@ -26,6 +26,7 @@ class StandardizationConfig:
     padding_idx: int
     body_width: int
     enforce_runtime_range: bool = False
+    compile_mode: Optional[str] = None   # accepted for consumer compat; no-op (ExecStrategy owns compile)
 
 
 def standardize_vars_offset(
