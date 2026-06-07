@@ -156,10 +156,18 @@ def create_grounder(
     max_total_groundings: int = 64,
     fc_method: str = "spmm",
     max_goals: Optional[int] = None,
+    dataset: Optional[str] = None,
     **kwargs,
 ) -> nn.Module:
-    """Build a KB + grounder from a type string — a shim over ``make_grounder``."""
+    """Build a KB + grounder from a type string — a shim over ``make_grounder``.
+
+    ``dataset`` (optional) applies the per-dataset execution defaults from
+    ``grounder.datasets.DATASET_DEFAULTS`` (chunk_size/layout/...) so callers
+    never re-guess the optimal config; explicit kwargs always win."""
     cfg = parse_grounder_type(grounder_type)
+    from grounder.datasets import grounder_defaults
+    for _k, _v in grounder_defaults(dataset).items():
+        kwargs.setdefault(_k, _v)
     kb = KB(facts_idx, rule_heads, rule_bodies, rule_lens,
             constant_no=constant_no, predicate_no=predicate_no, padding_idx=padding_idx,
             device=device, max_facts_per_query=max_facts_per_query, fact_index_type=fact_index_type)
