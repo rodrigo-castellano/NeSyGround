@@ -92,6 +92,52 @@ class KB(nn.Module):
         self.K_r = self.rule_index.max_rule_pairs
         self.K_f = self.fact_index.max_fact_pairs
 
+    def binding_tables(self, M: int, pad: int) -> dict:
+        """Lazy per-rule variable-binding constraints (memoized; pure fn of the KB)."""
+        cache = getattr(self, "_binding_tables_cache", None)
+        num_rules = int(self.num_rules)
+        if cache is not None and cache["num_rules"] == num_rules and cache["M"] == M:
+            return cache
+        device = self.device_
+        ri = self.rule_index
+        heads = ri.rules_heads.to("cpu")
+        bodies = ri.rules_bodies.to("cpu")
+        lens = ri.rule_lens.to("cpu")
+        Nslot = 2 + 2 * M
+        head_pred = torch.full((num_rules,), pad, dtype=torch.long)
+        body_pred = torch.full((num_rules, M), pad, dtype=torch.long)
+        slot_active = torch.zeros((num_rules, Nslot), dtype=torch.bool)
+        canon_src = torch.arange(Nslot).unsqueeze(0).repeat(num_rules, 1).long()
+        for r in range(num_rules):
+            L = int(lens[r])
+            head_pred[r] = int(heads[r, 0])
+            var = [-(s + 1) for s in range(Nslot)]
+            var[0] = int(heads[r, 1]); var[1] = int(heads[r, 2])
+            slot_active[r, 0] = slot_active[r, 1] = True
+            for m in range(M):
+                body_pred[r, m] = int(bodies[r, m, 0]) if m < L else pad
+                if m < L:
+                    var[2 + 2 * m] = int(bodies[r, m, 1])
+                    var[3 + 2 * m] = int(bodies[r, m, 2])
+                    slot_active[r, 2 + 2 * m] = slot_active[r, 3 + 2 * m] = True
+            first = {}
+            for s in range(Nslot):
+                if not bool(slot_active[r, s]):
+                    continue
+                v = var[s]
+                if v in first:
+                    canon_src[r, s] = first[v]
+                else:
+                    first[v] = s
+                    canon_src[r, s] = s
+        cache = {
+            "num_rules": num_rules, "M": M,
+            "head_pred": head_pred.to(device), "body_pred": body_pred.to(device),
+            "slot_active": slot_active.to(device), "canon_src": canon_src.to(device),
+        }
+        self._binding_tables_cache = cache
+        return cache
+
     @property
     def num_facts(self) -> int:
         return self.fact_index.num_facts

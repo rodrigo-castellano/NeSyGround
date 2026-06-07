@@ -93,26 +93,19 @@ def pack_states(
     n_r = S_in * K_r
     G = rule_goals.shape[3]
 
-    bc_is_3d = body_count.dim() == 3
+    D_bc = body_count.shape[2]                          # body_count always 3-D
     if K_f > 0:
         f_goals = fact_goals.reshape(B, n_f, G, 3)
         f_valid = fact_success.reshape(B, n_f)
         f_ridx = top_ridx.unsqueeze(2).expand(B, S_in, K_f).reshape(B, n_f)
-        if bc_is_3d:
-            D_bc = body_count.shape[2]
-            f_bcount = body_count.unsqueeze(2).expand(
-                B, S_in, K_f, D_bc).reshape(B, n_f, D_bc)
-        else:
-            f_bcount = body_count.unsqueeze(2).expand(B, S_in, K_f).reshape(B, n_f)
+        f_bcount = body_count.unsqueeze(2).expand(
+            B, S_in, K_f, D_bc).reshape(B, n_f, D_bc)
         f_subs = fact_subs.reshape(B, n_f, 2, 2)
         f_parents = torch.arange(S_in, device=dev).unsqueeze(1).expand(
             S_in, K_f).reshape(n_f)
         f_parents = f_parents.unsqueeze(0).expand(B, n_f)
         if collect_evidence:
-            if bc_is_3d:
-                uninit = (body_count.sum(dim=-1) == 0)
-            else:
-                uninit = (body_count == 0)
+            uninit = (body_count.sum(dim=-1) == 0)
             is_initial = (top_ridx == -1)
             skip_fact = uninit & ~is_initial
             f_valid = f_valid & ~skip_fact.unsqueeze(-1).expand(
@@ -124,11 +117,7 @@ def pack_states(
         f_goals = torch.full((B, 0, G, 3), pad, dtype=torch.long, device=dev)
         f_valid = torch.zeros(B, 0, dtype=torch.bool, device=dev)
         f_ridx = torch.zeros(B, 0, dtype=torch.long, device=dev)
-        if bc_is_3d:
-            D_bc = body_count.shape[2]
-            f_bcount = torch.zeros(B, 0, D_bc, dtype=torch.long, device=dev)
-        else:
-            f_bcount = torch.zeros(B, 0, dtype=torch.long, device=dev)
+        f_bcount = torch.zeros(B, 0, D_bc, dtype=torch.long, device=dev)
         f_subs = torch.full((B, 0, 2, 2), pad, dtype=torch.long, device=dev)
         f_parents = torch.zeros(B, 0, dtype=torch.long, device=dev)
         f_has_new = torch.zeros(B, 0, dtype=torch.bool, device=dev)
@@ -136,26 +125,14 @@ def pack_states(
     first = (top_ridx == -1).unsqueeze(2).expand(B, S_in, K_r).reshape(B, n_r)
 
     if collect_evidence:
-        if M_rule <= 0:
-            M_rule = M_work
-        new_body_atoms = rule_goals[:, :, :, :M_rule, :].reshape(B, n_r, M_rule, 3)
-        if M_rule < M_work:
-            r_gbody = torch.full((B, n_r, M_work, 3), pad, dtype=torch.long, device=dev)
-            r_gbody[:, :, :M_rule, :] = new_body_atoms
-        elif M_rule > M_work:
-            r_gbody = new_body_atoms[:, :, :M_work, :]
-        else:
-            r_gbody = new_body_atoms
+        r_gbody = rule_goals[:, :, :, :M_rule, :].reshape(B, n_r, M_rule, 3)
         r_has_new = rule_success.reshape(B, n_r)
     else:
         r_gbody = torch.full((B, n_r, M_work, 3), pad, dtype=torch.long, device=dev)
         r_has_new = torch.zeros(B, n_r, dtype=torch.bool, device=dev)
 
-    if bc_is_3d:
-        r_bcount = body_count.unsqueeze(2).expand(
-            B, S_in, K_r, D_bc).reshape(B, n_r, D_bc)
-    else:
-        r_bcount = body_count.unsqueeze(2).expand(B, S_in, K_r).reshape(B, n_r)
+    r_bcount = body_count.unsqueeze(2).expand(
+        B, S_in, K_r, D_bc).reshape(B, n_r, D_bc)
 
     r_ridx = torch.where(
         first,
@@ -204,10 +181,7 @@ def pack_states(
     out_gbody = torch.full((B, S_out + 1, M_work, 3), pad, dtype=torch.long, device=dev)
     out_goals = torch.full((B, S_out + 1, G, 3), pad, dtype=torch.long, device=dev)
     out_ridx = torch.zeros(B, S_out + 1, dtype=torch.long, device=dev)
-    if bc_is_3d:
-        out_bcount = torch.zeros(B, S_out + 1, D_bc, dtype=torch.long, device=dev)
-    else:
-        out_bcount = torch.zeros(B, S_out + 1, dtype=torch.long, device=dev)
+    out_bcount = torch.zeros(B, S_out + 1, D_bc, dtype=torch.long, device=dev)
     out_subs = torch.full((B, S_out + 1, 2, 2), pad, dtype=torch.long, device=dev)
     out_parents = torch.zeros(B, S_out + 1, dtype=torch.long, device=dev)
     out_has_new = torch.zeros(B, S_out + 1, dtype=torch.bool, device=dev)
@@ -217,10 +191,7 @@ def pack_states(
     out_gbody.scatter_(1, ti.expand(-1, -1, M_work, 3), all_gbody)
     out_goals.scatter_(1, ti.expand(-1, -1, G, 3), all_goals)
     out_ridx.scatter_(1, target, all_ridx)
-    if bc_is_3d:
-        out_bcount.scatter_(1, target[:, :, None].expand(-1, -1, D_bc), all_bcount)
-    else:
-        out_bcount.scatter_(1, target, all_bcount)
+    out_bcount.scatter_(1, target[:, :, None].expand(-1, -1, D_bc), all_bcount)
     out_subs.scatter_(
         1, target.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 2, 2), all_subs)
     out_parents.scatter_(1, target, all_parents)
@@ -265,18 +236,14 @@ def pack_states_flat(
     G = flat_goals.size(1)
     M_work = grounding_body.shape[2]
 
-    bc_is_3d = body_count.dim() == 3
+    D_bc = body_count.shape[2]                          # body_count always 3-D
     if T == 0:
         S_out = 1
         out_valid = torch.zeros(B, S_out, dtype=torch.bool, device=dev)
         out_goals = torch.full((B, S_out, G, 3), pad, dtype=torch.long, device=dev)
         out_gbody = torch.full((B, S_out, M_work, 3), pad, dtype=torch.long, device=dev)
         out_ridx = torch.zeros(B, S_out, dtype=torch.long, device=dev)
-        if bc_is_3d:
-            D_bc = body_count.shape[2]
-            out_bcount = torch.zeros(B, S_out, D_bc, dtype=torch.long, device=dev)
-        else:
-            out_bcount = torch.zeros(B, S_out, dtype=torch.long, device=dev)
+        out_bcount = torch.zeros(B, S_out, D_bc, dtype=torch.long, device=dev)
         out_parents = torch.zeros(B, S_out, dtype=torch.long, device=dev)
         out_subs = torch.full((B, S_out, 2, 2), pad, dtype=torch.long, device=dev)
         out_has_new = torch.zeros(B, S_out, dtype=torch.bool, device=dev)
@@ -309,10 +276,7 @@ def pack_states_flat(
         flat_s = flat_s[keep]
         T = flat_goals.size(0)
 
-    if T > 0:
-        counts = torch.bincount(flat_b, minlength=B)
-    else:
-        counts = torch.zeros(B, dtype=torch.long, device=dev)
+    counts = torch.bincount(flat_b, minlength=B)
 
     pos = cumcount_flat(flat_b)
 
@@ -343,43 +307,33 @@ def pack_states_flat(
     out_goals = torch.full((B, S_out, G, 3), pad, dtype=torch.long, device=dev)
     out_gbody = torch.full((B, S_out, M_work, 3), pad, dtype=torch.long, device=dev)
     out_ridx = torch.zeros(B, S_out, dtype=torch.long, device=dev)
-    if bc_is_3d:
-        D_bc = body_count.shape[2]
-        out_bcount = torch.zeros(B, S_out, D_bc, dtype=torch.long, device=dev)
-    else:
-        out_bcount = torch.zeros(B, S_out, dtype=torch.long, device=dev)
+    out_bcount = torch.zeros(B, S_out, D_bc, dtype=torch.long, device=dev)
     out_subs = torch.full((B, S_out, 2, 2), pad, dtype=torch.long, device=dev)
     out_parents = torch.zeros(B, S_out, dtype=torch.long, device=dev)
     out_has_new = torch.zeros(B, S_out, dtype=torch.bool, device=dev)
     out_cur_ridx = torch.full((B, S_out), -1, dtype=torch.long, device=dev)
 
-    if T > 0:
-        out_goals[flat_b, pos] = flat_goals
-        if M_rule <= 0:
-            M_rule = M_work
-        new_body = flat_goals[:, :M_rule, :]
-        if M_rule < M_work:
-            new_body = torch.nn.functional.pad(
-                new_body, (0, 0, 0, M_work - M_rule), value=pad)
-        out_bcount[flat_b, pos] = body_count[flat_b, flat_s]
-        out_parents[flat_b, pos] = flat_s
-        if subs_noop:                                   # ENUM — verbatim current writes
-            out_gbody[flat_b, pos] = new_body
-            out_ridx[flat_b, pos] = flat_ridx
-            out_has_new[flat_b, pos] = True
-            out_cur_ridx[flat_b, pos] = flat_ridx
-        else:                                           # SLD/RTF — dense-equivalent provenance
-            is_fact = flat_is_fact                       # [T] bool (dedup OFF -> aligned to pos)
-            top = flat_top                               # [T] long
-            first = (top == -1)
-            eff_ridx = torch.where(is_fact, top, torch.where(first, flat_ridx, top))
-            out_ridx[flat_b, pos] = eff_ridx
-            out_has_new[flat_b, pos] = ~is_fact
-            out_cur_ridx[flat_b, pos] = torch.where(
-                is_fact, torch.full_like(flat_ridx, -1), flat_ridx)
-            out_gbody[flat_b, pos] = torch.where(
-                is_fact.view(-1, 1, 1), torch.full_like(new_body, pad), new_body)
-            out_subs[flat_b, pos] = flat_subs
+    out_goals[flat_b, pos] = flat_goals
+    new_body = flat_goals[:, :M_rule, :]
+    out_bcount[flat_b, pos] = body_count[flat_b, flat_s]
+    out_parents[flat_b, pos] = flat_s
+    if subs_noop:                                   # ENUM — verbatim current writes
+        out_gbody[flat_b, pos] = new_body
+        out_ridx[flat_b, pos] = flat_ridx
+        out_has_new[flat_b, pos] = True
+        out_cur_ridx[flat_b, pos] = flat_ridx
+    else:                                           # SLD/RTF — dense-equivalent provenance
+        is_fact = flat_is_fact                       # [T] bool (dedup OFF -> aligned to pos)
+        top = flat_top                               # [T] long
+        first = (top == -1)
+        eff_ridx = torch.where(is_fact, top, torch.where(first, flat_ridx, top))
+        out_ridx[flat_b, pos] = eff_ridx
+        out_has_new[flat_b, pos] = ~is_fact
+        out_cur_ridx[flat_b, pos] = torch.where(
+            is_fact, torch.full_like(flat_ridx, -1), flat_ridx)
+        out_gbody[flat_b, pos] = torch.where(
+            is_fact.view(-1, 1, 1), torch.full_like(new_body, pad), new_body)
+        out_subs[flat_b, pos] = flat_subs
 
     out_valid = torch.arange(S_out, device=dev).unsqueeze(0) < counts.clamp(max=S_out).unsqueeze(1)
 

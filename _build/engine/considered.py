@@ -24,46 +24,6 @@ from grounder._build.state import FiringSet
 from grounder._build.types import FlatResolvedChildren, RuleGroundings
 
 
-def _binding_tables(plan, num_rules: int, M: int, pad: int, device):
-    """Precompute per-rule variable-binding constraints (canonical rule order)."""
-    ri = plan.kb.rule_index
-    heads = ri.rules_heads.to("cpu")
-    bodies = ri.rules_bodies.to("cpu")
-    lens = ri.rule_lens.to("cpu")
-    Nslot = 2 + 2 * M
-    head_pred = torch.full((num_rules,), pad, dtype=torch.long)
-    body_pred = torch.full((num_rules, M), pad, dtype=torch.long)
-    slot_active = torch.zeros((num_rules, Nslot), dtype=torch.bool)
-    canon_src = torch.arange(Nslot).unsqueeze(0).repeat(num_rules, 1).long()
-    for r in range(num_rules):
-        L = int(lens[r])
-        head_pred[r] = int(heads[r, 0])
-        var = [-(s + 1) for s in range(Nslot)]
-        var[0] = int(heads[r, 1]); var[1] = int(heads[r, 2])
-        slot_active[r, 0] = slot_active[r, 1] = True
-        for m in range(M):
-            body_pred[r, m] = int(bodies[r, m, 0]) if m < L else pad
-            if m < L:
-                var[2 + 2 * m] = int(bodies[r, m, 1])
-                var[3 + 2 * m] = int(bodies[r, m, 2])
-                slot_active[r, 2 + 2 * m] = slot_active[r, 3 + 2 * m] = True
-        first = {}
-        for s in range(Nslot):
-            if not bool(slot_active[r, s]):
-                continue
-            v = var[s]
-            if v in first:
-                canon_src[r, s] = first[v]
-            else:
-                first[v] = s
-                canon_src[r, s] = s
-    return {
-        "num_rules": num_rules, "M": M,
-        "head_pred": head_pred.to(device), "body_pred": body_pred.to(device),
-        "slot_active": slot_active.to(device), "canon_src": canon_src.to(device),
-    }
-
-
 def _extract_considered_rows(plan, resolved, fr):
     """``(resolved, fr) -> valid considered rows`` (body in canonical order)."""
     pad = plan.kb.padding_idx
@@ -100,12 +60,8 @@ def _extract_considered_rows(plan, resolved, fr):
     if v2o is not None:
         rule_idx = v2o[rule_idx.clamp(min=0)]
 
-    sel = fr.selected_goal
-    if sel is not None:
-        head = sel[b_idx.long(), s_idx.long()]
-    else:
-        head = torch.full((rule_idx.size(0), 3), pad,
-                          dtype=torch.long, device=rule_idx.device)
+    sel = fr.selected_goal  # always set when capture_step runs
+    head = sel[b_idx.long(), s_idx.long()]
 
     return (rule_idx[valid], head[valid], body[valid], b_idx[valid].long())
 
@@ -138,7 +94,7 @@ def finalize(plan, firings) -> Optional[RuleGroundings]:
         rule_idx < 0, torch.full_like(rule_idx, num_rules), rule_idx).long()
     all_atoms_flat = torch.cat(
         [head.long().unsqueeze(1), body.long()], dim=1).reshape(-1, 3)
-    abase = int(all_atoms_flat.max().item()) + 1 if all_atoms_flat.numel() else 1
+    abase = int(all_atoms_flat.max().item()) + 1  # T>=1, never empty
     akey = (all_atoms_flat[:, 0] * abase + all_atoms_flat[:, 1]) * abase \
         + all_atoms_flat[:, 2]
     uniq_akey, ainv = torch.unique(akey, return_inverse=True)
@@ -156,7 +112,7 @@ def finalize(plan, firings) -> Optional[RuleGroundings]:
         for c in range(M + 1):
             key = key * A + ainv[:, c]
         _, inv_row = torch.unique(key, return_inverse=True)
-        n_uniq = int(inv_row.max().item()) + 1 if inv_row.numel() else 0
+        n_uniq = int(inv_row.max().item()) + 1  # T>=1, never empty
         rep = torch.zeros(n_uniq, dtype=torch.long, device=row.device)
         rep.scatter_reduce_(0, inv_row, torch.arange(T, device=row.device),
                             reduce="amax", include_self=False)
@@ -169,11 +125,7 @@ def finalize(plan, firings) -> Optional[RuleGroundings]:
     u_head = atom_table[head_atom_idx]
     u_body = atom_table[body_atom_idx]
 
-    dev = u_rule.device
-    bt = plan.binding_tables
-    if bt is None or bt["num_rules"] != num_rules or bt["M"] != M:
-        bt = _binding_tables(plan, num_rules, M, pad, dev)
-        object.__setattr__(plan, "binding_tables", bt)
+    bt = plan.kb.binding_tables(M, pad)  # KB-cached (pure fn of kb)
     rule_c = u_rule.clamp(min=0, max=num_rules - 1)
     ent = torch.cat([u_head[:, 1:3], u_body[..., 1:].reshape(-1, 2 * M)], dim=1)
     pred_ok = (u_head[:, 0] == bt["head_pred"][rule_c])

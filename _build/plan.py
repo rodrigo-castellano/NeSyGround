@@ -69,7 +69,6 @@ class RunPlan:
     variant_to_orig: Optional[Tensor]    # REFERENCE, not clone
     fact_hook: object
     rule_hook: object
-    binding_tables: object               # mutable cache slot (filled by engine)
 
     @staticmethod
     def snapshot(grounder) -> "RunPlan":
@@ -119,8 +118,7 @@ class RunPlan:
             init_state_shape=grounder._init_state_shape,
             standardize=grounder._standardize_fn is not None,
             variant_to_orig=getattr(grounder, "_variant_to_orig_t", None),
-            fact_hook=grounder.fact_hook, rule_hook=grounder.rule_hook,
-            binding_tables=None)
+            fact_hook=grounder.fact_hook, rule_hook=grounder.rule_hook)
 
     def for_chunk(self, B: int) -> "RunPlan":
         """New immutable plan with Shapes rebatched to ``B``."""

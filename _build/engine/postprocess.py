@@ -55,42 +55,28 @@ def collect_groundings(
 
     valid_grounding = all_goals_ok & is_ground & state_valid
 
-    has_head = head_per_depth is not None and collected_head is not None
-
     n_new = S
-    n_cat = C + n_new
+    n_cat = C + n_new  # > C, so the topk keeps exactly C (no pad branch)
     cb = torch.cat([collected_body, grounding_body], dim=1)
     cm = torch.cat([collected_mask, valid_grounding], dim=1)
     cr = torch.cat([collected_ridx, ridx_per_depth], dim=1)
     c_bc = torch.cat([collected_bcount, body_count], dim=1)
-    if has_head:
-        c_hd = torch.cat([collected_head, head_per_depth], dim=1)
+    c_hd = torch.cat([collected_head, head_per_depth], dim=1)
 
     cb_flat = cb.reshape(B, n_cat, G_body_flat, 3)
     cm = _dedup_groundings(cb_flat, cr, cm, G_body_flat, variant_to_orig=variant_to_orig)
 
-    n_k = min(C, n_cat)
-    _, ki = cm.to(torch.int8).topk(n_k, dim=1, largest=True, sorted=False)
+    _, ki = cm.to(torch.int8).topk(C, dim=1, largest=True, sorted=False)
 
     ki_body = ki[:, :, None, None, None].expand(-1, -1, D_dim, M_dim, 3)
     ki_ridx = ki[:, :, None].expand(-1, -1, D_dim)
-    ki_head = ki[:, :, None, None].expand(-1, -1, D_dim, 3) if has_head else None
+    ki_head = ki[:, :, None, None].expand(-1, -1, D_dim, 3)
 
-    if n_k < C:
-        p2 = C - n_k
-        out_body = torch.nn.functional.pad(
-            cb.gather(1, ki_body), (0, 0, 0, 0, 0, 0, 0, p2))
-        out_mask = torch.nn.functional.pad(cm.gather(1, ki), (0, p2))
-        out_ridx = torch.nn.functional.pad(cr.gather(1, ki_ridx), (0, 0, 0, p2))
-        out_bcount = torch.nn.functional.pad(c_bc.gather(1, ki_ridx), (0, 0, 0, p2))
-        out_head = (torch.nn.functional.pad(
-            c_hd.gather(1, ki_head), (0, 0, 0, 0, 0, p2)) if has_head else None)
-    else:
-        out_body = cb.gather(1, ki_body)
-        out_mask = cm.gather(1, ki)
-        out_ridx = cr.gather(1, ki_ridx)
-        out_bcount = c_bc.gather(1, ki_ridx)
-        out_head = c_hd.gather(1, ki_head) if has_head else None
+    out_body = cb.gather(1, ki_body)
+    out_mask = cm.gather(1, ki)
+    out_ridx = cr.gather(1, ki_ridx)
+    out_bcount = c_bc.gather(1, ki_ridx)
+    out_head = c_hd.gather(1, ki_head)
 
     if deactivate:
         state_valid = state_valid & ~valid_grounding
@@ -100,7 +86,7 @@ def collect_groundings(
 
 def _dedup_groundings(
     body: Tensor,       # [B, N, G_body, 3]
-    ridx: Tensor,       # [B, N] or [B, N, D]
+    ridx: Tensor,       # [B, N, D]
     mask: Tensor,       # [B, N]
     G_body: int,
     *,
@@ -114,17 +100,13 @@ def _dedup_groundings(
     atom_hashes = (body[..., 0].long() * P1
                    + body[..., 1].long() * P2
                    + body[..., 2].long() * P3)
-    if ridx.dim() == 3:
-        D = ridx.shape[2]
-        M = G_body // D
-        ah_sorted, _ = atom_hashes.view(B, N, D, M).sort(dim=-1)
-        m_powers = _pow_desc(P4, M, dev)
-        per_depth_hash = (ah_sorted * m_powers).sum(dim=-1)
-        d_powers = _pow_desc(P5, D, dev)
-        body_hash = (per_depth_hash * d_powers).sum(dim=-1)
-    else:
-        powers = _pow_desc(P4, G_body, dev)
-        body_hash = (atom_hashes * powers).sum(dim=-1)
+    D = ridx.shape[2]  # ridx is always 3-D ([B, N, D])
+    M = G_body // D
+    ah_sorted, _ = atom_hashes.view(B, N, D, M).sort(dim=-1)
+    m_powers = _pow_desc(P4, M, dev)
+    per_depth_hash = (ah_sorted * m_powers).sum(dim=-1)
+    d_powers = _pow_desc(P5, D, dev)
+    body_hash = (per_depth_hash * d_powers).sum(dim=-1)
 
     ridx_long = ridx.long()
     if variant_to_orig is not None:
@@ -134,12 +116,8 @@ def _dedup_groundings(
     else:
         ridx_eff = ridx_long
 
-    if ridx.dim() == 3:
-        D = ridx.shape[2]
-        r_powers = _pow_desc(P4, D, dev)
-        ridx_hash = (ridx_eff * r_powers).sum(dim=-1)
-    else:
-        ridx_hash = ridx_eff
+    r_powers = _pow_desc(P4, D, dev)
+    ridx_hash = (ridx_eff * r_powers).sum(dim=-1)
 
     g_hash = ridx_hash * P1 + body_hash
 
