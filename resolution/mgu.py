@@ -266,7 +266,7 @@ def init_mgu(
 
     max_vars_per_rule = (int(rule_index.rule_lens_sorted.max().item()) + 2
                          if rule_index.rule_lens_sorted.numel() > 0 else 3)
-    C = (min(max_total_groundings, rule_index.R_eff * max(max_groundings_per_rule, 1))
+    C = (min(max_total_groundings, rule_index.max_rule_pairs * max(max_groundings_per_rule, 1))
          if max_groundings_per_rule is not None else max_total_groundings)
     return {"K": K, "K_f": K_f, "max_vars_per_rule": max_vars_per_rule,
             "C": C, "max_fact_pairs_body": K_f}

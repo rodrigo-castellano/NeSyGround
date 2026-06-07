@@ -187,10 +187,16 @@ class BackwardGrounder(nn.Module):
             fc_method=fc_method, fc_depth=fc_depth)
 
         # ── pre-resolved exec cell axes (read by plan.snapshot; no map leak) ──
-        self._exec_compile = _COMPILE_KNOB[self._compile_knob]
         _lay = _LAYOUT_KNOB[self._layout_knob]
         self._exec_layout = (_lay if _lay is not None
                              else (Layout.FLAT if self._flat_intermediate else Layout.DENSE))
+        # FLAT is eager-only by capability. When the layout AUTO-resolved to flat,
+        # a compile preference (incl. the consumer compile_mode alias) downgrades to
+        # EAGER — matches the legacy flat semantics. But an EXPLICIT layout='flat'
+        # + compile knob is an illegal combo: leave it for validate() to reject.
+        self._exec_compile = (
+            EAGER if (self._exec_layout is Layout.FLAT and self._layout_knob == "auto")
+            else _COMPILE_KNOB[self._compile_knob])
 
     # ------------------------------------------------------------------
     # Per-resolution init
@@ -329,6 +335,10 @@ class BackwardGrounder(nn.Module):
             rg = RuleGroundings.empty(
                 num_rules=int(getattr(self.kb, "num_rules", 0) or 0),
                 M=self.kb.M, device=queries.device)
+        # Pin queries into the atom pool so tkk's pool-iter _rule_loop can
+        # gather pool[query_pool_idx] for every query, provable or not.
+        from grounder.backward.considered import populate_query_pool_idx
+        rg = populate_query_pool_idx(rg, queries, self.kb.padding_idx)
         return rg
 
     def __repr__(self) -> str:

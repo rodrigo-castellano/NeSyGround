@@ -165,4 +165,58 @@ def finalize(plan, firings) -> Optional[RuleGroundings]:
     )
 
 
-__all__ = ["capture_step", "finalize"]
+def _atom_hash(atoms: Tensor) -> Tensor:
+    """Injective int64 key for atom triples ``(p, a0, a1)`` (..., 3) -> (...)."""
+    a = atoms.long()
+    base = int(a.max().item()) + 1 if a.numel() else 1
+    return (a[..., 0] * base + a[..., 1]) * base + a[..., 2]
+
+
+def populate_query_pool_idx(
+    rg: RuleGroundings, queries: Tensor, padding_idx: int,
+) -> RuleGroundings:
+    """Extend ``rg.atom_table`` to cover every query atom and set ``query_pool_idx``.
+
+    Pool-iter reasoners (SBR/DCR/R2N via tkk ``_rule_loop``) gather
+    ``pool[query_pool_idx]`` regardless of provability, so each query
+    ``(pred, h, t)`` needs a slot in the atom table even when no firing
+    produced it as a head. Atoms already present keep their slot; novel
+    queries are appended (the 0..N-1 prefix stays stable so existing
+    body/head pool indices remain valid). ``query_pool_idx`` is ``[B]``."""
+    queries = queries.long()
+    device = queries.device
+    pool = rg.atom_table.to(device)
+
+    # Hash over the union so query and pool keys share one base — atom_hash's
+    # per-call max base would diverge between the two tensors otherwise.
+    both = torch.cat([pool, queries], dim=0) if pool.numel() else queries
+    base = int(both.max().item()) + 1 if both.numel() else 1
+
+    def _h(a: Tensor) -> Tensor:
+        a = a.long()
+        return (a[..., 0] * base + a[..., 1]) * base + a[..., 2]
+
+    pool_h = _h(pool)
+    query_h = _h(queries)
+    in_pool = (query_h.unsqueeze(1) == pool_h.unsqueeze(0)).any(dim=1) \
+        if pool.numel() else torch.zeros_like(query_h, dtype=torch.bool)
+
+    novel = queries[~in_pool]
+    novel_h = _h(novel)
+    nuniq_h, ninv = torch.unique(novel_h, return_inverse=True)
+    rep = torch.zeros(nuniq_h.shape[0], dtype=torch.long, device=device)
+    rep.scatter_reduce_(0, ninv, torch.arange(novel.size(0), device=device),
+                        reduce="amax", include_self=False)
+    new_pool = torch.cat([pool, novel[rep]], dim=0)
+
+    new_h = _h(new_pool)
+    sort_idx = new_h.argsort()
+    pos = torch.searchsorted(new_h[sort_idx], query_h)
+    query_pool_idx = sort_idx[pos]
+
+    return replace(rg, atom_table=new_pool.contiguous(),
+                   num_atoms=int(new_pool.shape[0]),
+                   query_pool_idx=query_pool_idx)
+
+
+__all__ = ["capture_step", "finalize", "populate_query_pool_idx"]
