@@ -1,15 +1,31 @@
 {
   "_meta": {
     "device": "cpu",
+    "frozen_from_env": "old",
     "gate_fields": [
       "sha",
       "n_firings",
       "ground_proofs"
     ],
     "max_queries": 50,
-    "n_cells": 14
+    "n_cells": 40
   },
   "cells": {
+    "ablation_d2|enum-dense|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "ablation_d2",
+      "ground_proofs": 0,
+      "kind": "enum-dense",
+      "n_firings": 0,
+      "n_queries": 25,
+      "num_atoms": 0,
+      "per_rule": {},
+      "rules": "rules.txt",
+      "sha": "EMPTY"
+    },
     "ablation_d2|enum-dense|w1d2": {
       "cfg": {
         "d": 2,
@@ -27,6 +43,38 @@
       "rules": "rules.txt",
       "sha": "a4235af45e128d91"
     },
+    "ablation_d2|enum-dense|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "ablation_d2",
+      "ground_proofs": 367,
+      "kind": "enum-dense",
+      "n_firings": 377,
+      "n_queries": 25,
+      "num_atoms": 564,
+      "per_rule": {
+        "0": 377
+      },
+      "rules": "rules.txt",
+      "sha": "1bbc647163ce74c9"
+    },
+    "ablation_d2|enum-flat|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "ablation_d2",
+      "ground_proofs": 0,
+      "kind": "enum-flat",
+      "n_firings": 0,
+      "n_queries": 25,
+      "num_atoms": 0,
+      "per_rule": {},
+      "rules": "rules.txt",
+      "sha": "EMPTY"
+    },
     "ablation_d2|enum-flat|w1d2": {
       "cfg": {
         "d": 2,
@@ -43,6 +91,117 @@
       },
       "rules": "rules.txt",
       "sha": "a4235af45e128d91"
+    },
+    "ablation_d2|enum-flat|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "ablation_d2",
+      "ground_proofs": 280,
+      "kind": "enum-flat",
+      "n_firings": 377,
+      "n_queries": 25,
+      "num_atoms": 564,
+      "per_rule": {
+        "0": 377
+      },
+      "rules": "rules.txt",
+      "sha": "1bbc647163ce74c9"
+    },
+    "ablation_d3|enum-dense|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "ablation_d3",
+      "ground_proofs": 0,
+      "kind": "enum-dense",
+      "n_firings": 0,
+      "n_queries": 25,
+      "num_atoms": 0,
+      "per_rule": {},
+      "rules": "rules.txt",
+      "sha": "EMPTY"
+    },
+    "ablation_d3|enum-dense|w1d2": {
+      "cfg": {
+        "d": 2,
+        "w": 1
+      },
+      "dataset": "ablation_d3",
+      "ground_proofs": 0,
+      "kind": "enum-dense",
+      "n_firings": 0,
+      "n_queries": 25,
+      "num_atoms": 0,
+      "per_rule": {},
+      "rules": "rules.txt",
+      "sha": "EMPTY"
+    },
+    "ablation_d3|enum-dense|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "ablation_d3",
+      "ground_proofs": 54,
+      "kind": "enum-dense",
+      "n_firings": 252,
+      "n_queries": 25,
+      "num_atoms": 512,
+      "per_rule": {
+        "0": 252
+      },
+      "rules": "rules.txt",
+      "sha": "c94e15756b5b33f1"
+    },
+    "ablation_d3|enum-flat|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "ablation_d3",
+      "ground_proofs": 0,
+      "kind": "enum-flat",
+      "n_firings": 0,
+      "n_queries": 25,
+      "num_atoms": 0,
+      "per_rule": {},
+      "rules": "rules.txt",
+      "sha": "EMPTY"
+    },
+    "ablation_d3|enum-flat|w1d2": {
+      "cfg": {
+        "d": 2,
+        "w": 1
+      },
+      "dataset": "ablation_d3",
+      "ground_proofs": 0,
+      "kind": "enum-flat",
+      "n_firings": 0,
+      "n_queries": 25,
+      "num_atoms": 0,
+      "per_rule": {},
+      "rules": "rules.txt",
+      "sha": "EMPTY"
+    },
+    "ablation_d3|enum-flat|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "ablation_d3",
+      "ground_proofs": 46,
+      "kind": "enum-flat",
+      "n_firings": 252,
+      "n_queries": 25,
+      "num_atoms": 512,
+      "per_rule": {
+        "0": 252
+      },
+      "rules": "rules.txt",
+      "sha": "c94e15756b5b33f1"
     },
     "countries_s2|RTF|d2": {
       "cfg": {
@@ -75,6 +234,23 @@
       "rules": "rules.txt",
       "sha": "d89d732d98097181"
     },
+    "countries_s2|enum-dense|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "countries_s2",
+      "ground_proofs": 67,
+      "kind": "enum-dense",
+      "n_firings": 67,
+      "n_queries": 24,
+      "num_atoms": 142,
+      "per_rule": {
+        "1": 67
+      },
+      "rules": "rules.txt",
+      "sha": "a4d533c9b44525fd"
+    },
     "countries_s2|enum-dense|w1d2": {
       "cfg": {
         "d": 2,
@@ -92,6 +268,40 @@
       "rules": "rules.txt",
       "sha": "b79f91812f9e21b0"
     },
+    "countries_s2|enum-dense|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "countries_s2",
+      "ground_proofs": 311,
+      "kind": "enum-dense",
+      "n_firings": 165,
+      "n_queries": 24,
+      "num_atoms": 293,
+      "per_rule": {
+        "1": 165
+      },
+      "rules": "rules.txt",
+      "sha": "c10b9c2e9e6be637"
+    },
+    "countries_s2|enum-flat|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "countries_s2",
+      "ground_proofs": 67,
+      "kind": "enum-flat",
+      "n_firings": 67,
+      "n_queries": 24,
+      "num_atoms": 142,
+      "per_rule": {
+        "1": 67
+      },
+      "rules": "rules.txt",
+      "sha": "a4d533c9b44525fd"
+    },
     "countries_s2|enum-flat|w1d2": {
       "cfg": {
         "d": 2,
@@ -108,6 +318,135 @@
       },
       "rules": "rules.txt",
       "sha": "b79f91812f9e21b0"
+    },
+    "countries_s2|enum-flat|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "countries_s2",
+      "ground_proofs": 273,
+      "kind": "enum-flat",
+      "n_firings": 165,
+      "n_queries": 24,
+      "num_atoms": 293,
+      "per_rule": {
+        "1": 165
+      },
+      "rules": "rules.txt",
+      "sha": "c10b9c2e9e6be637"
+    },
+    "countries_s3|enum-dense|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "countries_s3",
+      "ground_proofs": 42,
+      "kind": "enum-dense",
+      "n_firings": 42,
+      "n_queries": 24,
+      "num_atoms": 100,
+      "per_rule": {
+        "1": 1,
+        "2": 41
+      },
+      "rules": "rules.txt",
+      "sha": "1d8434c2c00eda0b"
+    },
+    "countries_s3|enum-dense|w1d2": {
+      "cfg": {
+        "d": 2,
+        "w": 1
+      },
+      "dataset": "countries_s3",
+      "ground_proofs": 313,
+      "kind": "enum-dense",
+      "n_firings": 766,
+      "n_queries": 24,
+      "num_atoms": 674,
+      "per_rule": {
+        "0": 74,
+        "1": 143,
+        "2": 549
+      },
+      "rules": "rules.txt",
+      "sha": "788216962f5d3bbe"
+    },
+    "countries_s3|enum-dense|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "countries_s3",
+      "ground_proofs": 564,
+      "kind": "enum-dense",
+      "n_firings": 3129,
+      "n_queries": 24,
+      "num_atoms": 992,
+      "per_rule": {
+        "0": 81,
+        "1": 608,
+        "2": 2440
+      },
+      "rules": "rules.txt",
+      "sha": "e40f544a72b5be23"
+    },
+    "countries_s3|enum-flat|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "countries_s3",
+      "ground_proofs": 42,
+      "kind": "enum-flat",
+      "n_firings": 42,
+      "n_queries": 24,
+      "num_atoms": 100,
+      "per_rule": {
+        "1": 1,
+        "2": 41
+      },
+      "rules": "rules.txt",
+      "sha": "1d8434c2c00eda0b"
+    },
+    "countries_s3|enum-flat|w1d2": {
+      "cfg": {
+        "d": 2,
+        "w": 1
+      },
+      "dataset": "countries_s3",
+      "ground_proofs": 813,
+      "kind": "enum-flat",
+      "n_firings": 783,
+      "n_queries": 24,
+      "num_atoms": 680,
+      "per_rule": {
+        "0": 74,
+        "1": 143,
+        "2": 566
+      },
+      "rules": "rules.txt",
+      "sha": "02224d0ca2665bbc"
+    },
+    "countries_s3|enum-flat|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "countries_s3",
+      "ground_proofs": 2677,
+      "kind": "enum-flat",
+      "n_firings": 3349,
+      "n_queries": 24,
+      "num_atoms": 1003,
+      "per_rule": {
+        "0": 83,
+        "1": 613,
+        "2": 2653
+      },
+      "rules": "rules.txt",
+      "sha": "db27b19f49c7523a"
     },
     "family|RTF|d3": {
       "cfg": {
@@ -160,6 +499,30 @@
       },
       "rules": "rules_old.txt",
       "sha": "865bd52a40954f82"
+    },
+    "family|enum-dense|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "family",
+      "ground_proofs": 195,
+      "kind": "enum-dense",
+      "n_firings": 195,
+      "n_queries": 50,
+      "num_atoms": 296,
+      "per_rule": {
+        "0": 46,
+        "1": 32,
+        "2": 38,
+        "3": 46,
+        "4": 7,
+        "5": 16,
+        "6": 2,
+        "7": 8
+      },
+      "rules": "rules_old.txt",
+      "sha": "47c40c378d39fa6c"
     },
     "family|enum-dense|w1d2": {
       "cfg": {
@@ -236,6 +599,30 @@
       },
       "rules": "rules_old.txt",
       "sha": "ee8e1bff079776ed"
+    },
+    "family|enum-flat|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "family",
+      "ground_proofs": 195,
+      "kind": "enum-flat",
+      "n_firings": 195,
+      "n_queries": 50,
+      "num_atoms": 296,
+      "per_rule": {
+        "0": 46,
+        "1": 32,
+        "2": 38,
+        "3": 46,
+        "4": 7,
+        "5": 16,
+        "6": 2,
+        "7": 8
+      },
+      "rules": "rules_old.txt",
+      "sha": "47c40c378d39fa6c"
     },
     "family|enum-flat|w1d2": {
       "cfg": {
@@ -314,6 +701,26 @@
       "rules": "rules_old.txt",
       "sha": "297f605917aa35ac"
     },
+    "wn18rr|enum-dense|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "wn18rr",
+      "ground_proofs": 55,
+      "kind": "enum-dense",
+      "n_firings": 55,
+      "n_queries": 50,
+      "num_atoms": 101,
+      "per_rule": {
+        "0": 12,
+        "1": 10,
+        "2": 30,
+        "3": 3
+      },
+      "rules": "rules.txt",
+      "sha": "698c3605aafcfca2"
+    },
     "wn18rr|enum-dense|w1d2": {
       "cfg": {
         "d": 2,
@@ -334,6 +741,47 @@
       "rules": "rules.txt",
       "sha": "c9b060e4853c57cb"
     },
+    "wn18rr|enum-dense|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "wn18rr",
+      "ground_proofs": 980,
+      "kind": "enum-dense",
+      "n_firings": 630,
+      "n_queries": 50,
+      "num_atoms": 2373,
+      "per_rule": {
+        "0": 207,
+        "1": 241,
+        "2": 140,
+        "3": 38,
+        "4": 4
+      },
+      "rules": "rules.txt",
+      "sha": "aae279399336ac22"
+    },
+    "wn18rr|enum-flat|w0d1": {
+      "cfg": {
+        "d": 1,
+        "w": 0
+      },
+      "dataset": "wn18rr",
+      "ground_proofs": 55,
+      "kind": "enum-flat",
+      "n_firings": 55,
+      "n_queries": 50,
+      "num_atoms": 101,
+      "per_rule": {
+        "0": 12,
+        "1": 10,
+        "2": 30,
+        "3": 3
+      },
+      "rules": "rules.txt",
+      "sha": "698c3605aafcfca2"
+    },
     "wn18rr|enum-flat|w1d2": {
       "cfg": {
         "d": 2,
@@ -353,6 +801,27 @@
       },
       "rules": "rules.txt",
       "sha": "a5c539aa84cf24ba"
+    },
+    "wn18rr|enum-flat|w1d3": {
+      "cfg": {
+        "d": 3,
+        "w": 1
+      },
+      "dataset": "wn18rr",
+      "ground_proofs": 496,
+      "kind": "enum-flat",
+      "n_firings": 860,
+      "n_queries": 50,
+      "num_atoms": 2373,
+      "per_rule": {
+        "0": 321,
+        "1": 355,
+        "2": 140,
+        "3": 40,
+        "4": 4
+      },
+      "rules": "rules.txt",
+      "sha": "53686838d5ef5ed7"
     }
   }
 }

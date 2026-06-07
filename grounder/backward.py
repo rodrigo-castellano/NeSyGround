@@ -340,8 +340,14 @@ class BackwardGrounder(nn.Module):
         return CapabilityRow(frozenset(cells))
 
     @torch.no_grad()
-    def run_bc(self, queries: Tensor, query_mask: Tensor, **init_kwargs) -> RuleGroundings:
-        """Rule-evidence entry point — forces collect_rule_groundings, returns rg."""
+    def run_bc(self, queries: Tensor, query_mask: Tensor, *,
+               pad_outputs: bool = False, **init_kwargs) -> RuleGroundings:
+        """Rule-evidence entry point — forces collect_rule_groundings, returns rg.
+
+        ``pad_outputs=True`` pads the returned rg to power-of-two shapes (per-rule
+        firings + atom_table) so the downstream compiled reasoner sees a bounded
+        set of graph variants — essential for the OOM-prone flat-path cells
+        (family|BC{12,13}, countries_s3|BC13) under reduce-overhead compile."""
         prev = self._collect_rule_groundings
         self._collect_rule_groundings = True
         try:
@@ -361,6 +367,18 @@ class BackwardGrounder(nn.Module):
         # gather pool[query_pool_idx] for every query, provable or not.
         from grounder.backward.considered import populate_query_pool_idx
         rg = populate_query_pool_idx(rg, queries, self.kb.padding_idx)
+        if pad_outputs:
+            from grounder.backward.considered import (
+                pad_rule_groundings, next_pow2)
+            if rg.rule_offsets.numel() > 1:
+                sizes = rg.rule_offsets[1:] - rg.rule_offsets[:-1]
+                max_K_r = int(sizes.max().item()) if sizes.numel() else 0
+                if max_K_r > 0:
+                    G_pad = next_pow2(max(max_K_r, 1))
+                    atom_cap = next_pow2(max(int(rg.atom_table.size(0)) + 1, 16))
+                    rg = pad_rule_groundings(
+                        rg, pad_per_rule_to=G_pad, pad_atom_table_to=atom_cap,
+                        pad_idx_for_atoms=0)
         return rg
 
     def __repr__(self) -> str:

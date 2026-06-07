@@ -1,13 +1,24 @@
 """NEW grounding-fingerprint harness — gates the rebuilt engine against the frozen
-14-cell baseline (``tests/baselines/ground_fingerprint.json``).
+oracle baseline (``tests/baselines/ground_fingerprint.json``, frozen from the OLD
+grounder).
 
-Builds the NEW ``BackwardGrounder`` per cell (CPU/eager, 50 queries), computes the
-SAME canonical SHA the OLD harness uses over ``out.rule_groundings`` +
-``out.evidence.count``, and diffs against the frozen JSON.
+For every cell it builds the NEW ``BackwardGrounder`` (CPU/eager, 50 queries) and
+computes the SAME canonical SHA the OLD harness uses over ``out.rule_groundings`` +
+``out.evidence.count``, then checks TWO things:
+
+  1. byte-identity vs the frozen baseline  (new == old grounding output), and
+  2. batch-size invariance: the cell is re-run at chunk sizes {None, 8, 4, 1} and
+     every run must produce the IDENTICAL SHA (the chunk driver must not change
+     what is grounded).
+
+Matrix: 6 datasets {ablation_d2, ablation_d3, countries_s2, countries_s3, family,
+wn18rr} x bc01/bc12/bc13 x {enum-flat, enum-dense}, plus SLD/RTF on family d3 and
+countries_s2 d2 = 40 cells.
 
 Usage:
-    python tests/fingerprint_new.py            # check all 14
+    python tests/fingerprint_new.py                 # check all 40, all batch sizes
     python tests/fingerprint_new.py --cell family|SLD|d3
+    python tests/fingerprint_new.py --no-batch-invariance   # full-batch only (fast)
 """
 from __future__ import annotations
 
@@ -27,33 +38,37 @@ _BASELINE = (_HERE / "baselines" / "ground_fingerprint.json")
 _RULES_FILE = {"family": "rules_old.txt"}
 _GATE_FIELDS = ("sha", "n_firings", "ground_proofs")
 _DEFAULT_MAX_QUERIES = 50
+_BATCH_SIZES = (None, 8, 4, 1)   # None = all queries in one chunk
 
-_MATRIX = [
-    ("family", "enum-flat",  {"w": 1, "d": 2}),
-    ("family", "enum-flat",  {"w": 1, "d": 3}),
-    ("family", "enum-dense", {"w": 1, "d": 2}),
-    ("family", "enum-dense", {"w": 1, "d": 3}),
-    ("family", "SLD", {"depth": 3}),
-    ("family", "RTF", {"depth": 3}),
-    ("countries_s2", "enum-flat",  {"w": 1, "d": 2}),
-    ("countries_s2", "enum-dense", {"w": 1, "d": 2}),
-    ("countries_s2", "SLD", {"depth": 2}),
-    ("countries_s2", "RTF", {"depth": 2}),
-    ("ablation_d2", "enum-flat",  {"w": 1, "d": 2}),
-    ("ablation_d2", "enum-dense", {"w": 1, "d": 2}),
-    ("wn18rr", "enum-flat",  {"w": 1, "d": 2}),
-    ("wn18rr", "enum-dense", {"w": 1, "d": 2}),
-]
+_ENUM_DATASETS = ("ablation_d2", "ablation_d3", "countries_s2", "countries_s3",
+                  "family", "wn18rr")
+_ENUM_WD = ((0, 1), (1, 2), (1, 3))   # bc01, bc12, bc13
 
 
-def _build_grounder(kind: str, kb, cfg: dict) -> BackwardGrounder:
+def _build_matrix():
+    cells = []
+    for ds in _ENUM_DATASETS:
+        for (w, d) in _ENUM_WD:
+            for kind in ("enum-flat", "enum-dense"):
+                cells.append((ds, kind, {"w": w, "d": d}))
+    for ds, dep in (("family", 3), ("countries_s2", 2)):
+        cells.append((ds, "SLD", {"depth": dep}))
+        cells.append((ds, "RTF", {"depth": dep}))
+    return cells
+
+
+_MATRIX = _build_matrix()
+
+
+def _build_grounder(kind: str, kb, cfg: dict, chunk_size=None) -> BackwardGrounder:
     """Mirror ``tests/_runners.build_torch_grounder`` config exactly."""
     if kind in ("SLD", "RTF"):
         return BackwardGrounder(
             kb, resolution="sld" if kind == "SLD" else "rtf", filter="none",
             depth=cfg["depth"], max_total_groundings=4096,
             max_derived_per_state=64, max_states=256, prune_facts=True,
-            collect_evidence=True, collect_rule_groundings=True)
+            collect_evidence=True, collect_rule_groundings=True,
+            chunk_size=chunk_size)
     if kind in ("enum-flat", "enum-dense"):
         flat = (kind == "enum-flat")
         return BackwardGrounder(
@@ -61,7 +76,8 @@ def _build_grounder(kind: str, kb, cfg: dict) -> BackwardGrounder:
             flat_intermediate=flat, max_groundings_per_query=64,
             max_total_groundings=4096, max_states=256, prune_facts=True,
             bump_s_to_k=False, init_state_shape="minimal",
-            collect_evidence=True, collect_rule_groundings=True)
+            collect_evidence=True, collect_rule_groundings=True,
+            chunk_size=chunk_size)
     raise ValueError(f"unsupported kind: {kind!r}")
 
 
@@ -117,7 +133,8 @@ def _cell_key(dataset, kind, cfg) -> str:
     return f"{dataset}|{kind}|w{cfg['w']}d{cfg['d']}"
 
 
-def compute_fingerprint(dataset, kind, cfg, *, data_root, max_queries=_DEFAULT_MAX_QUERIES) -> dict:
+def compute_fingerprint(dataset, kind, cfg, *, data_root,
+                        max_queries=_DEFAULT_MAX_QUERIES, chunk_size=None) -> dict:
     ds_path = Path(data_root).expanduser() / dataset
     rules_file = _RULES_FILE.get(dataset, "rules.txt")
     ds = KGDataset(str(ds_path), device="cpu", rules_file=rules_file)
@@ -127,7 +144,7 @@ def compute_fingerprint(dataset, kind, cfg, *, data_root, max_queries=_DEFAULT_M
         queries = queries[:max_queries]
     qmask = torch.ones(queries.shape[0], dtype=torch.bool, device=queries.device)
 
-    g = _build_grounder(kind, kb, cfg)
+    g = _build_grounder(kind, kb, cfg, chunk_size=chunk_size)
     with torch.no_grad():
         out = g(queries, qmask)
 
@@ -142,9 +159,12 @@ def main() -> None:
     p.add_argument("--data-root", default=str(Path.home() / "repos/data-swarm/main"))
     p.add_argument("--max-queries", type=int, default=_DEFAULT_MAX_QUERIES)
     p.add_argument("--cell", default=None, help="run a single cell key, e.g. 'family|SLD|d3'")
+    p.add_argument("--no-batch-invariance", action="store_true",
+                   help="full-batch only; skip the chunk-size invariance sweep")
     args = p.parse_args()
 
     frozen = json.loads(_BASELINE.read_text())["cells"]
+    batch_sizes = (None,) if args.no_batch_invariance else _BATCH_SIZES
 
     matrix = _MATRIX
     if args.cell:
@@ -155,10 +175,13 @@ def main() -> None:
     drift = []
     for dataset, kind, cfg in matrix:
         key = _cell_key(dataset, kind, cfg)
+        # full-batch fingerprint vs the frozen oracle
         fp = compute_fingerprint(dataset, kind, cfg, data_root=args.data_root,
-                                 max_queries=args.max_queries)
+                                 max_queries=args.max_queries, chunk_size=None)
         exp = frozen.get(key, {})
         status = "OK"
+        if not exp:
+            status = "DRIFT"; drift.append((key, "NOT in baseline"))
         for field in _GATE_FIELDS:
             if exp.get(field) != fp.get(field):
                 status = "DRIFT"
@@ -166,16 +189,28 @@ def main() -> None:
                 if field == "sha":
                     drift.append((key, f"  per_rule exp={exp.get('per_rule')}"))
                     drift.append((key, f"  per_rule new={fp.get('per_rule')}"))
-        print(f"  [{status:5s}] {key:30s} sha={fp['sha']} "
+        # batch-size invariance: every chunk size must reproduce the full-batch SHA
+        inv = "INVARIANT"
+        for bs in batch_sizes:
+            if bs is None:
+                continue
+            fp_bs = compute_fingerprint(dataset, kind, cfg, data_root=args.data_root,
+                                        max_queries=args.max_queries, chunk_size=bs)
+            if fp_bs["sha"] != fp["sha"]:
+                status = "DRIFT"; inv = "BATCH-VARYING"
+                drift.append((key, f"chunk={bs}: sha {fp['sha']} -> {fp_bs['sha']}"))
+        print(f"  [{status:5s}] {key:30s} sha={fp['sha']:>16} "
               f"n_firings={fp['n_firings']:>6} ground_proofs={fp['ground_proofs']:>6} "
-              f"num_atoms={fp['num_atoms']:>6}")
+              f"[{inv}]")
 
     if drift:
         print(f"\nFAIL — {len(drift)} drift line(s):")
         for key, msg in drift:
             print(f"  DRIFT {key}: {msg}")
         sys.exit(1)
-    print(f"\nPASS — all {len(matrix)} cells match the frozen fingerprint.")
+    n_bs = len(batch_sizes)
+    print(f"\nPASS — all {len(matrix)} cells match the frozen oracle "
+          f"AND are batch-invariant across {n_bs} chunk size(s).")
 
 
 if __name__ == "__main__":
