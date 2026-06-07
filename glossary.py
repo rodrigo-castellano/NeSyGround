@@ -55,6 +55,8 @@ FIELDS: Mapping[str, str] = {
     "head_per_depth": "per-depth head atom [B,S,D,3]",
     "selected_goal": "the goal atom selected this step [..,3]",
     "next_var": "next free-variable id (standardization only)",
+    "initial_next_var": "passed-in next_var; terminal-standardize base [B]",
+    "initial_goals": "passed-in goal atoms; terminal-standardize parents [B,M_in,3]",
     # ── validity masks (the <thing>_valid family) ──
     "state_valid": "active proof-state mask [B,S]",
     "grounding_valid": "valid-grounding mask [B,C]",

@@ -86,6 +86,11 @@ def init_frontier(
         body_count=body_count,
         next_var=next_var,
         selected_goal=None,
+        # Terminal standardize (build_proof_state) renames output vars relative to
+        # the passed-in next_var / goals — captured here, untouched by step.
+        initial_next_var=next_var,
+        initial_goals=(initial_goals if initial_goals is not None
+                       else proof_goals.new_zeros(B, 0, 3)),
     )
     coll = None
     if plan.output_spec.trees:

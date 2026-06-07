@@ -48,6 +48,8 @@ class Frontier:
     body_count: Tensor            # [B, S, D]       per-depth #body atoms bound
     next_var: Optional[Tensor] = None      # [B]      var-renaming counter (standardization only)
     selected_goal: Optional[Tensor] = None  # [B, S, 3] goal selected this step (provenance)
+    initial_next_var: Optional[Tensor] = None  # [B]    passed-in next_var (terminal standardize base)
+    initial_goals: Optional[Tensor] = None     # [B, M_in, 3] passed-in goals (terminal standardize parents)
 
     def replace(self, **kw) -> "Frontier":
         return replace(self, **kw)

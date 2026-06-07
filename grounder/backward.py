@@ -135,7 +135,17 @@ class BackwardGrounder(nn.Module):
         self.hooks = list(hooks) if hooks else []
         self.fact_hook = fact_hook
         self.rule_hook = rule_hook
-        self._standardize_fn = None
+        # A standardization config flips on next_var emission in the output
+        # ProofState (the renaming itself is inlined in resolution; this only
+        # gates whether build_proof_state surfaces the tracked fr.next_var).
+        if standardization is not None:
+            from grounder.resolution.standardize import build_standardize_fn
+            self._standardize_fn = build_standardize_fn(standardization)
+        else:
+            self._standardize_fn = None
+        # Always-present default spec so plan.snapshot reads an attribute (never
+        # evaluates an OutputSpec() default → no frozenset build under compile).
+        self.output_spec = OutputSpec(frozenset({Tier.PROOF_STATE}))
 
         # ── exec-surface knobs: validate + capture (auto/off/None = legacy path) ──
         if layout not in _LAYOUT_KNOB:
@@ -266,13 +276,24 @@ class BackwardGrounder(nn.Module):
     # ------------------------------------------------------------------
     def _default_output_spec(self) -> OutputSpec:
         """The grounder's standing tier set (from its collect flags) — the BC
-        request default when ``forward()`` is called without an explicit spec."""
+        request default when ``forward()`` is called without an explicit spec.
+
+        Cached and keyed on the collect flags so the compiled ``forward`` path
+        does not build a ``frozenset`` at trace time (Dynamo can't wrap it);
+        ``run_bc`` flips ``_collect_rule_groundings`` so the key triggers a
+        one-off rebuild outside any compiled region."""
+        key = (self._collect_rule_groundings, self.collect_evidence)
+        cached = self.__dict__.get("_default_output_spec_cache")
+        if cached is not None and cached[0] == key:
+            return cached[1]
         tiers = {Tier.PROOF_STATE}
         if self._collect_rule_groundings:
             tiers.add(Tier.FIRINGS)
         if self.collect_evidence:
             tiers.add(Tier.TREES)
-        return OutputSpec(frozenset(tiers))
+        spec = OutputSpec(frozenset(tiers))
+        self.__dict__["_default_output_spec_cache"] = (key, spec)
+        return spec
 
     @torch.no_grad()
     def ground(self, request: GroundRequest) -> BackwardResult:
@@ -287,13 +308,14 @@ class BackwardGrounder(nn.Module):
         """Compat shim — build a GroundRequest from the standing collect flags and
         delegate to ``ground()`` (byte-identical to the legacy forward path)."""
         excluded = init_kwargs.pop("excluded_queries", None)
-        req = GroundRequest(queries=queries, query_mask=query_mask,
-                            output_spec=self._default_output_spec(),
-                            excluded_queries=excluded)
+        if "next_var_indices" in init_kwargs:  # consumer one-window alias for next_var
+            init_kwargs["next_var"] = init_kwargs.pop("next_var_indices")
+        spec = self._default_output_spec()  # cached → compile-safe (no frozenset build at trace)
         if not init_kwargs:
-            return self.ground(req)
+            return self.ground(GroundRequest(queries=queries, query_mask=query_mask,
+                                             output_spec=spec, excluded_queries=excluded))
         # Rare extra init kwargs (initial_goals/next_var) bypass GroundRequest.
-        self.output_spec = req.output_spec
+        self.output_spec = spec
         return run_backward(self, queries, query_mask,
                             excluded_queries=excluded, **init_kwargs)
 

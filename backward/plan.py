@@ -8,7 +8,7 @@ runtime then redirects every hot-path read through this frozen plan.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Optional
+from typing import Callable, TYPE_CHECKING, Optional
 
 from torch import Tensor
 
@@ -64,6 +64,7 @@ class RunPlan:
     all_anchors: bool
     init_state_shape: str
     standardize: bool                    # = _standardize_fn is not None
+    standardize_fn: Optional[Callable]   # terminal output-var renaming (REFERENCE)
     variant_to_orig: Optional[Tensor]    # REFERENCE, not clone
     fact_hook: object
     rule_hook: object
@@ -100,7 +101,7 @@ class RunPlan:
                 strategy = ExecStrategy.explicit(row, Cell(Layout.DENSE, EAGER), strategy.chunk)
         return RunPlan(
             shapes=shapes, kb=kb,
-            output_spec=getattr(grounder, "output_spec", OutputSpec()),
+            output_spec=grounder.output_spec,  # always set in __init__ (no eager OutputSpec() default → compile-safe)
             strategy=strategy, pbc=pbc,
             resolution=getattr(grounder, "_dispatch_resolution", grounder.resolution),
             filter_mode=grounder.filter_mode,
@@ -116,6 +117,7 @@ class RunPlan:
             all_anchors=grounder._all_anchors,
             init_state_shape=grounder._init_state_shape,
             standardize=grounder._standardize_fn is not None,
+            standardize_fn=grounder._standardize_fn,
             variant_to_orig=getattr(grounder, "_variant_to_orig_t", None),
             fact_hook=grounder.fact_hook, rule_hook=grounder.rule_hook)
 

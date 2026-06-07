@@ -73,12 +73,28 @@ def finalize_evidence(plan, trees) -> Optional[CompletedTreeFirings]:
 
 
 def build_proof_state(plan, fr) -> ProofState:
-    """Assemble the output ``ProofState`` from the final ``Frontier``."""
+    """Assemble the output ``ProofState`` from the final ``Frontier``.
+
+    When a standardization fn is configured (and not collecting evidence), the
+    output proof_goals' variables are renamed into the runtime range relative to
+    the passed-in next_var/goals — mirrors OLD bc/step.py terminal standardize so
+    downstream consumers (DpRL env embeddings) see bounded var ids."""
+    proof_goals = fr.proof_goals
+    next_var = fr.next_var if plan.standardize else None
+    if plan.standardize_fn is not None and not plan.collect_evidence:
+        counts = fr.state_valid.long().sum(dim=1)
+        nv = fr.initial_next_var if fr.initial_next_var is not None else fr.next_var
+        inp = (fr.initial_goals if fr.initial_goals is not None
+               else proof_goals.new_zeros(proof_goals.shape[0], 0, 3))
+        std, std_nv = plan.standardize_fn(proof_goals, counts, nv, inp)
+        # Clone to detach from any compiled/CUDA-graph output buffers.
+        proof_goals = std.clone()
+        next_var = std_nv.clone()
     return ProofState(
-        proof_goals=fr.proof_goals,
+        proof_goals=proof_goals,
         state_valid=fr.state_valid,
         top_rule_idx=fr.top_rule_idx,
-        next_var=(fr.next_var if plan.standardize else None),
+        next_var=next_var,
     )
 
 
