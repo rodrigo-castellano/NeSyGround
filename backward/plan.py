@@ -99,6 +99,12 @@ class RunPlan:
             # auto they always run dense, so keep the auto cell DENSE for them.
             elif not is_pbc and strategy.cell.layout is Layout.FLAT:
                 strategy = ExecStrategy.explicit(row, Cell(Layout.DENSE, EAGER), strategy.chunk)
+            # Flat materializes only actual candidates (ragged→flat, capped by C), never
+            # the dense [B*S,K_r,G_r,M,3] intermediate the budget chunker sizes for — so
+            # drop chunking and run one pass (chunking is output-invariant; this removes
+            # the redundant per-chunk init/finalize overhead the auto budget imposed).
+            if strategy.cell.layout is Layout.FLAT and strategy.chunk.batch_size != 0:
+                strategy = ExecStrategy(strategy.cell, ChunkPolicy())
         return RunPlan(
             shapes=shapes, kb=kb,
             output_spec=grounder.output_spec,  # always set in __init__ (no eager OutputSpec() default → compile-safe)
