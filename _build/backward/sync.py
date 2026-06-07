@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 
 from grounder._build.resolution.primitives import apply_substitutions
-from grounder._build.state import Frontier
+from grounder._build.backward.state import Frontier
 
 
 def sync_accumulated(plan, fr: Frontier, sync, dsel) -> Frontier:

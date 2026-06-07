@@ -4,7 +4,7 @@
 CUDA-graph private pool (so a later replay can't overwrite a still-referenced
 tensor). It is a structural deep-clone over an arbitrary pytree (tensors inside
 tuples / NamedTuples / dataclasses / lists / dicts), so it covers both the
-step-output tuple and the nested ``GrounderOutput`` tree.
+step-output tuple and the nested ``BackwardResult`` tree.
 """
 from __future__ import annotations
 

@@ -1,7 +1,7 @@
 """Seam registries — one keyed table per axis (each has >=2 real impls).
 
 AXIS 1 (Resolver): ``RESOLVERS`` maps the backward resolution name
-``{sld, rtf, pbc, join}`` to its ``Resolver`` impl, replacing engine/step.py's
+``{sld, rtf, pbc, join}`` to its ``Resolver`` impl, replacing backward/step.py's
 if/elif. ``join`` is the L3 semantics-preserving sibling of ``pbc``.
 AXIS 3 (ForwardMethod): ``FORWARD_METHODS`` maps ``{spmm, staged}`` to its
 closure-engine impl (owned by forward/methods.py; re-exported here as the

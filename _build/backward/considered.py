@@ -20,7 +20,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from grounder._build.state import FiringSet
+from grounder._build.backward.state import FiringSet
 from grounder._build.types import FlatResolvedChildren, RuleGroundings
 
 

@@ -12,7 +12,8 @@ from grounder._build.factory import (
 )
 from grounder._build.grounder import BackwardGrounder
 from grounder._build.types import (
-    GrounderOutput, ProofState, ProofEvidence, RuleGroundings,
+    BackwardResult, CompletedTreeFirings, GrounderOutput, ProofEvidence,
+    ProofState, RuleGroundings,
 )
 
 __all__ = [
@@ -20,7 +21,9 @@ __all__ = [
     "BackwardGrounder",
     "SLDConfig", "RTFConfig", "PBCConfig", "FCConfig",
     "KB", "KGDataset", "Encoding",
-    "GrounderOutput", "ProofState", "ProofEvidence", "RuleGroundings",
+    "BackwardResult", "CompletedTreeFirings", "ProofState", "RuleGroundings",
+    # one-window back-compat aliases
+    "GrounderOutput", "ProofEvidence",
 ]
 
 

@@ -1,10 +1,10 @@
-"""Finalization — assemble ProofEvidence / ProofState / RuleGroundings.
+"""Finalization — assemble CompletedTreeFirings / ProofState / RuleGroundings.
 
 Ported from OLD ``bc/terminal.py`` + ``bc/finalize.py``, producing the NEW output
 types:
-  * ``finalize_evidence``        — terminal fp_batch filter → ``ProofEvidence``.
+  * ``finalize_evidence``        — terminal fp_batch filter → ``CompletedTreeFirings``.
   * ``build_proof_state``        — final ``states`` → ``ProofState``.
-  * ``finalize_rule_groundings`` — considered accumulator → fp_batch-pruned
+  * ``finalize_rule_groundings`` — firing accumulator → fp_batch-pruned
                                    ``RuleGroundings``.
 """
 from __future__ import annotations
@@ -15,12 +15,12 @@ import torch
 
 from grounder._build.shapes import Shapes
 from grounder._build.types import (
-    GrounderOutput, ProofEvidence, ProofState, RuleGroundings,
+    BackwardResult, CompletedTreeFirings, ProofState, RuleGroundings,
 )
 
 
 def _make_shapes(plan, B: int, C: int) -> Shapes:
-    """Minimal valid Shapes for the evidence view (consumers preserve D/M)."""
+    """Minimal valid Shapes for the completed-tree-firings view (consumers preserve D/M)."""
     kb = plan.kb
     sh = plan.shapes
     D = plan.depth
@@ -35,8 +35,8 @@ def _make_shapes(plan, B: int, C: int) -> Shapes:
     )
 
 
-def finalize_evidence(plan, trees) -> Optional[ProofEvidence]:
-    """Build ``ProofEvidence`` from run-scoped ``ProofTrees`` (chunk pieces).
+def finalize_evidence(plan, trees) -> Optional[CompletedTreeFirings]:
+    """Build ``CompletedTreeFirings`` from run-scoped ``ProofTrees`` (chunk pieces).
 
     Mirrors OLD ``terminal.filter_terminal`` + ``finalize.finalize_evidence``:
     concat the per-chunk pieces on B, then ``fp_batch`` applies ONE terminal
@@ -66,7 +66,7 @@ def finalize_evidence(plan, trees) -> Optional[ProofEvidence]:
 
     count = mask.sum(dim=1)
     shapes = _make_shapes(plan, B, C)
-    return ProofEvidence(
+    return CompletedTreeFirings(
         body=body, grounding_valid=mask, count=count, rule_idx=ridx,
         body_count=bcount, head=head, shapes=shapes,
     )
@@ -83,12 +83,12 @@ def build_proof_state(plan, fr) -> ProofState:
 
 
 def finalize_rule_groundings(plan, firings) -> Optional[RuleGroundings]:
-    """Build the "considered" RuleGroundings and apply fp_batch pruning.
+    """Build the firing-set RuleGroundings and apply fp_batch pruning.
 
     ``firings`` is the run-scoped ``FiringSet`` (global concat; query_idx IGNORED)."""
     if not plan.collect_rule_groundings:
         return None
-    from grounder._build.engine.considered import finalize as considered_finalize
+    from grounder._build.backward.considered import finalize as considered_finalize
     rule_groundings = considered_finalize(plan, firings)
     if rule_groundings is not None and plan.filter_mode == "fp_batch":
         from grounder._build.filters.fp_batch import prune_rule_groundings
@@ -124,16 +124,18 @@ def _merge_proof_states(parts: Sequence[ProofState]) -> ProofState:
                       top_rule_idx=top_rule_idx, next_var=next_var)
 
 
-def merge_finalize(plan) -> Callable[[Sequence[ProofState], object], GrounderOutput]:
+def merge_finalize(plan) -> Callable[[Sequence[ProofState], object], BackwardResult]:
     """Return the ``finalize_fn`` handed to ``ExecStrategy.merge``: stitch the
-    per-chunk proof-state ``parts`` + threaded ``RunState`` into a GrounderOutput.
-    State concats on B; evidence/rule_groundings come from the run-scoped, already
-    globally-concatenated trees/firings (ONE terminal fp_batch, never per-chunk)."""
-    def _fn(parts: Sequence[ProofState], run) -> GrounderOutput:
+    per-chunk proof-state ``parts`` + threaded ``RunState`` into a BackwardResult.
+    State concats on B; completed-tree-firings/rule_groundings come from the
+    run-scoped, already globally-concatenated trees/firings (ONE terminal fp_batch,
+    never per-chunk)."""
+    def _fn(parts: Sequence[ProofState], run) -> BackwardResult:
         state = _merge_proof_states(parts)
-        evidence = finalize_evidence(plan, run.trees)
+        completed_tree_firings = finalize_evidence(plan, run.trees)
         rule_groundings = finalize_rule_groundings(plan, run.firings)
-        return GrounderOutput(state=state, evidence=evidence,
+        return BackwardResult(state=state,
+                              completed_tree_firings=completed_tree_firings,
                               rule_groundings=rule_groundings)
     return _fn
 

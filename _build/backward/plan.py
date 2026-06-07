@@ -1,9 +1,9 @@
-"""RunPlan — the immutable shell->engine snapshot.
+"""RunPlan — the immutable shell->backward snapshot.
 
-The engine reads ONLY this (plus the threaded RunState); it NEVER reads an
-attribute off the Grounder/nn.Module. Backward grounding is reentrant +
+The backward runtime reads ONLY this (plus the threaded RunState); it NEVER reads
+an attribute off the Grounder/nn.Module. Backward grounding is reentrant +
 thread-safe by construction. ``snapshot`` reads every ``grounder.X`` ONCE; the
-engine then redirects every hot-path read through this frozen plan.
+runtime then redirects every hot-path read through this frozen plan.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ def _resolve_chunk(grounder, shapes) -> ChunkPolicy:
 
 @dataclass(frozen=True)
 class RunPlan:
-    """Per-run snapshot handed shell->engine. Immutable; ``for_chunk`` returns a
+    """Per-run snapshot handed shell->backward. Immutable; ``for_chunk`` returns a
     rebatched copy. The engine never stores any of this on the module."""
 
     shapes: Shapes

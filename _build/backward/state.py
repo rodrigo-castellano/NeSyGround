@@ -14,7 +14,7 @@ The compile-only static scatter buffer is an EXECUTION-layer local, NOT here.
 Output tiers (verified against consumers):
   - groundings : final proof state              -> ProofState      (DpRL)
   - firings    : fired rule applications        -> RuleGroundings  (torch-ns run_bc)
-  - trees      : completed proof trees          -> ProofEvidence   (probfol, torch-ns resolve)
+  - trees      : completed proof trees          -> CompletedTreeFirings (probfol, torch-ns resolve)
 """
 from __future__ import annotations
 
@@ -84,7 +84,7 @@ class FiringSet:
 @dataclass(frozen=True)
 class ProofTrees:
     """Append-only completed proof-tree pieces (one per chunk), concatenated along
-    the query axis at finalize -> ProofEvidence. Subject to the per-query C
+    the query axis at finalize -> CompletedTreeFirings. Subject to the per-query C
     budget during collection."""
 
     body: Tuple[Tensor, ...] = ()        # per chunk [B_i, C, D, M, 3]

@@ -1,8 +1,8 @@
 """BackwardGrounder — query-directed proof search (sld / rtf / pbc).
 
-The engine shell: wires the per-resolution config (init_mgu for sld/rtf, init_enum
+The backward shell: wires the per-resolution config (init_mgu for sld/rtf, init_enum
 for pbc), sets the shared layout (G, A, S, C), and drives the depth loop via
-``engine.loop.run_backward``. Ported from OLD ``bc/bc.py`` + ``bc/init_resolution.py``,
+``backward.loop.run_backward``. Ported from OLD ``bc/bc.py`` + ``bc/init_resolution.py``,
 trimmed to the eager/CPU fingerprint path (no compile, no chunking, no caches).
 
   pbc  → BC_{w,d,u}: all_anchors forced True, filter fp_batch (u=0), G_r cap.
@@ -19,7 +19,7 @@ from torch import Tensor
 from grounder._build.core.request import GroundRequest, OutputSpec, Tier
 from grounder._build.core.result import BackwardResult
 from grounder._build.data.kb import KB
-from grounder._build.engine.loop import run_backward
+from grounder._build.backward.loop import run_backward
 from grounder._build.errors import ConfigError
 from grounder._build.execution.capability import (
     COMPILED_DYNAMIC, COMPILED_STEP, EAGER, CapabilityRow, Cell,

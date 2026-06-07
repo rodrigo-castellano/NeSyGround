@@ -16,17 +16,17 @@ from typing import Optional
 
 from torch import Tensor
 
-from grounder._build.engine.buffers import init_frontier
-from grounder._build.engine.finalize import build_proof_state, merge_finalize
-from grounder._build.engine.step import step
-from grounder._build.plan import RunPlan
-from grounder._build.state import ProofTrees, RunState
-from grounder._build.types import GrounderOutput
+from grounder._build.backward.buffers import init_frontier
+from grounder._build.backward.finalize import build_proof_state, merge_finalize
+from grounder._build.backward.step import step
+from grounder._build.backward.plan import RunPlan
+from grounder._build.backward.state import ProofTrees, RunState
+from grounder._build.types import BackwardResult
 
 
 def run_backward(grounder, queries: Tensor, query_mask: Tensor,
                  *, excluded_queries: Optional[Tensor] = None,
-                 **init_kwargs) -> GrounderOutput:
+                 **init_kwargs) -> BackwardResult:
     """snapshot plan → per chunk (init_frontier → depth loop → emit pieces) → merge."""
     plan = RunPlan.snapshot(grounder)
     run = RunState.init(plan.output_spec)

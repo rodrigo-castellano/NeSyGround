@@ -11,7 +11,7 @@ from typing import NamedTuple, Optional, Tuple
 import torch
 from torch import Tensor
 
-from grounder._build.state import Frontier
+from grounder._build.backward.state import Frontier
 
 
 class _Collected(NamedTuple):

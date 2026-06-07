@@ -4,8 +4,8 @@
 dispatches on the value, never ``isinstance``). ``subs_noop`` lives only where it
 is determined: post-pack ``SyncParams`` and constant-True on
 ``FlatResolvedChildren`` — never on dense ``ResolvedChildren`` (sld/rtf subs are
-real there). No ``D==0`` legacy flat layout; ``ProofEvidence`` carries ``Shapes``
-so every consumer preserves D/M.
+real there). No ``D==0`` legacy flat layout; ``CompletedTreeFirings`` carries
+``Shapes`` so every consumer preserves D/M.
 """
 from __future__ import annotations
 
@@ -37,11 +37,11 @@ class ProofState:
 
 
 @dataclass(frozen=True)
-class ProofEvidence:
-    """Completed proof-tree groundings — the ``evidence`` output (probfol,
-    torch-ns resolve). The 'considered' ``FiringSet`` is PRIMARY for
+class CompletedTreeFirings:
+    """Fired rule apps inside completed proof trees — the ``completed_tree_firings``
+    output (probfol, torch-ns resolve). The ``FiringSet`` is PRIMARY for
     ``RuleGroundings``; this completed-tree view undercounts ~3x and is the
-    evidence/fallback. Carries ``Shapes`` so consumers preserve D/M."""
+    chunk-merge fallback. Carries ``Shapes`` so consumers preserve D/M."""
 
     body: Tensor                 # [B, C, D, M, 3]
     grounding_valid: Tensor      # [B, C]  (which of the C groundings are real)
@@ -65,12 +65,20 @@ class ProofEvidence:
         return mask.reshape(B, C, D * M)
 
     @property
-    def top_rule_idx(self) -> Tensor:       # [B, C]  (depth-0 rule of each tree)
+    def tree_top_rule_idx(self) -> Tensor:  # [B, C]  (depth-0 rule of each tree)
         return self.rule_idx[:, :, 0]
+
+    @property
+    def top_rule_idx(self) -> Tensor:       # one-window alias of tree_top_rule_idx
+        return self.tree_top_rule_idx
 
     @property
     def body_count_total(self) -> Tensor:   # [B, C]
         return self.body_count.sum(dim=-1)
+
+
+# one-window back-compat alias (consumers import ProofEvidence)
+ProofEvidence = CompletedTreeFirings
 
 
 @dataclass(frozen=True)
@@ -109,12 +117,22 @@ class RuleGroundings:
 
 
 @dataclass(frozen=True)
-class GrounderOutput:
-    """The output bundle — each field present iff its OutputSpec tier was requested."""
+class BackwardResult:
+    """The backward proof bundle — each field present iff its OutputSpec tier was
+    requested. ``kind`` + ``as_rule_groundings`` are attached in ``core/result.py``."""
 
     state: ProofState
-    evidence: Optional[ProofEvidence] = None
+    completed_tree_firings: Optional[CompletedTreeFirings] = None
     rule_groundings: Optional[RuleGroundings] = None
+
+    @property
+    def evidence(self) -> Optional[CompletedTreeFirings]:
+        """One-window alias of ``completed_tree_firings`` (consumer ``.evidence``)."""
+        return self.completed_tree_firings
+
+
+# one-window back-compat alias (consumers import GrounderOutput)
+GrounderOutput = BackwardResult
 
 
 # ── Internal pipeline NamedTuples (torch.compile-safe; engine step seams) ──
@@ -169,7 +187,7 @@ class SyncParams(NamedTuple):
 
 
 __all__ = [
-    "Layout", "ProofState", "ProofEvidence", "RuleGroundings",
-    "GrounderOutput", "ResolvedChildren", "FlatResolvedChildren",
-    "PackedStates", "SyncParams",
+    "Layout", "ProofState", "CompletedTreeFirings", "ProofEvidence",
+    "RuleGroundings", "BackwardResult", "GrounderOutput",
+    "ResolvedChildren", "FlatResolvedChildren", "PackedStates", "SyncParams",
 ]

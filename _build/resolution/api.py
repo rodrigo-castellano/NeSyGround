@@ -1,4 +1,4 @@
-"""AXIS 1 — the Resolver seam contract (replaces engine/step.py:resolve() if/elif).
+"""AXIS 1 — the Resolver seam contract (replaces backward/step.py:resolve() if/elif).
 
 A ``Resolver`` is the backward RESOLVE-step strategy ``{sld, rtf, pbc}``: given one
 proof step's request it produces the children (``ResolvedChildren`` dense or

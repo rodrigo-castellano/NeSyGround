@@ -30,7 +30,7 @@ from grounder._build.config import FCConfig, PBCConfig, RTFConfig, SLDConfig
 from grounder._build.factory import create_grounder, make_bcwd, make_grounder
 from grounder._build.glossary import COMPILE_BACKENDS, INTEGRATIONS
 from grounder._build.grounder.backward import BackwardGrounder
-from grounder._build.plan import RunPlan
+from grounder._build.backward.plan import RunPlan
 from grounder._build.types import Layout, ProofState
 
 _BUILD = Path(__file__).parent.parent

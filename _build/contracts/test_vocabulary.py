@@ -13,7 +13,7 @@ import collections
 import dataclasses
 from pathlib import Path
 
-from grounder._build import state as state_mod
+from grounder._build.backward import state as state_mod
 from grounder._build import types as types_mod
 from grounder._build.core import request as request_mod
 from grounder._build.glossary import FIELDS
@@ -24,10 +24,10 @@ _MODULES = (state_mod, types_mod, request_mod)
 
 # Tokens that legitimately span GLOSSARY (concept) and FIELDS (field) — the same
 # concept named in both registries. The disjointness check (below) allows ONLY
-# these and flags any other overlap. `evidence` is a KNOWN pending collision
-# (the evidence concept/type/field collapse to `completed_tree_firings` lands in
-# the Phase-C rename); `layout` is a genuine same-concept span (the layout value).
-_GLOSSARY_FIELDS_CROSSLINKS = frozenset({"evidence", "layout"})
+# these and flags any other overlap. The `evidence` concept/type/field collision
+# is now resolved (collapsed to `completed_tree_firings` — distinct GLOSSARY vs
+# FIELDS spellings); `layout` is a genuine same-concept span (the layout value).
+_GLOSSARY_FIELDS_CROSSLINKS = frozenset({"layout"})
 
 
 # OutputSpec's one-window back-compat accessors over its ``tiers`` field. They are
@@ -103,9 +103,9 @@ def test_no_duplicate_vocab_keys() -> None:
 def test_glossary_fields_token_disjoint() -> None:
     """GLOSSARY (concepts) and FIELDS (field names) must be token-disjoint, EXCEPT
     where a token legitimately spans both as the same concept — those must be
-    declared in ``_GLOSSARY_FIELDS_CROSSLINKS``. Catches the ``evidence``
-    concept/field collision and any future accidental overlap (e.g. a new field
-    name silently shadowing a concept term)."""
+    declared in ``_GLOSSARY_FIELDS_CROSSLINKS``. Caught (and resolved) the
+    ``evidence`` concept/field collision; guards any future accidental overlap
+    (e.g. a new field name silently shadowing a concept term)."""
     from grounder._build.glossary import GLOSSARY
     overlap = set(GLOSSARY) & set(FIELDS)
     undeclared = sorted(overlap - _GLOSSARY_FIELDS_CROSSLINKS)

@@ -1,8 +1,8 @@
 """Cross-query Kleene T_P fixed-point filter for transitive provability.
 
 The one soundness filter, in two layouts of the same fixed-point:
-  * ``apply_fp_batch``        — padded evidence ``[B,N,M,3]`` → proved mask
-                                (terminal filter for ``ProofEvidence``).
+  * ``apply_fp_batch``        — padded body atoms ``[B,N,M,3]`` → proved mask
+                                (terminal filter for ``CompletedTreeFirings``).
   * ``prune_rule_groundings`` — CSR pool ``RuleGroundings`` → row-dropped copy.
 Ported from OLD ``filters/soundness/fp_batch.py`` + ``bc/pruning.py``. A grounding
 is proved when every body atom is a base fact or the head of an already-proved

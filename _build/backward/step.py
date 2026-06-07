@@ -13,15 +13,15 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from grounder._build.engine.buffers import _Collected
-from grounder._build.engine.considered import capture_step
-from grounder._build.engine.pack import compact_atoms, pack_states, pack_states_flat
-from grounder._build.engine.postprocess import collect_groundings
-from grounder._build.engine.sync import sync_accumulated
+from grounder._build.backward.buffers import _Collected
+from grounder._build.backward.considered import capture_step
+from grounder._build.backward.pack import compact_atoms, pack_states, pack_states_flat
+from grounder._build.backward.postprocess import collect_groundings
+from grounder._build.backward.sync import sync_accumulated
 from grounder._build.filters.prune_facts import prune_ground_facts
 from grounder._build.grounder.registry import RESOLVERS
 from grounder._build.resolution.api import ResolveRequest
-from grounder._build.state import Frontier
+from grounder._build.backward.state import Frontier
 from grounder._build.types import FlatResolvedChildren
 
 

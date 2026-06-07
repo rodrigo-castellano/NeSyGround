@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
-from grounder._build.engine.pack import _pow_desc
+from grounder._build.backward.pack import _pow_desc
 
 
 def collect_groundings(

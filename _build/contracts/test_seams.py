@@ -4,7 +4,7 @@ AXIS 4 ProgramTransform).
 - RESOLVERS is keyed exactly {sld, rtf, pbc, join}; every entry structurally
   implements the Resolver Protocol and its ``.name`` matches its registry key.
   ``join`` is the L3 semantics-preserving sibling of pbc (flat-eager cell).
-- the resolve() dispatch in engine/step.py is a pure registry lookup: NO if/elif
+- the resolve() dispatch in backward/step.py is a pure registry lookup: NO if/elif
   branching on a ``.resolution`` attribute survives in that module (AST scan).
 - declared_cells() is a non-empty FrozenSet[Cell] for every resolver.
 - FORWARD_METHODS is keyed exactly {spmm, staged}; every entry impls the
@@ -29,7 +29,7 @@ from grounder._build.resolution.api import Resolver
 from grounder._build.transform.api import IdentityTransform, ProgramTransform
 from grounder._build.transform.magic_set import MagicSetTransform
 
-_STEP_PY = Path(__file__).parent.parent / "engine" / "step.py"
+_STEP_PY = Path(__file__).parent.parent / "backward" / "step.py"
 _FC_PY = Path(__file__).parent.parent / "forward" / "fc.py"
 
 
@@ -59,7 +59,7 @@ def _references_resolution_attr(node: ast.AST) -> bool:
 
 
 def test_step_resolve_has_no_resolution_branching() -> None:
-    """engine/step.py must dispatch via RESOLVERS, not an if/elif on .resolution."""
+    """backward/step.py must dispatch via RESOLVERS, not an if/elif on .resolution."""
     tree = ast.parse(_STEP_PY.read_text())
     offenders = []
     for node in ast.walk(tree):
@@ -71,7 +71,7 @@ def test_step_resolve_has_no_resolution_branching() -> None:
 def test_step_resolve_uses_registry() -> None:
     """resolve() must reference the RESOLVERS table (the dispatch is a lookup)."""
     src = _STEP_PY.read_text()
-    assert "RESOLVERS[" in src, "engine/step.py does not dispatch via RESOLVERS[...]"
+    assert "RESOLVERS[" in src, "backward/step.py does not dispatch via RESOLVERS[...]"
 
 
 # ── AXIS 3 — ForwardMethod registry ──

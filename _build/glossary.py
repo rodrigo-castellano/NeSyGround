@@ -20,12 +20,12 @@ from typing import Mapping
 
 GLOSSARY: Mapping[str, str] = {
     "forward": "forward chaining only (ForwardGrounder); never the BC batch driver",
-    "run_backward": "the backward proof-search batch driver (engine/loop.py)",
+    "run_backward": "the backward proof-search batch driver (backward/loop.py)",
     "backward": "query-directed proof search (BackwardGrounder; sld/rtf/pbc)",
     "resolution": "the WHAT axis of BackwardGrounder: sld | rtf | pbc (config type, not subclass)",
     "pbc": "Parametrized Backward Chaining (IJCAI BC_{w,d,u}); pbc resolution + fp_batch filter",
-    "considered": "fired rule apps OUTSIDE completed proof trees — PRIMARY for RuleGroundings",
-    "evidence": "fired rule apps INSIDE completed proof trees — chunk-merge fallback only",
+    "firing": "one fired rule application (rule_idx, head, body); the FiringSet unit, PRIMARY for RuleGroundings (replaces legacy 'considered')",
+    "completed-tree firings": "fired rule apps INSIDE completed proof trees (~3x undercount); the TREES tier — chunk-merge fallback (was 'evidence')",
     "filter": "post-hoc soundness prune; the ONLY filter is fp_batch (Kleene T_P)",
     "fp_global": "GONE as a filter — that capability is ForwardGrounder + KB.with_closure()",
     "layout": "materialization of one grounding step: flat (compact/eager) | dense (padded/compiled)",
@@ -43,7 +43,7 @@ FIELDS: Mapping[str, str] = {
     # ── identity / provenance ──
     "rule_idx": "rule (or anchor-variant) index",
     "head": "head atom(s), trailing dims [..,3]",
-    "body": "body atom(s), trailing dims [..,M,3] (depth-structured in ProofEvidence)",
+    "body": "body atom(s), trailing dims [..,M,3] (depth-structured in CompletedTreeFirings)",
     "current_head": "head of the current rule application [..,3]",
     "sub_rule_idx": "per-child rule index from rule resolution",
     "query_idx": "global query index (flat layouts)",
@@ -96,12 +96,12 @@ FIELDS: Mapping[str, str] = {
     "current_rule_idx": "rule index of the current step's children",
     "parent_map": "parent-state index per packed state",
     "parent_body_count": "parent's per-depth body count",
-    # ── evidence / shapes ──
+    # ── shapes ──
     "shapes": "the Shapes static-symbol registry",
     # ── output bundle / request / run state ──
-    "state": "the ProofState in GrounderOutput",
-    "evidence": "the ProofEvidence in GrounderOutput",
-    "rule_groundings": "the RuleGroundings in GrounderOutput",
+    "state": "the ProofState in BackwardResult",
+    "completed_tree_firings": "the CompletedTreeFirings in BackwardResult",
+    "rule_groundings": "the RuleGroundings in BackwardResult",
     "groundings": "OutputSpec: produce the proof-state tier",
     "firings": "OutputSpec: produce the rule-firings tier",
     "trees": "OutputSpec: produce the proof-tree tier",
