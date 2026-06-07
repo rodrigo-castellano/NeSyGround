@@ -79,7 +79,7 @@ class KGEScorer(nn.Module):
         scores = torch.where(mask, scores, torch.tensor(-1e9, device=dev))
 
         # Top-k
-        from grounder.nesy import _topk_select
+        from grounder.nesy._util import _topk_select
         return _topk_select(body, mask, rule_idx, scores, self._output_tG)
 
     def __repr__(self) -> str:
@@ -316,7 +316,7 @@ class KGEStepFilter(nn.Module):
         Branchless: no .item()/.any() calls, no dynamic-shape indexing.
         All ops run unconditionally on the full [B, tG] tensors using
         torch.where for conditional scoring. Safe to call from a Python
-        loop between compiled steps (no GPU→CPU sync).
+        loop between compiled steps (no GPU->CPU sync).
         """
         B, tG, M, _ = body.shape
         dev = body.device
@@ -392,3 +392,11 @@ class KGEStepFilter(nn.Module):
     def __repr__(self) -> str:
         return (f"KGEStepFilter(top_k={self._top_k}, "
                 f"scoring_mode='{self._scoring_mode}')")
+
+
+__all__ = [
+    "KGEScorer",
+    "KGEFactFilter",
+    "KGERuleFilter",
+    "KGEStepFilter",
+]

@@ -87,3 +87,11 @@ class GroundingHook(Protocol):
         Returns: (body, mask, rule_idx) — possibly resized/reordered.
         """
         ...
+
+
+__all__ = [
+    "ResolutionFactHook",
+    "ResolutionRuleHook",
+    "StepHook",
+    "GroundingHook",
+]

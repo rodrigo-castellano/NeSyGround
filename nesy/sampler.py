@@ -13,7 +13,7 @@ from torch import Tensor
 class RandomSampler(nn.Module):
     """Random subsampling of groundings.
 
-    Train: random scores → topk. Eval: deterministic valid-first.
+    Train: random scores -> topk. Eval: deterministic valid-first.
 
     Args:
         output_budget: number of groundings to keep.
@@ -37,8 +37,11 @@ class RandomSampler(nn.Module):
         else:
             scores = mask.float()
 
-        from grounder.nesy import _topk_select
+        from grounder.nesy._util import _topk_select
         return _topk_select(body, mask, rule_idx, scores, self._output_tG)
 
     def __repr__(self) -> str:
         return f"RandomSampler(output_budget={self._output_tG})"
+
+
+__all__ = ["RandomSampler"]

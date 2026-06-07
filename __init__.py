@@ -1,184 +1,34 @@
-"""NeSyGround — compiled CUDA-graph-safe FOL grounding for neuro-symbolic reasoning.
+"""grounder (redesign, staged under ``_build``) — public API.
 
-This package provides a fully compilable grounding engine with fixed-shape
-tensors throughout.  All dynamic operations are replaced with masked operations
-for torch.compile and CUDA graph compatibility.
+After promotion (``_build/*`` → package root) these are the top-level
+``grounder.*`` names consumers import. Today: ``grounder.*``.
 
-Architecture
-------------
-The grounding system is built around a single ``BCGrounder`` class that is
-configured at construction time via three orthogonal axes:
-
-* **resolution** — how unification candidates are generated:
-    ``sld``   standard SLD resolution (fact + rule unification),
-    ``rtf``   Rule-Then-Fact (rule first, then match facts),
-    ``enum``  full entity enumeration.
-
-* **filter** — how incomplete / unreachable proof branches are pruned:
-    ``fp_batch``  cross-query Kleene T_P fixed-point,
-    ``fp_global`` forward-chaining provable-set check (precomputed),
-    ``none``      no filtering (raw resolution output).
-
-* **hooks** — optional neuro-symbolic callbacks injected at various points:
-    ``ResolutionFactHook``   scores / filters fact candidates during resolution,
-    ``ResolutionRuleHook``   scores / filters rule candidates during resolution,
-    ``GroundingHook``        post-processes final groundings.
-
-There is no class hierarchy of subclasses — just one ``BCGrounder`` that
-composes the desired behaviour from the options above.
-
-Usage::
-
-    from grounder import BCGrounder, create_grounder
-
-    # Factory construction (recommended)
-    grounder = create_grounder(
-        'sld.fp_batch.d2', facts_idx=facts, rule_heads=heads,
-        rule_bodies=bodies, rule_lens=lens, constant_no=C,
-        padding_idx=P, device=dev,
-    )
-    result = grounder(queries, query_mask)
+    from grounder import make_grounder, BackwardGrounder, create_grounder, make_bcwd, KB
 """
-
-# --- Primitives ---
-from grounder.resolution.primitives import apply_substitutions, unify_one_to_one
-
-# --- Fact indexing ---
-from grounder.data.fact_index import (
-    ArgKeyFactIndex,
-    BlockSparseFactIndex,
-    FactIndex,
-    InvertedFactIndex,
-    fact_contains,
-    pack_triples_64,
+from grounder.config import FCConfig, PBCConfig, RTFConfig, SLDConfig
+from grounder.data import KB, KGDataset, Encoding
+from grounder.factory import (
+    create_grounder, make_bcwd, make_grounder, parse_grounder_type,
 )
-
-# --- Rule indexing + compilation ---
-from grounder.data.rule_index import RuleIndex, RuleIndexEnum, RulePattern, compile_rules
-
-# --- Packing + post-processing ---
-from grounder.bc.packing import compact_atoms, pack_states
-from grounder.bc.postprocessing import collect_groundings
-from grounder.filters.search.prune_facts import prune_ground_facts
-
-# --- Standardization ---
-from grounder.resolution.standardization import (
-    build_standardize_fn,
-    standardize_vars_canonical,
-    standardize_vars_offset,
-)
-
-# --- Filters ---
-from grounder.filters import filter_prune_dead, filter_width
-
-
-# --- Types ---
+from grounder.grounder import BackwardGrounder
 from grounder.types import (
-    GrounderOutput, GroundingResult, ProofEvidence, ProofState,
-    ResolvedChildren, PackedStates, SyncParams, RuleGroundings,
+    BackwardResult, CompletedTreeFirings, GrounderOutput, ProofEvidence,
+    ProofState, RuleGroundings,
 )
-from grounder.groundings import (
-    atom_hash, count_proof_trees,
-    evidence_to_rule_groundings,
-    evidence_unique_app_count, evidence_unique_app_keys,
-)
-
-# --- Data loading ---
-from grounder.data.loader import KGDataset
-
-
-# --- Forward chaining ---
-from grounder.fc.fc import run_forward_chaining
-
-# --- Factory ---
-from grounder.factory import create_grounder, make_bcwd
-
-# --- KB + Grounders ---
-from grounder.data.kb import KB
-from grounder.bc.bc import BCGrounder
-# GrounderConfig is a validated 1:1 mirror of the BCGrounder kwargs;
-# construct via ``BCGrounder.from_config(kb, GrounderConfig.from_kwargs(**kw))``.
-from grounder.config import GrounderConfig
-
-# --- NeSy hooks ---
-from grounder.nesy.hooks import (
-    GroundingHook, ResolutionFactHook, ResolutionRuleHook, StepHook,
-)
-from grounder.nesy.kge import KGEScorer, KGEFactFilter, KGERuleFilter
-from grounder.nesy.neural import NeuralScorer, GroundingAttention
-from grounder.nesy.soft import SoftScorer, ProvabilityMLP
-from grounder.nesy.sampler import RandomSampler
-
-# --- Utilities ---
-from grounder.utils import timed_warmup
 
 __all__ = [
-    # Grounder config
-    "GrounderConfig",
-    # Primitives
-    "apply_substitutions",
-    "unify_one_to_one",
-    # Fact indexing
-    "ArgKeyFactIndex",
-    "BlockSparseFactIndex",
-    "FactIndex",
-    "InvertedFactIndex",
-    "fact_contains",
-    "pack_triples_64",
-    # Rule indexing
-    "RuleIndex",
-    "RuleIndexEnum",
-    "RulePattern",
-    "compile_rules",
-    # Packing + post-processing
-    "compact_atoms",
-    "collect_groundings",
-    "pack_states",
-    "prune_ground_facts",
-    # Standardization
-    "standardize_vars_canonical",
-    "standardize_vars_offset",
-    # Filters
-    "filter_prune_dead",
-    "filter_width",
-    # Types
-    "GrounderOutput",
-    "GroundingResult",
-    "ProofEvidence",
-    "ProofState",
-    "ResolvedChildren",
-    "PackedStates",
-    "SyncParams",
-    "RuleGroundings",
-    # Groundings conversions (proof evidence ↔ rule groundings ↔ proof count)
-    "atom_hash",
-    "count_proof_trees",
-    "evidence_to_rule_groundings",
-    "evidence_unique_app_count",
-    "evidence_unique_app_keys",
-    # Data loading
-    "KGDataset",
-    # Forward chaining
-    "run_forward_chaining",
-    # Factory
-    "create_grounder",
-    # Grounders
-    "BCGrounder",
-    "KB",
-    # NeSy hooks
-    "GroundingHook",
-    "ResolutionFactHook",
-    "ResolutionRuleHook",
-    "StepHook",
-    # Hook implementations
-    "KGEScorer",
-    "KGEFactFilter",
-    "KGERuleFilter",
-    "NeuralScorer",
-    "GroundingAttention",
-    "SoftScorer",
-    "ProvabilityMLP",
-    "RandomSampler",
-    # Utilities
-    "timed_warmup",
+    "make_grounder", "create_grounder", "make_bcwd", "parse_grounder_type",
+    "BackwardGrounder",
+    "SLDConfig", "RTFConfig", "PBCConfig", "FCConfig",
+    "KB", "KGDataset", "Encoding",
+    "BackwardResult", "CompletedTreeFirings", "ProofState", "RuleGroundings",
+    # one-window back-compat aliases
+    "GrounderOutput", "ProofEvidence",
 ]
+
+
+def __getattr__(name):
+    if name == "ForwardGrounder":
+        from grounder.forward.grounder import ForwardGrounder
+        return ForwardGrounder
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

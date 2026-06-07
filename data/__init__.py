@@ -1,27 +1,13 @@
-# data/ — knowledge base, fact/rule indexing, dataset loading
-from grounder.data.kb import KB
-from grounder.data.fact_index import (
-    ArgKeyFactIndex,
-    BlockSparseFactIndex,
-    FactIndex,
-    InvertedFactIndex,
-    fact_contains,
-    pack_triples_64,
-)
-from grounder.data.rule_index import RuleIndex, RuleIndexEnum, RulePattern, compile_rules
-from grounder.data.loader import KGDataset
+"""Data layer — id encoding, dataset loading, KB construction, fact/rule indexing.
 
-__all__ = [
-    "KB",
-    "ArgKeyFactIndex",
-    "BlockSparseFactIndex",
-    "FactIndex",
-    "InvertedFactIndex",
-    "fact_contains",
-    "pack_triples_64",
-    "RuleIndex",
-    "RuleIndexEnum",
-    "RulePattern",
-    "compile_rules",
-    "KGDataset",
-]
+    from grounder.data import KGDataset, KB, Encoding
+    from grounder.data import fact_index, rule_index
+"""
+from __future__ import annotations
+
+from grounder.data import fact_index, rule_index
+from grounder.data.dataset import KGDataset
+from grounder.data.encoding import Encoding
+from grounder.data.kb import KB
+
+__all__ = ["KGDataset", "KB", "Encoding", "fact_index", "rule_index"]

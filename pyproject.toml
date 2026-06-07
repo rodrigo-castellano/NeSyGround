@@ -15,33 +15,49 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 # The repo root IS the `grounder` package: __init__.py and the modules
-# (factory.py, types.py, utils.py) sit at the root, and subpackages
-# (bc/, fc/, filters/, nesy/, resolution/, analysis/, data/) are siblings.
-# We map "grounder" -> "." and each subpackage explicitly so consumers can
-# `import grounder` and `from grounder.bc.bc import BCGrounder` after a
-# normal `pip install`.
+# (factory.py, types.py, utils.py, config.py, glossary.py, errors.py,
+# shapes.py) sit at the root, and the subpackages (backward/, forward/,
+# resolution/, data/, core/, execution/, transform/, filters/, nesy/,
+# grounder/, memo/, contracts/) are siblings. We map "grounder" -> "." and
+# each subpackage explicitly so consumers can `import grounder` and
+# `from grounder.forward.grounder import ForwardGrounder` after a normal
+# `pip install`.
 [tool.setuptools]
 packages = [
     "grounder",
-    "grounder.bc",
-    "grounder.fc",
-    "grounder.filters",
-    "grounder.filters.search",
-    "grounder.filters.soundness",
-    "grounder.nesy",
+    "grounder.backward",
+    "grounder.forward",
+    "grounder.forward.spmm",
     "grounder.resolution",
-    "grounder.analysis",
+    "grounder.resolution.pbc",
     "grounder.data",
+    "grounder.data.fact_index",
+    "grounder.data.rule_index",
+    "grounder.core",
+    "grounder.execution",
+    "grounder.transform",
+    "grounder.filters",
+    "grounder.nesy",
+    "grounder.grounder",
+    "grounder.memo",
+    "grounder.contracts",
 ]
 
 [tool.setuptools.package-dir]
 "grounder" = "."
-"grounder.bc" = "bc"
-"grounder.fc" = "fc"
-"grounder.filters" = "filters"
-"grounder.filters.search" = "filters/search"
-"grounder.filters.soundness" = "filters/soundness"
-"grounder.nesy" = "nesy"
+"grounder.backward" = "backward"
+"grounder.forward" = "forward"
+"grounder.forward.spmm" = "forward/spmm"
 "grounder.resolution" = "resolution"
-"grounder.analysis" = "analysis"
+"grounder.resolution.pbc" = "resolution/pbc"
 "grounder.data" = "data"
+"grounder.data.fact_index" = "data/fact_index"
+"grounder.data.rule_index" = "data/rule_index"
+"grounder.core" = "core"
+"grounder.execution" = "execution"
+"grounder.transform" = "transform"
+"grounder.filters" = "filters"
+"grounder.nesy" = "nesy"
+"grounder.grounder" = "grounder"
+"grounder.memo" = "memo"
+"grounder.contracts" = "contracts"

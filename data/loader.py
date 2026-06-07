@@ -1,92 +1,78 @@
-"""Lightweight KG dataset loader for the grounder package.
+"""Text parsing for KG datasets — facts, rules (arrow + Prolog), variables.
 
-Loads a dataset directory containing triples, rules, and optional facts,
-builds vocabularies and converts to tensors suitable for BCGrounder.
+Pure string→tuple parsing, no tensors and no vocabulary (``dataset.py`` owns
+those). Split out so the dataset module stays about encoding, and FC/analysis
+callers can parse rule text without constructing a full dataset.
 
-Usage:
-    from grounder.data.loader import KGDataset
-    from grounder import BCGrounder
-    ds = KGDataset('kge_experiments/data/family', device='cuda')
-    kb = ds.make_kb()
-    grounder = BCGrounder(kb, resolution='sld', filter='fp_batch', depth=2)
+BIT-EXACT RECIPES (fingerprint-enforced — these fix the id assignment):
+  * the atom regex accepts ``/`` and ``.`` in predicate names (fb15k relations);
+    ``\\w+`` would truncate at the last dotted segment and desync vocabularies
+  * triple parsing prefers ``pred(a,b)`` via ``rfind("(")``, then tab-separated
+  * a variable is a single lowercase letter OR an uppercase-initial token
 """
-
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
-import torch
-from torch import Tensor
+Triple = Tuple[str, str, str]
+Rule = Tuple[Triple, List[Triple]]
 
-
-# Regex for atoms: pred(arg0,arg1). Predicates may contain slashes and
-# dots (e.g. ``/people/person/place_of_birth``) so the predicate-name
-# group must accept those — ``\w+`` would silently truncate to the
-# last word before the paren and break parity with fact predicates
-# parsed by ``_parse_triples`` (which uses rfind("(")).
+# pred(arg0,arg1) — predicate may contain / and . (e.g. /people/person/place_of_birth)
 _ATOM_RE = re.compile(r"([\w/.]+)\(([^,]+),([^)]+)\)")
-# Variable detection: single lowercase letter OR uppercase-starting name
-_VAR_PATTERN_LOWER = re.compile(r"^[a-z]$")
-_VAR_PATTERN_UPPER = re.compile(r"^[A-Z]")
+_VAR_LOWER = re.compile(r"^[a-z]$")
+_VAR_UPPER = re.compile(r"^[A-Z]")
 
 
-def _parse_triples(path: Path) -> List[Tuple[str, str, str]]:
-    """Parse triples file: pred(arg0,arg1) or tab-separated."""
-    triples: list[tuple[str, str, str]] = []
+def is_variable(name: str) -> bool:
+    """A logical variable: single lowercase letter or uppercase-initial token."""
+    return bool(_VAR_LOWER.match(name) or _VAR_UPPER.match(name))
+
+
+def parse_triples(path: Path) -> List[Triple]:
+    """Parse a triples file: ``pred(a,b)`` (preferred) or tab-separated."""
+    triples: List[Triple] = []
     with open(path) as f:
         for line in f:
             line = line.strip().rstrip(".")
             if not line or line.startswith("#"):
                 continue
-            # Try Prolog format: pred(arg0,arg1)
-            paren_idx = line.rfind("(")
-            if paren_idx > 0 and line.endswith(")"):
-                pred = line[:paren_idx]
-                args = line[paren_idx + 1:-1]
+            paren = line.rfind("(")
+            if paren > 0 and line.endswith(")"):
+                pred, args = line[:paren], line[paren + 1:-1]
                 parts = args.split(",", 1)
                 if len(parts) == 2:
                     triples.append((pred.strip(), parts[0].strip(), parts[1].strip()))
                     continue
-            # Try tab-separated format
             parts = line.split("\t")
             if len(parts) == 3:
-                triples.append(tuple(parts))
+                triples.append((parts[0], parts[1], parts[2]))
     return triples
 
 
-def _parse_atom(s: str) -> Optional[Tuple[str, str, str]]:
-    """Parse a single ``pred(a, b)`` atom into ``(pred, a, b)`` (or None)."""
+def parse_atom(s: str) -> Optional[Triple]:
+    """Parse one ``pred(a, b)`` atom into ``(pred, a, b)`` (or None)."""
     m = _ATOM_RE.search(s.strip())
-    if not m:
-        return None
-    return (m.group(1).strip(), m.group(2).strip(), m.group(3).strip())
+    return (m.group(1).strip(), m.group(2).strip(), m.group(3).strip()) if m else None
 
 
-def _parse_body_atoms(body_str: str) -> List[Tuple[str, str, str]]:
-    """Parse a comma-separated rule body into ``(pred, a, b)`` atoms.
-
-    Splits on ``),`` (re-appending the stripped ``)``) and matches each
-    fragment with ``_ATOM_RE``; unparseable fragments are skipped.
-    """
-    atoms: List[Tuple[str, str, str]] = []
-    for b in body_str.split("),"):
-        b = b.strip()
-        if not b.endswith(")"):
-            b += ")"
-        atom = _parse_atom(b)
+def parse_body_atoms(body_str: str) -> List[Triple]:
+    """Parse a comma-separated rule body. Splits on ``),`` (re-adding ``)``)."""
+    atoms: List[Triple] = []
+    for frag in body_str.split("),"):
+        frag = frag.strip()
+        if not frag.endswith(")"):
+            frag += ")"
+        atom = parse_atom(frag)
         if atom is not None:
             atoms.append(atom)
     return atoms
 
 
-def _parse_rules_arrow(
-    path: Path,
-) -> List[Tuple[Tuple[str, str, str], List[Tuple[str, str, str]]]]:
-    """Parse arrow-format rules: rN:score:body1(a,h), body2(b,h) -> head(a,b)."""
-    rules: list[tuple[tuple[str, str, str], list[tuple[str, str, str]]]] = []
+def _parse_rules_arrow(path: Path) -> List[Rule]:
+    """Arrow format: ``rN:score:body1(a,h), body2(b,h) -> head(a,b)``."""
+    rules: List[Rule] = []
     with open(path) as f:
         for line in f:
             line = line.strip()
@@ -99,229 +85,46 @@ def _parse_rules_arrow(
             if "->" not in rest:
                 continue
             body_str, head_str = rest.rsplit("->", 1)
-            head = _parse_atom(head_str)
+            head = parse_atom(head_str)
             if head is None:
                 continue
-            body_atoms = _parse_body_atoms(body_str)
-            if body_atoms:
-                rules.append((head, body_atoms))
+            body = parse_body_atoms(body_str)
+            if body:
+                rules.append((head, body))
     return rules
 
 
-def _parse_rules_prolog(
-    path: Path,
-) -> List[Tuple[Tuple[str, str, str], List[Tuple[str, str, str]]]]:
-    """Parse Prolog-format rules: head(X,Y) :- body1(X,Z), body2(Z,Y)."""
-    rules: list[tuple[tuple[str, str, str], list[tuple[str, str, str]]]] = []
+def _parse_rules_prolog(path: Path) -> List[Rule]:
+    """Prolog format: ``head(X,Y) :- body1(X,Z), body2(Z,Y)``."""
+    rules: List[Rule] = []
     with open(path) as f:
         for line in f:
             line = line.strip().rstrip(".")
-            if not line or line.startswith("#"):
-                continue
-            if ":-" not in line:
+            if not line or line.startswith("#") or ":-" not in line:
                 continue
             head_str, body_str = line.split(":-", 1)
-            head = _parse_atom(head_str)
+            head = parse_atom(head_str)
             if head is None:
                 continue
-            body_atoms = _parse_body_atoms(body_str)
-            if body_atoms:
-                rules.append((head, body_atoms))
+            body = parse_body_atoms(body_str)
+            if body:
+                rules.append((head, body))
     return rules
 
 
-def _parse_rules(
-    path: Path,
-) -> List[Tuple[Tuple[str, str, str], List[Tuple[str, str, str]]]]:
-    """Auto-detect and parse rules file (arrow or Prolog format)."""
+def parse_rules(path: Path) -> List[Rule]:
+    """Auto-detect arrow vs Prolog by the first non-comment line."""
+    first = ""
     with open(path) as f:
-        first_line = ""
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
-                first_line = line
+                first = line
                 break
-    if ":-" in first_line:
-        return _parse_rules_prolog(path)
-    return _parse_rules_arrow(path)
+    return _parse_rules_prolog(path) if ":-" in first else _parse_rules_arrow(path)
 
 
-def _is_variable(name: str) -> bool:
-    """Check if a name is a logical variable (single lowercase or uppercase-starting)."""
-    return bool(_VAR_PATTERN_LOWER.match(name) or _VAR_PATTERN_UPPER.match(name))
-
-
-class KGDataset:
-    """Load a KG dataset from a directory.
-
-    Args:
-        data_dir: Path to dataset directory containing train.txt, rules.txt, etc.
-        facts_file: File for KB facts (default: 'facts.txt', fallback to 'train.txt')
-        device: Target device for tensors
-    """
-
-    def __init__(
-        self,
-        data_dir: str,
-        facts_file: str = "facts.txt",
-        rules_file: str = "rules.txt",
-        device: str = "cpu",
-    ) -> None:
-        self.data_dir = Path(data_dir)
-        self.device = torch.device(device)
-        assert self.data_dir.exists(), f"Dataset directory not found: {self.data_dir}"
-
-        # Determine facts file (fallback to train.txt)
-        facts_path = self.data_dir / facts_file
-        if not facts_path.exists():
-            facts_path = self.data_dir / "train.txt"
-        self._facts_file = facts_path.name
-
-        # Rules file (paper numbers for ``family`` use ``rules_old.txt`` —
-        # 47 rules, vs the expanded ``rules.txt`` with 143 rules. Pass
-        # ``rules_file='rules_old.txt'`` to reproduce paper grounding
-        # counts on family).
-        self._rules_file = rules_file
-
-        # Parse raw data, sorted alphabetically for deterministic ordering
-        facts_raw = sorted(_parse_triples(facts_path))
-        rules_raw = sorted(_parse_rules(self.data_dir / rules_file))
-        self._facts_raw: List[Tuple[str, str, str]] = facts_raw
-        self._rules_raw: List[Tuple[Tuple[str, str, str], List[Tuple[str, str, str]]]] = rules_raw
-
-        # Parse all splits, sorted alphabetically
-        self._splits_raw: Dict[str, List[Tuple[str, str, str]]] = {}
-        for split in ("train", "valid", "test"):
-            split_path = self.data_dir / f"{split}.txt"
-            if split_path.exists():
-                self._splits_raw[split] = sorted(_parse_triples(split_path))
-
-        # Build vocabularies from ALL data
-        all_preds: set[str] = set()
-        all_entities: set[str] = set()
-        var_names: set[str] = set()
-
-        for pred, a0, a1 in facts_raw:
-            all_preds.add(pred)
-            all_entities.add(a0)
-            all_entities.add(a1)
-
-        for split_triples in self._splits_raw.values():
-            for pred, a0, a1 in split_triples:
-                all_preds.add(pred)
-                all_entities.add(a0)
-                all_entities.add(a1)
-
-        for head, body_atoms in rules_raw:
-            for atom in [head] + body_atoms:
-                all_preds.add(atom[0])
-                for arg in atom[1:]:
-                    if _is_variable(arg):
-                        var_names.add(arg)
-                    else:
-                        all_entities.add(arg)
-
-        # 1-based indexing
-        self.pred2idx: Dict[str, int] = {p: i + 1 for i, p in enumerate(sorted(all_preds))}
-        self.entity2idx: Dict[str, int] = {e: i + 1 for i, e in enumerate(sorted(all_entities))}
-        var2idx: Dict[str, int] = {v: len(self.entity2idx) + 1 + i
-                                   for i, v in enumerate(sorted(var_names))}
-
-        self.idx2pred: Dict[int, str] = {v: k for k, v in self.pred2idx.items()}
-        self.idx2entity: Dict[int, str] = {v: k for k, v in self.entity2idx.items()}
-
-        self.constant_no = len(self.entity2idx)
-        self.padding_idx = self.constant_no + len(var_names) + 10
-        # predicate_no must be > padding_idx: padding values appear in
-        # predicate slots of inactive proof states and must fit in
-        # index tables sized predicate_no + 1.
-        self.predicate_no = max(len(self.pred2idx) + 1, self.padding_idx + 1)
-
-        def _lookup(arg: str) -> int:
-            if arg in var2idx:
-                return var2idx[arg]
-            if arg in self.entity2idx:
-                return self.entity2idx[arg]
-            return self.padding_idx
-
-        # Build fact tensors
-        fact_list = []
-        for pred, a0, a1 in facts_raw:
-            if pred in self.pred2idx and a0 in self.entity2idx and a1 in self.entity2idx:
-                fact_list.append([self.pred2idx[pred], self.entity2idx[a0], self.entity2idx[a1]])
-        self.facts_idx = (torch.tensor(fact_list, dtype=torch.long, device=self.device)
-                          if fact_list else torch.empty(0, 3, dtype=torch.long, device=self.device))
-
-        # Build rule tensors
-        max_body = max((len(body) for _, body in rules_raw), default=1)
-        heads_list: list[list[int]] = []
-        bodies_list: list[list[list[int]]] = []
-        lens_list: list[int] = []
-
-        for head, body_atoms in rules_raw:
-            h = [self.pred2idx[head[0]], _lookup(head[1]), _lookup(head[2])]
-            heads_list.append(h)
-
-            body_row: list[list[int]] = []
-            for atom in body_atoms:
-                b = [self.pred2idx[atom[0]], _lookup(atom[1]), _lookup(atom[2])]
-                body_row.append(b)
-            while len(body_row) < max_body:
-                body_row.append([self.padding_idx, self.padding_idx, self.padding_idx])
-            bodies_list.append(body_row)
-            lens_list.append(len(body_atoms))
-
-        if heads_list:
-            self.rules_heads_idx = torch.tensor(heads_list, dtype=torch.long, device=self.device)
-            self.rules_bodies_idx = torch.tensor(bodies_list, dtype=torch.long, device=self.device)
-            self.rule_lens = torch.tensor(lens_list, dtype=torch.long, device=self.device)
-        else:
-            self.rules_heads_idx = torch.empty(0, 3, dtype=torch.long, device=self.device)
-            self.rules_bodies_idx = torch.empty(0, 1, 3, dtype=torch.long, device=self.device)
-            self.rule_lens = torch.empty(0, dtype=torch.long, device=self.device)
-
-        # Build split tensors
-        self._splits_idx: Dict[str, Tensor] = {}
-        for split, triples in self._splits_raw.items():
-            rows = []
-            for pred, a0, a1 in triples:
-                if pred in self.pred2idx and a0 in self.entity2idx and a1 in self.entity2idx:
-                    rows.append([self.pred2idx[pred], self.entity2idx[a0], self.entity2idx[a1]])
-            if rows:
-                self._splits_idx[split] = torch.tensor(rows, dtype=torch.long, device=self.device)
-            else:
-                self._splits_idx[split] = torch.empty(0, 3, dtype=torch.long, device=self.device)
-
-    def get_queries(self, split: str) -> Tensor:
-        """Get query tensor for a split. [N, 3] (pred, arg0, arg1)."""
-        if split not in self._splits_idx:
-            return torch.empty(0, 3, dtype=torch.long, device=self.device)
-        return self._splits_idx[split]
-
-    def get_query_strings(self, split: str) -> List[str]:
-        """Get query strings in 'pred(arg0,arg1)' format."""
-        if split not in self._splits_raw:
-            return []
-        return [f"{p}({a0},{a1})" for p, a0, a1 in self._splits_raw[split]]
-
-    def make_kb(self, **kwargs) -> "KB":
-        """Create a KB from this dataset's tensors."""
-        from grounder.data.kb import KB
-        return KB(
-            self.facts_idx,
-            self.rules_heads_idx,
-            self.rules_bodies_idx,
-            self.rule_lens,
-            constant_no=self.constant_no,
-            predicate_no=self.predicate_no,
-            padding_idx=self.padding_idx,
-            device=self.device,
-            **kwargs,
-        )
-
-    def __repr__(self) -> str:
-        return (f"KGDataset(dir={self.data_dir.name}, "
-                f"facts={self.facts_idx.shape[0]}, "
-                f"rules={self.rules_heads_idx.shape[0]}, "
-                f"entities={self.constant_no}, "
-                f"predicates={self.predicate_no - 1})")
+__all__ = [
+    "Triple", "Rule", "is_variable",
+    "parse_triples", "parse_atom", "parse_body_atoms", "parse_rules",
+]

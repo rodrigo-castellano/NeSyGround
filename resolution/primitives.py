@@ -1,142 +1,98 @@
-"""Core unification primitives: pairwise term unification and substitution application.
+"""Core unification primitives: pairwise MGU and substitution application.
 
-These are leaf-level building blocks with no internal package dependencies.
-All operations are vectorized and torch.compile compatible.
+Leaf-level, dependency-free, vectorized, torch.compile-safe. Generic leading
+dims ``[...]`` (works for ``[L,3]`` facts and ``[B,S,3]`` states alike).
 
-Part of the grounder package.
+Re-implemented from scratch against the redesign contract; classification is
+delegated to ``Encoding`` (the single id source of truth). Two semantics learned
+from the old code and reproduced exactly (proven bit-identical by an A/B test):
+  1. var boundary at ``constant_no+1`` with ``pad`` inert (owned by Encoding);
+  2. ``apply_substitutions`` applies its two slots SEQUENTIALLY (slot 1 sees
+     slot 0's result) — the grounder's S=2 path.
 """
-
 from __future__ import annotations
-from typing import Tuple
+
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 from torch import Tensor
 
+if TYPE_CHECKING:
+    from grounder.data.encoding import Encoding
+
 
 @torch.no_grad()
-def apply_substitutions(goals: Tensor, subs_pairs: Tensor, padding_idx: int) -> Tensor:
-    """Apply variable substitutions to goal atoms (optimized for S=2).
+def unify_one_to_one(a: Tensor, b: Tensor, enc: "Encoding") -> Tuple[Tensor, Tensor]:
+    """Pairwise most-general unifier of two atom tensors.
 
     Args:
-        goals:      [N, M, 3] goal atoms (pred, arg0, arg1)
-        subs_pairs: [N, S, 2] substitution pairs (from, to)
-        padding_idx: index used for padding
-
+        a, b: ``[...,3]`` atoms (pred, arg0, arg1).
+        enc:  id convention (``is_const``/``is_var``).
     Returns:
-        [N, M, 3] goals with substitutions applied to argument positions
+        ok:   ``[...]`` bool — whether each pair unified.
+        subs: ``[...,2,2]`` — per arg position ``(from, to)``; ``pad`` = no binding.
+
+    A pair fails on predicate mismatch, a constant clash, or the same variable
+    bound to two different targets across the two positions.
     """
-    if goals.numel() == 0:
-        return goals
+    pad = enc.pad
+    pad_t = torch.tensor(pad, dtype=a.dtype, device=a.device)
 
-    N, M = goals.shape[:2]
-    S = subs_pairs.shape[1]
-    pad = padding_idx
+    pred_ok = a[..., 0] == b[..., 0]                              # [...]
+    qa, ta = a[..., 1:], b[..., 1:]                              # [...,2]
 
-    preds = goals[:, :, 0:1]  # [N, M, 1]
-    args = goals[:, :, 1:]    # [N, M, 2]
+    qc, tc = enc.is_const(qa), enc.is_const(ta)                  # [...,2]
+    qv, tv = enc.is_var(qa), enc.is_var(ta)
 
-    # OPTIMIZATION: Loop-unrolled for common S=2 case
+    const_clash = (qc & tc & (qa != ta)).any(dim=-1)            # [...]
+    ok = pred_ok & ~const_clash
+
+    bind_q = qv & tc                                             # a-var ↦ b-const
+    bind_t = tv & (qa != pad)         # b-var ↦ any non-pad a-term ((qc|qv)≡a!=pad)
+    frm = torch.where(bind_q, qa, torch.where(bind_t, ta, pad_t))   # [...,2]
+    to_ = torch.where(bind_q, ta, torch.where(bind_t, qa, pad_t))   # [...,2]
+    subs = torch.stack([frm, to_], dim=-1)                       # [...,2,2]
+
+    same_var = (subs[..., 0, 0] == subs[..., 1, 0]) & (subs[..., 0, 0] != pad)
+    ok = ok & ~(same_var & (subs[..., 0, 1] != subs[..., 1, 1]))
+
+    subs = torch.where((~ok).unsqueeze(-1).unsqueeze(-1), pad_t, subs)
+    return ok, subs
+
+
+@torch.no_grad()
+def apply_substitutions(atoms: Tensor, subs: Tensor, enc: "Encoding") -> Tensor:
+    """Apply substitution slots ``(from→to)`` to atom args: ``[N,M,3]``, subs ``[N,S,2]``.
+
+    S=2 hot path: two SEQUENTIAL ``where``s (slot 1 sees slot 0 — needed for chained
+    var→var bindings); a ``pad→-1`` sentinel folds the validity guard into the tiny
+    operand (one fewer big op/slot). S≠2: vectorized first-match (cold path).
+    """
+    if atoms.numel() == 0:
+        return atoms
+    pad = enc.pad
+    N, M = atoms.shape[:2]
+    S = subs.shape[1]
+    preds = atoms[:, :, 0:1]                          # [N, M, 1] (view)
+    args = atoms[:, :, 1:]                            # [N, M, 2] (view)
+
     if S == 2:
-        frm_0 = subs_pairs[:, 0, 0].view(N, 1, 1)  # [N] → [N, 1, 1] for broadcast vs [N, M, 2]
-        to_0 = subs_pairs[:, 0, 1].view(N, 1, 1)
-        frm_1 = subs_pairs[:, 1, 0].view(N, 1, 1)
-        to_1 = subs_pairs[:, 1, 1].view(N, 1, 1)
+        neg = torch.tensor(-1, dtype=args.dtype, device=args.device)   # absent from args
+        frm0 = torch.where(subs[:, 0, 0] != pad, subs[:, 0, 0], neg).view(N, 1, 1)
+        out = torch.where(args == frm0, subs[:, 0, 1].view(N, 1, 1), args)
+        frm1 = torch.where(subs[:, 1, 0] != pad, subs[:, 1, 0], neg).view(N, 1, 1)
+        out = torch.where(out == frm1, subs[:, 1, 1].view(N, 1, 1), out)
+        return torch.cat([preds, out], dim=2)
 
-        valid_0 = (frm_0 != pad)  # [N, 1, 1]
-        valid_1 = (frm_1 != pad)  # [N, 1, 1]
-
-        result_args = torch.where((args == frm_0) & valid_0, to_0, args)  # [N, M, 2]
-        result_args = torch.where((result_args == frm_1) & valid_1, to_1, result_args)  # [N, M, 2]
-
-        return torch.cat([preds, result_args], dim=2)  # [N, M, 3]
-
-    # General case for S != 2
-    valid = subs_pairs[..., 0] != pad             # [N, S]
-    frm = subs_pairs[:, :, 0].view(N, S, 1, 1)   # [N, S, 1, 1] for broadcast vs args
-    to_ = subs_pairs[:, :, 1].view(N, S, 1, 1)   # [N, S, 1, 1]
-    args_exp = args.view(N, 1, M, 2)              # [N, 1, M, 2] for broadcast vs subs
-    valid_exp = valid.view(N, S, 1, 1)             # [N, S, 1, 1]
-
-    match = (args_exp == frm) & valid_exp  # [N, S, M, 2]
-    any_match = match.any(dim=1)           # [N, M, 2]
-    match_idx = match.long().argmax(dim=1) # [N, M, 2] — index into S dim
-
-    to_flat = subs_pairs[:, :, 1]                          # [N, S]
-    match_idx_flat = match_idx.view(N, M * 2)              # [N, M*2]
-    to_gathered = to_flat.gather(1, match_idx_flat).view(N, M, 2)  # [N, M*2] → [N, M, 2]
-
-    result_args = torch.where(any_match, to_gathered, args)  # [N, M, 2]
-    return torch.cat([preds, result_args], dim=2)  # [N, M, 3]
+    # General fallback: first-match over the S slots (parallel; cold path).
+    frm = subs[:, :, 0].view(N, S, 1, 1)
+    valid = (subs[:, :, 0] != pad).view(N, S, 1, 1)
+    match = (args.view(N, 1, M, 2) == frm) & valid               # [N, S, M, 2]
+    any_match = match.any(dim=1)                                 # [N, M, 2]
+    idx = match.long().argmax(dim=1).view(N, M * 2)              # [N, M*2]
+    to_gathered = subs[:, :, 1].gather(1, idx).view(N, M, 2)
+    out = torch.where(any_match, to_gathered, args)
+    return torch.cat([preds, out], dim=2)
 
 
-@torch.no_grad()
-def unify_one_to_one(
-    queries: Tensor,
-    terms: Tensor,
-    constant_no: int,
-    padding_idx: int,
-) -> Tuple[Tensor, Tensor]:
-    """Perform pairwise unification between queries and terms.
-
-    Args:
-        queries:     [L, 3] query atoms
-        terms:       [L, 3] target atoms (facts or rule heads)
-        constant_no: highest constant index (variables start at constant_no + 1)
-        padding_idx: padding index
-
-    Returns:
-        mask: [L] bool — whether each pair unified successfully
-        subs: [L, 2, 2] substitution pairs (from, to) per position
-    """
-    device = queries.device
-    L = queries.shape[0]
-
-    if L == 0:
-        return (torch.empty(0, dtype=torch.bool, device=device),
-                torch.full((0, 2, 2), padding_idx, dtype=torch.long, device=device))
-
-    var_start = constant_no + 1
-    pad = padding_idx
-
-    # Extract predicates and args
-    pred_ok = (queries[:, 0] == terms[:, 0])       # [L]
-    q_args, t_args = queries[:, 1:], terms[:, 1:]  # [L, 2], [L, 2]
-
-    # Compute masks once — all [L, 2]
-    q_const = (q_args <= constant_no)
-    t_const = (t_args <= constant_no)
-    qv = (q_args >= var_start) & (q_args != pad)
-    tv = (t_args >= var_start) & (t_args != pad)
-
-    # Constant conflict check
-    const_conflict = (q_const & t_const & (q_args != t_args)).any(dim=1)  # [L, 2] → [L]
-    mask = pred_ok & ~const_conflict  # [L]
-
-    # Compute substitutions in single vectorized pass — all cases are [L, 2]
-    # case1: query=var, target=const → bind var to const
-    # case2: query=const, target=var → bind var to const
-    # case3: both vars → bind target var to query var
-    # Use t_const/q_const instead of != 0 to support 0-indexed entities.
-    case1 = qv & t_const
-    case2 = q_const & tv
-    case3 = qv & tv
-
-    # Nested torch.where: cases are mutually exclusive, so collapse to 2 ops
-    pad_t = torch.tensor(pad, dtype=q_args.dtype, device=q_args.device)
-    from_val = torch.where(case1, q_args, torch.where(case2 | case3, t_args, pad_t))  # [L, 2]
-    to_val = torch.where(case1, t_args, torch.where(case2 | case3, q_args, pad_t))    # [L, 2]
-
-    # Stack into subs: from_val[L,2] + to_val[L,2] → [L, 2, 2] (per-position from/to pairs)
-    subs = torch.stack([from_val, to_val], dim=2)  # [L, 2, 2]
-
-    # Consistency check: same var bound to different values
-    same_var = (subs[:, 0, 0] == subs[:, 1, 0]) & (subs[:, 0, 0] != pad)  # [L]
-    diff_tgt = subs[:, 0, 1] != subs[:, 1, 1]  # [L]
-    conflict = same_var & diff_tgt  # [L]
-    mask = mask & ~conflict
-
-    # Clear subs for failed unifications
-    fail_mask = ~mask
-    subs = torch.where(fail_mask.view(L, 1, 1), pad_t, subs)  # [L, 1, 1] broadcast → [L, 2, 2]
-
-    return mask, subs
+__all__ = ["unify_one_to_one", "apply_substitutions"]

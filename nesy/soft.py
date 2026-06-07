@@ -1,7 +1,7 @@
 """Soft provability scorer — PostResolutionHook.
 
-Known atoms (facts or provable) → score 1.0.
-Unknown atoms → sigmoid(KGE score) or learned MLP.
+Known atoms (facts or provable) -> score 1.0.
+Unknown atoms -> sigmoid(KGE score) or learned MLP.
 Grounding confidence = product of atom scores.
 Selects top-k by confidence.
 
@@ -22,7 +22,7 @@ from grounder.fc.fc import run_forward_chaining
 
 
 class ProvabilityMLP(nn.Module):
-    """Learned soft provability: Linear → ReLU → Linear → Sigmoid."""
+    """Learned soft provability: Linear -> ReLU -> Linear -> Sigmoid."""
 
     def __init__(self, input_size: int) -> None:
         super().__init__()
@@ -142,9 +142,12 @@ class SoftScorer(nn.Module):
         # Grounding confidence = product, masked
         conf = atom_scores.prod(dim=-1) * mask.float()
 
-        from grounder.nesy import _topk_select
+        from grounder.nesy._util import _topk_select
         return _topk_select(body, mask, rule_idx, conf, self._output_tG)
 
     def __repr__(self) -> str:
         mode = "neural" if self._is_neural else "kge"
         return f"SoftScorer(mode={mode}, output_budget={self._output_tG})"
+
+
+__all__ = ["ProvabilityMLP", "SoftScorer"]

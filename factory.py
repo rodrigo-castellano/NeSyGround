@@ -1,160 +1,147 @@
-"""Grounder factory — parse grounder type string and instantiate BCGrounder.
+"""Grounder factory — ONE construction entry: ``make_grounder(kb, config, ...)``.
 
-Naming convention (dot-separated):
-    {resolution}[.{filter}].d{depth}[.w{width}]
+``make_grounder`` dispatches on the config TYPE (the config encodes resolution +
+``filter()``), collapsing the old BC/FC string fork:
+  SLDConfig / RTFConfig / PBCConfig -> BackwardGrounder
+  FCConfig                          -> ForwardGrounder
 
-Examples:
-    sld.d2              SLD resolution, no filter, depth 2
-    sld.fp_batch.d2     SLD + cross-query Kleene T_P, depth 2
-    sld.fp_global.d3    SLD + FC provable set filter, depth 3
-    rtf.d2              Rule-Then-Fact, depth 2
-    enum.fp_batch.w1.d2 Enum resolution, fp_batch, width 1, depth 2
-    enum.full           Enum, all entities, depth 1
+``create_grounder`` / ``parse_grounder_type`` / ``make_bcwd`` are thin shims that
+build a typed config and delegate. They preserve today's defaults exactly
+(u->filter, all_anchors forced in the ctor, flat_intermediate).
 
-BC_{w,d} shorthand (paper notation):
-    bc01, bc11, bc12, bc13, ...     parametrized BC_{width=W, depth=D};
-                                     auto-configures resolution='enum',
-                                     all_anchors=True, flat_intermediate=True,
-                                     and the keras-prune-aligned filter:
-                                       d=1, w>0  → 'none'
-                                       else      → 'fp_batch'
-                                     ``make_bcwd(kb, w, d, ...)`` is the
-                                     equivalent direct constructor.
+Type grammar (dot-separated):  {resolution}[.{filter}][.pd][.full|.wW][.dD]
+  sld.fp_batch.d2 · rtf.d4 · pbc.fp_batch.w1.d2 · pbc.full · closure
+BC_{w,d}[u] shorthand: bc12, bc13, bc12u1 → pbc with the paper-aligned filter.
+
+``enum`` is accepted as a legacy alias for ``pbc`` (the new resolution name).
+``make_bcwd(kb, w, d, u=0)`` is the direct BC_{w,d,u} constructor.
 """
-
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from grounder.config import FCConfig, PBCConfig, RTFConfig, SLDConfig
 from grounder.data.kb import KB
-from grounder.bc.bc import BCGrounder
+from grounder.grounder.backward import BackwardGrounder
 
-
-# ======================================================================
-# Parser
-# ======================================================================
+GrounderConfigT = Union[SLDConfig, RTFConfig, PBCConfig, FCConfig]
 
 _PATTERN = re.compile(
-    r"^(?P<resolution>sld|rtf|enum|closure)"
+    r"^(?P<resolution>sld|rtf|enum|pbc|closure)"
     r"(\.(?P<filter>fp_batch|fp_global|prune|provset|none))?"
     r"(?P<pd>\.pd)?"
     r"(\.full|\.w(?P<width>\d+))?"
     r"(\.d(?P<depth>\d+))?$"
 )
-
-# Paper BC_{w,d}[_{u}] shorthand:
-#   bcWD       → w=W, d=D, u=0 (paper convention)
-#   bcWDuU     → explicit u (rare; non-paper)
-# Single digit per param. For multi-digit values use ``make_bcwd`` directly,
-# or the long form ``enum.wW.dD``.
 _BCWD_PATTERN = re.compile(r"^bc(?P<width>\d)(?P<depth>\d)(?:u(?P<u>\d))?$")
+_FILTER_ALIASES = {"prune": "fp_batch", "provset": "fp_global"}
 
 
-def _default_enum_filter(u: int) -> str:
-    """Filter default for enum BC_{w,d,u}, keyed on u (= last-step
-    unknown-atom cap, == ``w_last_depth``).
-
-    The paper always uses u=0: at the leaves of the proof tree every
-    body atom must be a fact, and ``fp_batch`` prunes any intermediate
-    rule application whose unknowns aren't derived through the chain.
-
-    u=0  → 'fp_batch' (paper case; keras ``prune_incomplete_proofs=True``)
-    u>0  → 'none'     (admits unknown leaves; keras ``prune=False``)
-    """
+def _default_pbc_filter(u: int) -> str:
+    """u=0 (paper) → fp_batch (keras prune=True); u>0 → none."""
     return "fp_batch" if u == 0 else "none"
 
 
 def parse_grounder_type(grounder_type: str) -> Dict[str, Any]:
-    """Parse a grounder type string into a config dict.
-
-    Returns dict with keys: resolution, filter, depth, width, is_full,
-    step_prune_dead, flat_intermediate.
-
-    Examples:
-        'sld.fp_batch.d2'         → {resolution:'sld', filter:'fp_batch', depth:2, ...}
-        'enum.fp_batch.w1.d2'     → {resolution:'enum', filter:'fp_batch', depth:2, width:1}
-        'enum.full'               → {resolution:'enum', filter:'fp_batch', depth:1, is_full:True}
-        'bc11'                    → enum BC_{w=1,d=1}: filter='none', flat_intermediate=True
-        'bc12'                    → enum BC_{w=1,d=2}: filter='fp_batch', flat_intermediate=True
-    """
-    # ── Paper BC_{w,d,u} shorthand ──
+    """Parse a type string into a config dict (resolution uses the new ``pbc`` name)."""
     m_bcwd = _BCWD_PATTERN.match(grounder_type)
     if m_bcwd is not None:
-        width = int(m_bcwd.group("width"))
-        depth = int(m_bcwd.group("depth"))
-        # u defaults to 0 (paper convention).
-        u_str = m_bcwd.group("u")
-        u = int(u_str) if u_str is not None else 0
-        cfg = {
-            "resolution": "enum",
-            "filter": _default_enum_filter(u),
-            "depth": depth,
-            "width": width,
-            "is_full": False,
-            "step_prune_dead": False,
-            # flat_intermediate is the right default for BC_{w,d} (zero
-            # grounding loss when V≥2; falls through to the dense path
-            # for V<2 cases).
-            "flat_intermediate": True,
-            "u": u,
-        }
-        return cfg
+        u = int(m_bcwd.group("u")) if m_bcwd.group("u") is not None else 0
+        return {"resolution": "pbc", "filter": _default_pbc_filter(u),
+                "depth": int(m_bcwd.group("depth")), "width": int(m_bcwd.group("width")),
+                "is_full": False, "step_prune_dead": False,
+                "flat_intermediate": True, "u": u}
 
-    # Strip known suffixes before regex matching
-    clean_type = grounder_type.replace(".flat", "")
-    m = _PATTERN.match(clean_type)
+    clean = grounder_type.replace(".flat", "")
+    m = _PATTERN.match(clean)
     if not m:
         raise ValueError(
-            f"Unknown grounder type: {grounder_type!r}. "
-            f"Expected format: {{resolution}}[.{{filter}}].d{{depth}}[.w{{width}}]  "
-            f"(e.g. 'sld.fp_batch.d2', 'enum.fp_batch.w1.d2', 'rtf.d4'), or "
-            f"the BC_{{w,d}} shorthand 'bcWD' (e.g. 'bc11', 'bc13')."
-        )
+            f"Unknown grounder type: {grounder_type!r}. Expected "
+            f"'{{sld|rtf|pbc|closure}}[.{{filter}}][.wW][.dD]' or BC shorthand 'bcWD'.")
 
     resolution = m.group("resolution")
+    if resolution == "enum":          # legacy alias
+        resolution = "pbc"
     is_full = ".full" in grounder_type
     flat_intermediate = ".flat" in grounder_type
-
     depth = int(m.group("depth")) if m.group("depth") else 1
     width = int(m.group("width")) if m.group("width") else 1
-
-    # SLD/RTF have no parity story → 'none'. The long-form enum string
-    # has no explicit u; default to the paper convention (u=0) so the
-    # filter resolves to 'fp_batch' (keras prune=True equivalent).
-    if resolution == "enum":
-        default_filter = _default_enum_filter(0)
-    else:
-        default_filter = "none"
-
+    default_filter = _default_pbc_filter(0) if resolution == "pbc" else "none"
     filter_mode = m.group("filter") or default_filter
-    # Normalize legacy names
-    _FILTER_ALIASES = {"prune": "fp_batch", "provset": "fp_global"}
     filter_mode = _FILTER_ALIASES.get(filter_mode, filter_mode)
-
-    return {
-        "resolution": resolution,
-        "filter": filter_mode,
-        "depth": depth,
-        "width": width,
-        "is_full": is_full,
-        "step_prune_dead": bool(m.group("pd")),
-        "flat_intermediate": flat_intermediate,
-    }
+    return {"resolution": resolution, "filter": filter_mode, "depth": depth,
+            "width": width, "is_full": is_full,
+            "step_prune_dead": bool(m.group("pd")), "flat_intermediate": flat_intermediate, "u": 0}
 
 
-# ======================================================================
-# Factory
-# ======================================================================
+# ── make_grounder: the single construction entry (dispatch on config TYPE) ──
+
+def _build_backward(kb: KB, config: GrounderConfigT, *, resolution: str,
+                    layout: str, compile: str, chunk_size: Optional[int],
+                    extra: Dict[str, Any]) -> BackwardGrounder:
+    """Translate a backward config + exec knobs into BackwardGrounder ctor kwargs.
+
+    ``filter`` is NOT forced from ``config.filter()`` here: an explicit filter
+    (type-string / make_bcwd) rides in ``extra``; otherwise the ctor derives the
+    u-based default (pbc u=0 -> fp_batch, u>0 -> none; sld/rtf -> none), which is
+    exactly today's behavior and what ``config.filter()`` encodes for u=0/PBC."""
+    kw: Dict[str, Any] = dict(
+        resolution=resolution, depth=config.depth,
+        max_total_groundings=config.max_total_groundings,
+        collect_rule_groundings=config.collect_rule_groundings,
+        layout=layout, compile=compile, chunk_size=chunk_size)
+    if isinstance(config, PBCConfig):
+        kw["width"] = config.w
+        kw["u"] = config.u
+        kw["flat_intermediate"] = config.flat_intermediate
+        if config.max_groundings_per_query is not None:
+            kw["max_groundings_per_query"] = config.max_groundings_per_query
+    kw.update(extra)
+    return BackwardGrounder(kb, **kw)
+
+
+def make_grounder(
+    kb: KB,
+    config: GrounderConfigT,
+    *,
+    layout: str = "auto",
+    compile: str = "off",
+    chunk_size: Optional[int] = None,
+    transforms: Sequence = (),
+    **extra: Any,
+) -> nn.Module:
+    """Build the family grounder over ``kb`` by dispatching on ``type(config)``.
+
+    ``transforms`` (AXIS 4): a non-empty sequence of ``ProgramTransform`` wraps the
+    base grounder in a ``Pipeline`` (per-call ``apply`` then ``base.rebound``);
+    ``transforms=()`` is byte-identical to the bare grounder (identity discipline).
+    """
+    if transforms:
+        from grounder.core.pipeline import Pipeline
+        base = make_grounder(kb, config, layout=layout, compile=compile,
+                             chunk_size=chunk_size, **extra)
+        return Pipeline(transforms, base)
+
+    if isinstance(config, FCConfig):
+        from grounder.forward.grounder import ForwardGrounder
+        return ForwardGrounder(kb, method=config.method, depth=config.depth,
+                               join_algo=config.join_algo, **extra)
+    if isinstance(config, (SLDConfig, RTFConfig, PBCConfig)):
+        resolution = ("pbc" if isinstance(config, PBCConfig)
+                      else "rtf" if isinstance(config, RTFConfig) else "sld")
+        return _build_backward(kb, config, resolution=resolution, layout=layout,
+                               compile=compile, chunk_size=chunk_size, extra=extra)
+    raise TypeError(f"Unknown grounder config type: {type(config).__name__}")
+
 
 def create_grounder(
     grounder_type: str,
     *,
-    # KB params
     facts_idx: Tensor,
     rule_heads: Tensor,
     rule_bodies: Tensor,
@@ -165,122 +152,54 @@ def create_grounder(
     predicate_no: Optional[int] = None,
     max_facts_per_query: int = 64,
     fact_index_type: str = "block_sparse",
-    # Algorithm params
     max_groundings: int = 32,
     max_total_groundings: int = 64,
-    fc_method: str = "join",
+    fc_method: str = "spmm",
     max_goals: Optional[int] = None,
     **kwargs,
 ) -> nn.Module:
-    """Create a grounder from a type string.
-
-    Builds a KB from the data params, then instantiates BCGrounder.
-
-    Args:
-        grounder_type: e.g. 'sld.fp_batch.d2', 'enum.fp_batch.w1.d2', 'rtf.d4'.
-
-    Returns:
-        BCGrounder instance.
-    """
+    """Build a KB + grounder from a type string — a shim over ``make_grounder``."""
     cfg = parse_grounder_type(grounder_type)
+    kb = KB(facts_idx, rule_heads, rule_bodies, rule_lens,
+            constant_no=constant_no, predicate_no=predicate_no, padding_idx=padding_idx,
+            device=device, max_facts_per_query=max_facts_per_query, fact_index_type=fact_index_type)
 
-    kb = KB(
-        facts_idx, rule_heads, rule_bodies, rule_lens,
-        constant_no=constant_no, predicate_no=predicate_no,
-        padding_idx=padding_idx, device=device,
-        max_facts_per_query=max_facts_per_query,
-        fact_index_type=fact_index_type,
-    )
+    if cfg["resolution"] == "closure":
+        return make_grounder(kb, FCConfig(depth=10, method=fc_method), **kwargs)
 
-    bc_kwargs = dict(
-        resolution=cfg["resolution"],
-        filter=cfg["filter"],
-        depth=cfg["depth"],
-        max_total_groundings=max_total_groundings,
-        max_goals=max_goals,
-    )
-    bc_kwargs["step_prune_dead"] = cfg["step_prune_dead"]
-
-    if cfg["resolution"] == "enum":
-        if cfg["is_full"]:
-            bc_kwargs["width"] = None
-            bc_kwargs["depth"] = 1
-        else:
-            bc_kwargs["width"] = cfg["width"]
-        bc_kwargs["max_groundings_per_query"] = max_groundings
-        bc_kwargs["fc_method"] = fc_method
-        bc_kwargs["flat_intermediate"] = cfg["flat_intermediate"]
-
-    bc_kwargs.update(kwargs)
-
-    # Width: always pass to BCGrounder (for SLD/RTF it activates the hook)
-    if "width" not in bc_kwargs:
-        bc_kwargs["width"] = cfg["width"]
-
-    return BCGrounder(kb, **bc_kwargs)
+    extra: Dict[str, Any] = dict(max_goals=max_goals)
+    if cfg["resolution"] == "pbc":
+        depth = 1 if cfg["is_full"] else cfg["depth"]
+        width = None if cfg["is_full"] else cfg["width"]
+        config: GrounderConfigT = PBCConfig(
+            depth=depth, w=width, u=cfg["u"], flat_intermediate=cfg["flat_intermediate"],
+            max_groundings_per_query=max_groundings,
+            max_total_groundings=max_total_groundings)
+        extra["fc_method"] = fc_method
+        # filter() on PBCConfig is always fp_batch; honor an explicit type-string filter.
+        extra["filter"] = cfg["filter"]
+    elif cfg["resolution"] == "rtf":
+        config = RTFConfig(depth=cfg["depth"], max_total_groundings=max_total_groundings)
+        extra["width"] = cfg["width"]
+        extra["filter"] = cfg["filter"]
+    else:  # sld
+        config = SLDConfig(depth=cfg["depth"], max_total_groundings=max_total_groundings)
+        extra["width"] = cfg["width"]
+        extra["filter"] = cfg["filter"]
+    extra.update(kwargs)
+    return make_grounder(kb, config, **extra)
 
 
-# ======================================================================
-# BC_{w,d} parametrized constructor (paper notation)
-# ======================================================================
+def make_bcwd(kb: KB, w: int, d: int, u: int = 0, *,
+              flat_intermediate: bool = True, filter: Optional[str] = None,
+              **kwargs) -> BackwardGrounder:
+    """The paper's BC_{w,d,u} grounder directly — a shim over ``make_grounder``."""
+    config = PBCConfig(depth=d, w=w, u=u, flat_intermediate=flat_intermediate,
+                       max_total_groundings=kwargs.pop("max_total_groundings", 64))
+    extra: Dict[str, Any] = dict(kwargs)
+    if filter is not None:                # else PBCConfig.filter()==fp_batch derives it
+        extra["filter"] = filter
+    return make_grounder(kb, config, **extra)
 
-def make_bcwd(
-    kb: KB,
-    w: int,
-    d: int,
-    u: int = 0,
-    *,
-    flat_intermediate: bool = True,
-    filter: Optional[str] = None,
-    **kwargs,
-) -> BCGrounder:
-    """Build the paper's BC_{w,d,u} grounder directly from (w, d, u).
 
-    Paper parametrization (matches `keras-ns
-    ApproximateBackwardChainingGrounder` knobs):
-
-      * ``w`` — ``max_unknown_fact_count`` at intermediate steps.
-      * ``d`` — ``num_steps`` (proof depth).
-      * ``u`` — ``max_unknown_fact_count_last_step`` (last-depth cap).
-                The paper convention is ``u=0`` (every leaf body atom
-                must be a fact); the IJCAI '25 experiments use this
-                everywhere. ``u>0`` admits unknown leaves and is rare.
-
-    Internal mapping: ``u`` is forwarded as ``BCGrounder.w_last_depth``.
-    Both names refer to the same per-step unknown cap at ``d == depth-1``.
-
-    Defaults (all overridable via kwargs):
-      * ``resolution='enum'``
-      * ``all_anchors=True``      (forced by ``BCGrounder.__init__`` for enum)
-      * ``flat_intermediate``     defaults to True (zero grounding loss
-                                    when V≥2; falls through to the dense
-                                    path for V<2)
-      * ``filter``                defaults via :func:`_default_enum_filter`:
-                                    u=0 → ``'fp_batch'`` (paper / keras
-                                          ``prune_incomplete_proofs=True``)
-                                    u>0 → ``'none'``    (keras ``prune=False``)
-
-    Args:
-        kb: pre-built KB instance.
-        w: intermediate-step unknown cap.
-        d: proof depth.
-        u: last-step unknown cap (default 0 = paper convention).
-        flat_intermediate: use the flat intermediate path for V≥2 rules.
-        filter: explicit filter override; if None, derived from ``u``.
-        **kwargs: forwarded to ``BCGrounder.__init__``.
-
-    Returns:
-        Fully-configured ``BCGrounder`` instance.
-    """
-    if filter is None:
-        filter = _default_enum_filter(u)
-    return BCGrounder(
-        kb,
-        resolution="enum",
-        depth=d,
-        width=w,
-        w_last_depth=u,
-        filter=filter,
-        flat_intermediate=flat_intermediate,
-        **kwargs,
-    )
+__all__ = ["parse_grounder_type", "make_grounder", "create_grounder", "make_bcwd"]

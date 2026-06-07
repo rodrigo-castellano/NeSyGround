@@ -11,7 +11,7 @@ from torch import Tensor
 
 
 class GroundingAttention(nn.Module):
-    """Learned attention over body atom embeddings. MLP: input_size → hidden → 1."""
+    """Learned attention over body atom embeddings. MLP: input_size -> hidden -> 1."""
 
     def __init__(self, input_size: int) -> None:
         super().__init__()
@@ -74,8 +74,11 @@ class NeuralScorer(nn.Module):
         scores = self._attention(emb.reshape(B * tG_in, M * E)).view(B, tG_in)
         scores = scores + (mask.float() - 1.0) * 1e9
 
-        from grounder.nesy import _topk_select
+        from grounder.nesy._util import _topk_select
         return _topk_select(body, mask, rule_idx, scores, self._output_tG)
 
     def __repr__(self) -> str:
         return f"NeuralScorer(output_budget={self._output_tG})"
+
+
+__all__ = ["GroundingAttention", "NeuralScorer"]
