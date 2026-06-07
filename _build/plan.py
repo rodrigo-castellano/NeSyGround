@@ -1,0 +1,129 @@
+"""RunPlan — the immutable shell->engine snapshot.
+
+The engine reads ONLY this (plus the threaded RunState); it NEVER reads an
+attribute off the Grounder/nn.Module. Backward grounding is reentrant +
+thread-safe by construction. ``snapshot`` reads every ``grounder.X`` ONCE; the
+engine then redirects every hot-path read through this frozen plan.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Optional
+
+from torch import Tensor
+
+from grounder._build.config import BackwardConfig
+from grounder._build.execution.capability import EAGER, CapabilityRow, Cell
+from grounder._build.execution.chunk_policy import ChunkPolicy
+from grounder._build.execution.strategy import ExecStrategy
+from grounder._build.resolution.pbc import PbcPlan, build_plan
+from grounder._build.shapes import Shapes
+from grounder._build.state import OutputSpec
+from grounder._build.types import Layout
+
+if TYPE_CHECKING:                       # cross-layer types
+    from grounder._build.data.kb import KB
+
+
+def _resolve_cell(grounder) -> Cell:
+    return Cell(grounder._exec_layout, grounder._exec_compile)
+
+
+def _resolve_chunk(grounder, shapes) -> ChunkPolicy:
+    cs = grounder._chunk_size
+    if cs is None:
+        return ExecStrategy.default_chunk(shapes)
+    return ChunkPolicy(batch_size=int(cs))
+
+
+@dataclass(frozen=True)
+class RunPlan:
+    """Per-run snapshot handed shell->engine. Immutable; ``for_chunk`` returns a
+    rebatched copy. The engine never stores any of this on the module."""
+
+    shapes: Shapes
+    config: Optional[BackwardConfig]     # SLDConfig | RTFConfig | PBCConfig
+    kb: "KB"
+    output_spec: OutputSpec
+    strategy: ExecStrategy
+    pbc: Optional[PbcPlan]               # build_plan(grounder) ONCE; None for sld/rtf
+    resolution: str
+    filter_mode: str
+    depth: int
+    width: Optional[int]
+    w_last_depth: int
+    S: int
+    C: int
+    max_goals: int
+    max_vars_per_rule: int
+    max_fact_pairs_body: int
+    collect_evidence: bool
+    collect_rule_groundings: bool
+    collect_mode: str
+    flat_intermediate: bool
+    pack_dedup: bool
+    prune_facts: bool
+    all_anchors: bool
+    init_state_shape: str
+    standardize: bool                    # = _standardize_fn is not None
+    variant_to_orig: Optional[Tensor]    # REFERENCE, not clone
+    fact_hook: object
+    rule_hook: object
+    binding_tables: object               # mutable cache slot (filled by engine)
+
+    @staticmethod
+    def snapshot(grounder) -> "RunPlan":
+        """Read every grounder.X ONCE into a frozen plan (reentrant from here)."""
+        kb = grounder.kb
+        is_pbc = grounder.resolution == "pbc"
+        pbc = build_plan(grounder) if is_pbc else None
+        shapes = Shapes(
+            B=getattr(grounder, "B", 1), S=grounder.S, G=grounder.max_goals,
+            M=kb.M, D=grounder.depth, A=grounder.A,
+            C=grounder.C, K_f=kb.K_f, K_r=getattr(grounder, "K_r", kb.K_r),
+            G_r=getattr(grounder, "G_r", 1), K_v=getattr(grounder, "K_v", 1),
+            V=getattr(grounder, "V", 1), E=getattr(grounder, "_E", kb.constant_no),
+            N=getattr(grounder, "B", 1) * grounder.S, pad=kb.padding_idx)
+        row = grounder.capability_row()
+        if getattr(grounder, "_knobs_set", False):
+            strategy = ExecStrategy.explicit(row, _resolve_cell(grounder),
+                                             _resolve_chunk(grounder, shapes))
+        else:
+            strategy = ExecStrategy.auto(row, shapes=shapes)
+            # Eager-port: compile is opt-in; downgrade an auto-picked compiled cell to
+            # its eager-declared sibling, keyed on the legacy flat flag (deterministic
+            # now that PBC declares two eager cells), so wrap_step stays byte-identical.
+            if (not strategy.cell.compile.eager
+                    and not getattr(grounder, "compile_enabled", False)):
+                want = Layout.FLAT if grounder._flat_intermediate else Layout.DENSE
+                strategy = ExecStrategy.explicit(row, Cell(want, EAGER), strategy.chunk)
+        return RunPlan(
+            shapes=shapes, config=getattr(grounder, "config", None), kb=kb,
+            output_spec=getattr(grounder, "output_spec", OutputSpec()),
+            strategy=strategy, pbc=pbc,
+            resolution=grounder.resolution, filter_mode=grounder.filter_mode,
+            depth=grounder.depth, width=grounder.width,
+            w_last_depth=grounder._w_last_depth, S=grounder.S, C=grounder.C,
+            max_goals=grounder.max_goals, max_vars_per_rule=grounder.max_vars_per_rule,
+            max_fact_pairs_body=getattr(grounder, "_max_fact_pairs_body", 0),
+            collect_evidence=grounder.collect_evidence,
+            collect_rule_groundings=grounder._collect_rule_groundings,
+            collect_mode=grounder._collect_mode,
+            flat_intermediate=grounder._flat_intermediate,
+            pack_dedup=grounder._pack_dedup, prune_facts=grounder.prune_facts,
+            all_anchors=grounder._all_anchors,
+            init_state_shape=grounder._init_state_shape,
+            standardize=grounder._standardize_fn is not None,
+            variant_to_orig=getattr(grounder, "_variant_to_orig_t", None),
+            fact_hook=grounder.fact_hook, rule_hook=grounder.rule_hook,
+            binding_tables=None)
+
+    def for_chunk(self, B: int) -> "RunPlan":
+        """New immutable plan with Shapes rebatched to ``B``."""
+        return replace(self, shapes=self.shapes.with_batch(B))
+
+    def needs_provenance(self) -> bool:
+        return self.output_spec.needs_provenance()
+
+
+__all__ = ["RunPlan"]
