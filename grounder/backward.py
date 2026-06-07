@@ -348,16 +348,20 @@ class BackwardGrounder(nn.Module):
         firings + atom_table) so the downstream compiled reasoner sees a bounded
         set of graph variants — essential for the OOM-prone flat-path cells
         (family|BC{12,13}, countries_s3|BC13) under reduce-overhead compile."""
-        prev = self._collect_rule_groundings
-        self._collect_rule_groundings = True
+        # run_bc returns ONLY rule_groundings (from the FIRINGS/considered path),
+        # so request FIRINGS-only and turn evidence OFF: skips the TREES
+        # accumulated_body[B,S,D,M,3] sync that the caller discards (the ~2x GPU
+        # cost on large KBs). rule_groundings is built from firings, not trees,
+        # so the output stays byte-identical.
+        prev_rg, prev_ev = self._collect_rule_groundings, self.collect_evidence
+        self._collect_rule_groundings, self.collect_evidence = True, False
         try:
             excluded = init_kwargs.pop("excluded_queries", None)
-            spec = self._default_output_spec()  # forces FIRINGS (flag is True here)
-            self.output_spec = spec
+            self.output_spec = OutputSpec(frozenset({Tier.PROOF_STATE, Tier.FIRINGS}))
             out = run_backward(self, queries, query_mask,
                                excluded_queries=excluded, **init_kwargs)
         finally:
-            self._collect_rule_groundings = prev
+            self._collect_rule_groundings, self.collect_evidence = prev_rg, prev_ev
         rg = out.rule_groundings
         if rg is None:
             rg = RuleGroundings.empty(
