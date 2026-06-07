@@ -39,6 +39,7 @@ class BackwardGrounder(nn.Module):
         kb: KB,
         *,
         resolution: str = "pbc",
+        materialization: str = "cartesian",   # pbc layout: "cartesian" | "join" (L3)
         depth: int = 2,
         width: Optional[int] = 1,
         w: Optional[int] = None,
@@ -75,7 +76,8 @@ class BackwardGrounder(nn.Module):
         # Capture the raw ctor inputs (sans kb) for rebound() — re-snapshot over a
         # rewritten KB with the IDENTICAL knobs (transform support).
         self._ctor_kwargs = dict(
-            resolution=resolution, depth=depth, width=width, w=w, u=u,
+            resolution=resolution, materialization=materialization,
+            depth=depth, width=width, w=w, u=u,
             w_last_depth=w_last_depth, filter=filter,
             max_total_groundings=max_total_groundings,
             max_groundings_per_query=max_groundings_per_query,
@@ -99,7 +101,18 @@ class BackwardGrounder(nn.Module):
         if w_last_depth is None:
             w_last_depth = u
 
+        if materialization not in ("cartesian", "join"):
+            raise ConfigError(f"materialization must be cartesian|join, got {materialization!r}")
+        if materialization == "join" and resolution != "pbc":
+            raise ConfigError("materialization='join' requires resolution='pbc'")
         self.resolution = resolution
+        # Dispatch key: "join" routes to the L3 JoinResolver but keeps the pbc init
+        # path (same binding tables); flat layout forced (join is flat-eager only).
+        self._materialization = materialization
+        self._dispatch_resolution = "join" if materialization == "join" else resolution
+        if materialization == "join":
+            flat_intermediate = True
+            layout = "flat"
         self.depth = depth
         self.width = width
         self.collect_evidence = collect_evidence

@@ -274,6 +274,69 @@ class FlatMaterializer:
             torch.zeros(0, dtype=torch.bool, device=dev), z(0), B, S, True)
 
 
+# ══════════════════════════ join (L3) ══════════════════════════
+
+class JoinMaterializer(FlatMaterializer):
+    """L3 join layout — flat compact rows + an in-join width BRANCH PRUNER.
+
+    SIBLING of FlatMaterializer: reuses prepare/fill/width/emit UNCHANGED and only
+    swaps ``enumerate`` for an incremental (per-fv) expansion that drops partial
+    rows whose determined-unknown count already exceeds the step width. Because the
+    final ``apply_filters_flat`` (in .width) is untouched and the pruner removes
+    only rows it too would reject, the survivor SET equals the flat path's.
+
+    ``set_prune_width(w_d)`` is called by ``resolve_step_join`` with the per-step
+    width (== the filter's, accounting for the last-step ``w_last_depth``)."""
+
+    def __init__(self):
+        self._prune_width = None   # int | 0-dim Tensor | None (set per step)
+
+    def set_prune_width(self, w_d) -> None:
+        self._prune_width = w_d
+
+    def enumerate(self, work: _FlatWork, cl, plan, fact_index) -> Optional[_FlatCand]:
+        t, ai = plan.tables, cl.active_idx
+        qs, qo = work.flat_q[:, 1], work.flat_q[:, 2]
+        N = work.flat_q.size(0)
+        # ready_after[r,m]: max free-var dep-index a body atom refs (-1 if none) →
+        # the fv step after which the atom is fully determined (subj/obj cols → -1).
+        ready_after = (t.arg_source_dep[ai] - 2).clamp(min=-1).max(dim=-1).values  # [N,K_r,M]
+        w_d = self._prune_width
+        # eager-only int width supports pruning; None / 0-dim tensor → no prune (sound).
+        prune_w = w_d if isinstance(w_d, int) else None
+        flat_source, n_idx, r_idx = C.enumerate_join_flat(
+            N, cl.K_r, qs, qo, t.fv_enum_pred[ai], t.fv_enum_bound_src[ai],
+            t.fv_enum_direction[ai], t.fv_enum_valid[ai], cl.has_free_q, cl.active_mask,
+            fact_index, V=plan.V, fv_any_valid=plan.fv_any_valid,
+            arg_source_dep_q=t.arg_source_dep[ai], body_preds_dep_q=t.body_preds_dep[ai],
+            num_body_q=t.num_body_atoms[ai], ready_after_q=ready_after,
+            width=prune_w, w_is_capped=(prune_w is not None))
+        if flat_source.size(0) == 0:
+            return None
+        rule_global = ai[n_idx, r_idx]
+        return _FlatCand(flat_source, n_idx, r_idx, rule_global,
+                         t.arg_source_dep[rule_global], t.body_preds_dep[rule_global],
+                         t.num_body_atoms[rule_global])
+
+
+def resolve_step_join(inp: StepInputs, plan, fact_index, materializer: JoinMaterializer):
+    """resolve_step for the join: identical pipeline, but feeds the per-step width
+    ``w_d`` to the materializer's in-join pruner before enumerate."""
+    w_d, hpm_d = depth_gate(inp.d, inp.depth, inp.width, inp.w_last_depth,
+                            plan.tables.head_pred_mask, inp.is_last)
+    materializer.set_prune_width(w_d)
+    work = materializer.prepare(inp, plan)
+    if work is None:
+        return materializer.empty(inp, plan)
+    cl = cluster(work.q_preds, work.q_valid, plan.tables)
+    cand = materializer.enumerate(work, cl, plan, fact_index)
+    if cand is None:
+        return materializer.empty(inp, plan)
+    body, exists, body_active = materializer.fill(cand, cl, plan, fact_index, work)
+    keep = materializer.width(body, exists, body_active, cand, cl, work, w_d, hpm_d, inp)
+    return materializer.emit(body, keep, cand, cl, work, inp, plan)
+
+
 # ══════════════════════════ resolver wrapper (AXIS 1 seam) ══════════════════════════
 
 class PbcResolver:
@@ -299,5 +362,28 @@ class PbcResolver:
         return resolve_step(inp, pbc, kb.fact_index, mat)
 
 
-__all__ = ["StepInputs", "resolve_step", "DenseMaterializer", "FlatMaterializer",
-           "PbcResolver"]
+class JoinResolver:
+    """RESOLVERS["join"] — L3 join SIBLING of pbc (NOT a modification of it).
+
+    Reuses the PbcPlan binding tables; drives ``resolve_step_join`` with a
+    ``JoinMaterializer`` (flat-eager only). Produces the EXACT pbc flat survivor
+    SET (set-equality gated by tests/join_ab.py), with the width predicate pushed
+    into the join as a branch pruner instead of a post-hoc filter."""
+    name = "join"
+
+    def declared_cells(self) -> frozenset:
+        return frozenset({Cell(Layout.FLAT, EAGER)})
+
+    def resolve(self, req):
+        plan, fr, kb, dsel = req.plan, req.frontier, req.plan.kb, req.depth_selector
+        pbc = plan.pbc
+        inp = StepInputs(
+            req.queries, req.remaining, fr.grounding_body, req.state_valid,
+            req.active_mask, padding_idx=kb.padding_idx, d=dsel.d, depth=plan.depth,
+            is_last=None, width=plan.width, w_last_depth=plan.w_last_depth,
+            collect_evidence=plan.collect_evidence, dedup_goals=False)
+        return resolve_step_join(inp, pbc, kb.fact_index, JoinMaterializer())
+
+
+__all__ = ["StepInputs", "resolve_step", "resolve_step_join", "DenseMaterializer",
+           "FlatMaterializer", "JoinMaterializer", "PbcResolver", "JoinResolver"]

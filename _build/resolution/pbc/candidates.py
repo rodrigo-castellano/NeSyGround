@@ -236,8 +236,101 @@ def enumerate_cartesian_flat(B, K_r, query_subjs, query_objs, fv_pred_q, fv_boun
     return torch.stack(flat_parts, dim=1), b_idx, r_idx
 
 
+# ── L3 join enumeration (semantics-preserving width branch-pruning) ──
+
+def _determined_unknown_count(flat_source, ready_now, arg_src_dep, bpreds_dep,
+                              nbody, fact_index, M):
+    """Count UNKNOWN (non-fact) body atoms that are FULLY DETERMINED so far.
+
+    ``ready_now [T,M]`` marks atoms whose every free-var ref is already bound.
+    Padded/undetermined atoms are excluded → a sound LOWER BOUND on the final
+    ``num_unknown`` (monotone as more fv bind), so a row exceeding ``width`` here
+    can never survive the final width filter. Returns ``[T]`` counts.
+    """
+    T = flat_source.size(0)
+    if T == 0:
+        return flat_source.new_zeros(0, dtype=torch.long)
+    body = _gather_body_atoms(
+        flat_source.unsqueeze(1).expand(-1, M, -1), arg_src_dep, bpreds_dep)  # [T,M,3]
+    exists = fact_index.exists(body.reshape(-1, 3)).reshape(T, M)
+    return (ready_now & ~exists).sum(dim=-1)
+
+
+def enumerate_join_flat(B, K_r, query_subjs, query_objs, fv_pred_q, fv_bound_src_q,
+                        fv_dir_q, fv_valid_q, has_free_q, active_mask, fact_index,
+                        V, fv_any_valid, arg_source_dep_q, body_preds_dep_q,
+                        num_body_q, ready_after_q, width, w_is_capped):
+    """L3 join: incremental free-var expansion with a width BRANCH PRUNER.
+
+    Same row contract as ``enumerate_cartesian_flat`` (``flat_source[T,2+V]``,
+    ``b_idx[T]``, ``r_idx[T]``) but expands compactly (nonzero per step, no dense
+    padded cartesian) and — when width is bounded — drops partial rows whose
+    DETERMINED unknown count already exceeds ``width``. The prune only removes
+    rows the final ``apply_filters_flat`` would also reject, so the survivor SET
+    is identical to the flat cartesian path.
+    """
+    dev = query_subjs.device
+    # seed: every (active query, valid rule slot) — flat row indices into [B*K_r].
+    seed_mask = active_mask & (has_free_q | ~has_free_q)   # all valid slots
+    seed = torch.nonzero(seed_mask, as_tuple=False)        # [T0, 2] (b, r)
+    n_idx, r_idx = seed[:, 0], seed[:, 1]
+    if n_idx.numel() == 0:
+        return (torch.empty(0, 2, dtype=torch.long, device=dev),
+                torch.empty(0, dtype=torch.long, device=dev),
+                torch.empty(0, dtype=torch.long, device=dev))
+
+    # flat_source columns: [subj, obj, fv0, fv1, ...] (free-var cols filled per step).
+    cols = [query_subjs[n_idx], query_objs[n_idx]]
+    for _ in range(V):
+        cols.append(torch.zeros(n_idx.size(0), dtype=torch.long, device=dev))
+    src = torch.stack(cols, dim=1)                          # [T, 2+V]
+    M = arg_source_dep_q.size(2)
+
+    for fv in range(V):
+        if fv_any_valid is not None and not fv_any_valid[fv]:
+            continue
+        # rows whose rule actually enumerates this fv (else pass through unchanged).
+        does_fv = fv_valid_q[n_idx, r_idx, fv]
+        if bool(does_fv.any()):
+            act = torch.nonzero(does_fv, as_tuple=False).squeeze(1)
+            ep = fv_pred_q[n_idx[act], r_idx[act], fv]
+            bsrc = fv_bound_src_q[n_idx[act], r_idx[act], fv].clamp(max=src.size(1) - 1)
+            bound = src[act].gather(1, bsrc.unsqueeze(1)).squeeze(1)
+            ed = fv_dir_q[n_idx[act], r_idx[act], fv]
+            cands, cmask = fact_index.enumerate(ep, bound, ed)   # [Ta, Kf]
+            Kf = cands.size(1)
+            rep = torch.repeat_interleave(act, Kf)
+            keep = cmask.reshape(-1)
+            new_src = src[rep].clone()
+            new_src[:, 2 + fv] = cands.reshape(-1)
+            keep_idx = torch.nonzero(keep, as_tuple=False).squeeze(1)
+            exp_n = n_idx[rep][keep_idx]; exp_r = r_idx[rep][keep_idx]
+            exp_src = new_src[keep_idx]
+            # pass-through rows (rule doesn't enumerate this fv at all).
+            pas = torch.nonzero(~does_fv, as_tuple=False).squeeze(1)
+            n_idx = torch.cat([exp_n, n_idx[pas]])
+            r_idx = torch.cat([exp_r, r_idx[pas]])
+            src = torch.cat([exp_src, src[pas]])
+        # BRANCH PRUNE: drop rows whose determined-unknown count already > width.
+        if w_is_capped and width is not None:
+            asd = arg_source_dep_q[n_idx, r_idx]; bpd = body_preds_dep_q[n_idx, r_idx]
+            nb = num_body_q[n_idx, r_idx]
+            atom_idx = arange_cached(M, dev).unsqueeze(0)
+            ready = (ready_after_q[n_idx, r_idx] <= fv) & (atom_idx < nb.unsqueeze(1))  # [T,M]
+            du = _determined_unknown_count(src, ready, asd, bpd, nb, fact_index, M)
+            surv = torch.nonzero(du <= width, as_tuple=False).squeeze(1)
+            n_idx, r_idx, src = n_idx[surv], r_idx[surv], src[surv]
+        if n_idx.numel() == 0:
+            return (torch.empty(0, 2 + V, dtype=torch.long, device=dev),
+                    torch.empty(0, dtype=torch.long, device=dev),
+                    torch.empty(0, dtype=torch.long, device=dev))
+
+    return src, n_idx, r_idx
+
+
 __all__ = [
     "cluster", "ClusteredRules", "arange_cached", "cumcount_flat",
     "fill_body_dense", "fill_body_flat",
     "enumerate_single_dense", "enumerate_cartesian_dense", "enumerate_cartesian_flat",
+    "enumerate_join_flat",
 ]

@@ -1,7 +1,8 @@
 """CONTRACTS for the registry seams (AXIS 1 Resolver + AXIS 3 ForwardMethod).
 
-- RESOLVERS is keyed exactly {sld, rtf, pbc}; every entry structurally implements
-  the Resolver Protocol and its ``.name`` matches its registry key.
+- RESOLVERS is keyed exactly {sld, rtf, pbc, join}; every entry structurally
+  implements the Resolver Protocol and its ``.name`` matches its registry key.
+  ``join`` is the L3 semantics-preserving sibling of pbc (flat-eager cell).
 - the resolve() dispatch in engine/step.py is a pure registry lookup: NO if/elif
   branching on a ``.resolution`` attribute survives in that module (AST scan).
 - declared_cells() is a non-empty FrozenSet[Cell] for every resolver.
@@ -24,7 +25,7 @@ _FC_PY = Path(__file__).parent.parent / "forward" / "fc.py"
 
 
 def test_resolvers_keyed_exactly() -> None:
-    assert set(RESOLVERS) == {"sld", "rtf", "pbc"}
+    assert set(RESOLVERS) == {"sld", "rtf", "pbc", "join"}
 
 
 def test_every_resolver_impls_protocol() -> None:
