@@ -117,8 +117,9 @@ def make_grounder(
 ) -> nn.Module:
     """Build the family grounder over ``kb`` by dispatching on ``type(config)``.
 
-    ``transforms`` (Phase A: empty) will wrap the grounder in a ``Pipeline``; the
-    seam lands with the transform axis, so a non-empty list raises here for now.
+    ``transforms`` (AXIS 4): a non-empty sequence of ``ProgramTransform`` wraps the
+    base grounder in a ``Pipeline`` (per-call ``apply`` then ``base.rebound``);
+    ``transforms=()`` is byte-identical to the bare grounder (identity discipline).
     """
     if transforms:
         from grounder._build.core.pipeline import Pipeline
