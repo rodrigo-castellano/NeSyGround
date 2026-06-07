@@ -101,5 +101,8 @@ def test_with_closure_returns_new_kb_without_mutating() -> None:
     assert new is not kb
     assert kb.num_facts == before              # original untouched
     assert new.num_facts == before + 1         # closure has the extra fact
-    assert kb.rule_index is not new.rule_index  # indices rebuilt, not shared
+    # Facts-only rewrite REUSES the rule-derived index (the Step-5 cache), but
+    # rebuilds the fact index (facts changed). with_closure now delegates here.
+    assert kb.rule_index is new.rule_index
+    assert kb.fact_index is not new.fact_index
 
