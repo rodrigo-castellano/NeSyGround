@@ -16,6 +16,7 @@ from typing import NamedTuple, Optional
 import torch
 from torch import Tensor
 
+from grounder._build.execution.capability import Cell, EAGER, COMPILED_STEP, COMPILED_DYNAMIC
 from grounder._build.resolution.pbc import candidates as C
 from grounder._build.resolution.pbc.candidates import cluster
 from grounder._build.resolution.pbc.width import apply_filters_dense, apply_filters_flat, depth_gate
@@ -273,4 +274,30 @@ class FlatMaterializer:
             torch.zeros(0, dtype=torch.bool, device=dev), z(0), B, S, True)
 
 
-__all__ = ["StepInputs", "resolve_step", "DenseMaterializer", "FlatMaterializer"]
+# ══════════════════════════ resolver wrapper (AXIS 1 seam) ══════════════════════════
+
+class PbcResolver:
+    """RESOLVERS["pbc"] — picks the dense/flat materializer (pbc-internal) + drives
+    resolve_step (byte-identical to today's step.py:resolve pbc branch). The
+    ResolveRequest fact_hook/rule_hook fields are INERT for pbc (ignored)."""
+    name = "pbc"
+
+    def declared_cells(self) -> frozenset:
+        return frozenset({Cell(Layout.FLAT, EAGER), Cell(Layout.DENSE, EAGER),
+                          Cell(Layout.DENSE, COMPILED_STEP), Cell(Layout.DENSE, COMPILED_DYNAMIC)})
+
+    def resolve(self, req):
+        plan, fr, kb, dsel = req.plan, req.frontier, req.plan.kb, req.depth_selector
+        pbc = plan.pbc
+        mat = (FlatMaterializer() if (plan.flat_intermediate and pbc.V >= 1)
+               else DenseMaterializer())
+        inp = StepInputs(
+            req.queries, req.remaining, fr.grounding_body, req.state_valid,
+            req.active_mask, padding_idx=kb.padding_idx, d=dsel.d, depth=plan.depth,
+            is_last=None, width=plan.width, w_last_depth=plan.w_last_depth,
+            collect_evidence=plan.collect_evidence, dedup_goals=False)
+        return resolve_step(inp, pbc, kb.fact_index, mat)
+
+
+__all__ = ["StepInputs", "resolve_step", "DenseMaterializer", "FlatMaterializer",
+           "PbcResolver"]

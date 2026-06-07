@@ -14,11 +14,13 @@ import torch
 from torch import Tensor
 
 from grounder._build.data.encoding import Encoding
+from grounder._build.execution.capability import Cell, EAGER
 from grounder._build.resolution.mgu import empty_rule_results, resolve_facts, resolve_rules
 from grounder._build.types import FlatResolvedChildren, Layout, ResolvedChildren
 
 if TYPE_CHECKING:
     from grounder._build.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
+    from grounder._build.resolution.api import ResolveRequest
 
 
 def resolve_sld(
@@ -162,4 +164,35 @@ def resolve_sld_flat(
         B, S, False)
 
 
-__all__ = ["resolve_sld", "resolve_sld_flat"]
+class SldResolver:
+    """RESOLVERS["sld"] — wraps resolve_sld / resolve_sld_flat (byte-identical dispatch)."""
+    name = "sld"
+
+    def declared_cells(self) -> frozenset:
+        return frozenset({Cell(Layout.DENSE, EAGER), Cell(Layout.FLAT, EAGER)})
+
+    def resolve(self, req: "ResolveRequest"):
+        plan, fr, kb = req.plan, req.frontier, req.plan.kb
+        flat = plan.strategy.layout() is Layout.FLAT
+        if flat:
+            return resolve_sld_flat(
+                req.queries, req.remaining, req.state_valid, req.active_mask,
+                next_var_indices=fr.next_var,
+                fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
+                rule_index=kb.rule_index, enc=kb.encoding,
+                K_f=kb.K_f, K_r=kb.K_r, max_vars_per_rule=plan.max_vars_per_rule,
+                num_rules=kb.num_rules, top_rule_idx=fr.top_rule_idx,
+                body_count=fr.body_count, excluded_queries=req.excluded_queries,
+                fact_hook=req.fact_hook, rule_hook=req.rule_hook,
+                collect_evidence=plan.collect_evidence)
+        return resolve_sld(
+            req.queries, req.remaining, req.state_valid, req.active_mask,
+            next_var_indices=fr.next_var,
+            fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
+            rule_index=kb.rule_index, enc=kb.encoding,
+            K_f=kb.K_f, K_r=kb.K_r, max_vars_per_rule=plan.max_vars_per_rule,
+            num_rules=kb.num_rules, excluded_queries=req.excluded_queries,
+            fact_hook=req.fact_hook, rule_hook=req.rule_hook)
+
+
+__all__ = ["resolve_sld", "resolve_sld_flat", "SldResolver"]

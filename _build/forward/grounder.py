@@ -1,22 +1,31 @@
 """ForwardGrounder — forward chaining as a grounder (closure to fixpoint).
 
 Wraps ``run_forward_chaining`` over a KB's rules+facts, exposing the derived
-closure as hashes or triples. Used by ``KB.with_closure`` (soundness) and the
-``closure`` factory type. FC operates over the REAL predicate range (max id seen
-in facts/rules + 1), NOT the loader's inflated ``predicate_no`` — passing the
-inflated value would build thousands of empty per-predicate matrices.
+closure as a ``Closure`` (hashes/n/E) via ``ground``; ``closure_facts``/``forward``
+stay as compat shims (``kb.with_closure(fg())`` still reads naturally). FC operates
+over the REAL predicate range (max id seen in facts/rules + 1), NOT the loader's
+inflated ``predicate_no`` — the inflated value would build thousands of empty
+per-predicate matrices.
+
+FC shares the execution Cell/CapabilityRow vocabulary only: it declares a single
+``Cell(SPARSE, EAGER)`` (sparse layout is forward-only, runs eager) and produces a
+``Closure``, NOT tiers (``producible_tiers() == frozenset()``).
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import FrozenSet, Tuple
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from grounder._build.core.request import GroundRequest, Tier
 from grounder._build.data.kb import KB
 from grounder._build.data.rule_index import compile_rules
+from grounder._build.execution.capability import EAGER, CapabilityRow, Cell
+from grounder._build.forward.api import Closure
 from grounder._build.forward.fc import run_forward_chaining
+from grounder._build.types import Layout
 
 
 def _real_num_predicates(kb: KB) -> int:
@@ -52,16 +61,35 @@ class ForwardGrounder(nn.Module):
             self._num_entities, self._num_predicates, depth=self.depth,
             device=str(self.kb.device_), method=self.method, join_algo=self.join_algo)
 
+    # ── Grounder API ──
+    @torch.no_grad()
+    def ground(self, request: GroundRequest = GroundRequest()) -> Closure:
+        """Run the closure to fixpoint -> ``Closure`` (FC reads only ``closure_depth``)."""
+        depth = request.closure_depth if request.closure_depth is not None else self.depth
+        hashes, n = run_forward_chaining(
+            self._rules, self.kb.fact_index.facts_idx,
+            self._num_entities, self._num_predicates, depth=depth,
+            device=str(self.kb.device_), method=self.method, join_algo=self.join_algo)
+        return Closure(hashes=hashes, n_provable=n, num_entities=self._num_entities)
+
+    def capability_row(self) -> CapabilityRow:
+        """FC shares Cell/CapabilityRow vocabulary only: one sparse-eager cell
+        (vocab-share, NO iter_chunks claim)."""
+        return CapabilityRow(frozenset({Cell(Layout.SPARSE, EAGER)}))
+
+    def producible_tiers(self) -> FrozenSet[Tier]:
+        """FC produces a ``Closure``, not BC tiers."""
+        return frozenset()
+
+    def rebound(self, kb: KB) -> "ForwardGrounder":
+        """Re-snapshot over a rewritten KB (transforms); same method/depth/join."""
+        return ForwardGrounder(kb, method=self.method, depth=self.depth,
+                               join_algo=self.join_algo)
+
+    # ── compat shims (one-window) ──
     def closure_facts(self) -> Tensor:
         """Derived closure as ``[N, 3]`` (pred, subj, obj) triples."""
-        hashes, n = self.closure_hashes()
-        if n == 0:
-            return torch.empty(0, 3, dtype=torch.long, device=hashes.device)
-        E = self._num_entities
-        E2 = E * E
-        pred = hashes // E2
-        rem = hashes % E2
-        return torch.stack([pred, rem // E, rem % E], dim=1)
+        return self.ground().facts()
 
     def forward(self) -> Tensor:
         """Closure triples (so ``kb.with_closure(fg())`` reads naturally)."""

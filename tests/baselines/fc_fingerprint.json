@@ -1,0 +1,82 @@
+{
+  "cells": {
+    "countries_s2|spmm|d10": {
+      "cfg": {
+        "depth": 10
+      },
+      "dataset": "countries_s2",
+      "method": "spmm",
+      "n_provable": 593,
+      "num_entities": 272,
+      "num_predicates": 5,
+      "numel": 593,
+      "rules": "rules.txt",
+      "sha": "7705b63bfe85f464"
+    },
+    "countries_s2|spmm|d3": {
+      "cfg": {
+        "depth": 3
+      },
+      "dataset": "countries_s2",
+      "method": "spmm",
+      "n_provable": 329,
+      "num_entities": 272,
+      "num_predicates": 5,
+      "numel": 329,
+      "rules": "rules.txt",
+      "sha": "4236061b80545362"
+    },
+    "countries_s2|staged|d10": {
+      "cfg": {
+        "depth": 10
+      },
+      "dataset": "countries_s2",
+      "method": "staged",
+      "n_provable": 593,
+      "num_entities": 272,
+      "num_predicates": 5,
+      "numel": 593,
+      "rules": "rules.txt",
+      "sha": "7705b63bfe85f464"
+    },
+    "countries_s2|staged|d3": {
+      "cfg": {
+        "depth": 3
+      },
+      "dataset": "countries_s2",
+      "method": "staged",
+      "n_provable": 329,
+      "num_entities": 272,
+      "num_predicates": 5,
+      "numel": 329,
+      "rules": "rules.txt",
+      "sha": "4236061b80545362"
+    },
+    "family|spmm|d10": {
+      "cfg": {
+        "depth": 10
+      },
+      "dataset": "family",
+      "method": "spmm",
+      "n_provable": 22234,
+      "num_entities": 2969,
+      "num_predicates": 13,
+      "numel": 22234,
+      "rules": "rules_old.txt",
+      "sha": "0a41d21b57143f8e"
+    },
+    "family|staged|d10": {
+      "cfg": {
+        "depth": 10
+      },
+      "dataset": "family",
+      "method": "staged",
+      "n_provable": 22234,
+      "num_entities": 2969,
+      "num_predicates": 13,
+      "numel": 22234,
+      "rules": "rules_old.txt",
+      "sha": "0a41d21b57143f8e"
+    }
+  }
+}

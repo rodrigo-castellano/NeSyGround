@@ -12,13 +12,12 @@ from typing import TYPE_CHECKING, Optional
 
 from torch import Tensor
 
-from grounder._build.config import BackwardConfig
+from grounder._build.core.request import OutputSpec   # typed tier set (threaded through the plan)
 from grounder._build.execution.capability import EAGER, CapabilityRow, Cell
 from grounder._build.execution.chunk_policy import ChunkPolicy
 from grounder._build.execution.strategy import ExecStrategy
 from grounder._build.resolution.pbc import PbcPlan, build_plan
 from grounder._build.shapes import Shapes
-from grounder._build.state import OutputSpec
 from grounder._build.types import Layout
 
 if TYPE_CHECKING:                       # cross-layer types
@@ -42,7 +41,6 @@ class RunPlan:
     rebatched copy. The engine never stores any of this on the module."""
 
     shapes: Shapes
-    config: Optional[BackwardConfig]     # SLDConfig | RTFConfig | PBCConfig
     kb: "KB"
     output_spec: OutputSpec
     strategy: ExecStrategy
@@ -101,7 +99,7 @@ class RunPlan:
             elif not is_pbc and strategy.cell.layout is Layout.FLAT:
                 strategy = ExecStrategy.explicit(row, Cell(Layout.DENSE, EAGER), strategy.chunk)
         return RunPlan(
-            shapes=shapes, config=getattr(grounder, "config", None), kb=kb,
+            shapes=shapes, kb=kb,
             output_spec=getattr(grounder, "output_spec", OutputSpec()),
             strategy=strategy, pbc=pbc,
             resolution=grounder.resolution, filter_mode=grounder.filter_mode,

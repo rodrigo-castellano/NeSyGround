@@ -20,7 +20,7 @@ class StrategyError(GrounderError):
 
 
 class CapMissError(GrounderError):
-    """G_r cap exceeded while EnumConfig.strict_cap is set. Default mode
+    """G_r cap exceeded while PBCConfig.strict_cap is set. Default mode
     flags+clamps instead of raising; this is opt-in strict mode only."""
 
 

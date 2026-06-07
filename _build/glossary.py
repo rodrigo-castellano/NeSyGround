@@ -31,6 +31,11 @@ GLOSSARY: Mapping[str, str] = {
     "layout": "materialization of one grounding step: flat (compact/eager) | dense (padded/compiled)",
     "strategy": "ExecStrategy — single owner of compile/layout/chunk/cudagraph policy",
     "cell": "one (layout, compile-mode) point a grounder DECLARES it supports",
+    # ── cross-family core/ seam nouns (additive; nothing wired yet) ──
+    "ground": "the single runtime verb (Grounder.ground); request in, GroundResult out",
+    "grounder": "a family (BackwardGrounder | ForwardGrounder); ground + capability_row + producible_tiers + rebound",
+    "tier": "a BACKWARD output stratum (proof_state | firings | trees); the OutputSpec.tiers set",
+    "closure": "the ForwardGrounder result FAMILY (provable triples); never a resolution value",
 }
 
 # The FIXED data-structure field names. One name per concept; no synonyms.
@@ -101,6 +106,13 @@ FIELDS: Mapping[str, str] = {
     "firings": "OutputSpec: produce the rule-firings tier",
     "trees": "OutputSpec: produce the proof-tree tier",
     "spec": "the OutputSpec on RunState",
+    # ── core/ GroundRequest + typed OutputSpec (additive; not wired) ──
+    "queries": "the [B,3] query atoms on GroundRequest (None => data-directed FC)",
+    "query_mask": "the [B] active-query mask on GroundRequest",
+    "output_spec": "the OutputSpec carried on GroundRequest",
+    "excluded_queries": "queries to exclude from groundings on GroundRequest",
+    "closure_depth": "FC-only closure depth override on GroundRequest (None for BC)",
+    "tiers": "the FrozenSet[Tier] on the typed OutputSpec (proof_state | firings | trees)",
     "chunk_query_offset": "running global-query offset across chunks",
     # ── misc tags / sizes used as fields ──
     "layout": "the Layout value tag (dense | flat | sparse)",

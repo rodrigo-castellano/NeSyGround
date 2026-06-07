@@ -16,14 +16,15 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from grounder._build.core.request import GroundRequest, OutputSpec, Tier
+from grounder._build.core.result import BackwardResult
 from grounder._build.data.kb import KB
 from grounder._build.engine.loop import run_backward
 from grounder._build.errors import ConfigError
 from grounder._build.execution.capability import (
     COMPILED_DYNAMIC, COMPILED_STEP, EAGER, CapabilityRow, Cell,
 )
-from grounder._build.state import OutputSpec
-from grounder._build.types import GrounderOutput, Layout, RuleGroundings
+from grounder._build.types import Layout, RuleGroundings
 
 # Knob normalization maps (str surface -> internal layout/compile spec).
 _LAYOUT_KNOB = {"auto": None, "dense": Layout.DENSE, "flat": Layout.FLAT}
@@ -71,6 +72,24 @@ class BackwardGrounder(nn.Module):
         standardization=None,
     ) -> None:
         super().__init__()
+        # Capture the raw ctor inputs (sans kb) for rebound() — re-snapshot over a
+        # rewritten KB with the IDENTICAL knobs (transform support).
+        self._ctor_kwargs = dict(
+            resolution=resolution, depth=depth, width=width, w=w, u=u,
+            w_last_depth=w_last_depth, filter=filter,
+            max_total_groundings=max_total_groundings,
+            max_groundings_per_query=max_groundings_per_query,
+            max_groundings_per_rule=max_groundings_per_rule, max_goals=max_goals,
+            max_states=max_states, K_MAX=K_MAX,
+            max_derived_per_state=max_derived_per_state,
+            collect_evidence=collect_evidence,
+            collect_rule_groundings=collect_rule_groundings,
+            cartesian_product=cartesian_product, all_anchors=all_anchors,
+            flat_intermediate=flat_intermediate, layout=layout, compile=compile,
+            chunk_size=chunk_size, pack_dedup=pack_dedup, prune_facts=prune_facts,
+            bump_s_to_k=bump_s_to_k, init_state_shape=init_state_shape,
+            fc_method=fc_method, fc_depth=fc_depth, hooks=hooks,
+            fact_hook=fact_hook, rule_hook=rule_hook, standardization=standardization)
         self.kb = kb
         self.num_rules = kb.num_rules
 
@@ -215,13 +234,48 @@ class BackwardGrounder(nn.Module):
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+    def _default_output_spec(self) -> OutputSpec:
+        """The grounder's standing tier set (from its collect flags) — the BC
+        request default when ``forward()`` is called without an explicit spec."""
+        tiers = {Tier.PROOF_STATE}
+        if self._collect_rule_groundings:
+            tiers.add(Tier.FIRINGS)
+        if self.collect_evidence:
+            tiers.add(Tier.TREES)
+        return OutputSpec(frozenset(tiers))
+
     @torch.no_grad()
-    def forward(self, queries: Tensor, query_mask: Tensor, **init_kwargs) -> GrounderOutput:
-        self.output_spec = OutputSpec(
-            firings=self._collect_rule_groundings, trees=self.collect_evidence)
-        return run_backward(self, queries, query_mask, **init_kwargs)
+    def ground(self, request: GroundRequest) -> BackwardResult:
+        """The unified runtime verb — proof search over ``request.queries`` with
+        the requested tiers (``request.output_spec``)."""
+        self.output_spec = request.output_spec
+        return run_backward(self, request.queries, request.query_mask,
+                            excluded_queries=request.excluded_queries)
+
+    @torch.no_grad()
+    def forward(self, queries: Tensor, query_mask: Tensor, **init_kwargs) -> BackwardResult:
+        """Compat shim — build a GroundRequest from the standing collect flags and
+        delegate to ``ground()`` (byte-identical to the legacy forward path)."""
+        excluded = init_kwargs.pop("excluded_queries", None)
+        req = GroundRequest(queries=queries, query_mask=query_mask,
+                            output_spec=self._default_output_spec(),
+                            excluded_queries=excluded)
+        if not init_kwargs:
+            return self.ground(req)
+        # Rare extra init kwargs (initial_goals/next_var) bypass GroundRequest.
+        self.output_spec = req.output_spec
+        return run_backward(self, queries, query_mask,
+                            excluded_queries=excluded, **init_kwargs)
 
     __call__ = nn.Module.__call__
+
+    def producible_tiers(self) -> "frozenset[Tier]":
+        """BC can fill all three backward tiers."""
+        return frozenset({Tier.PROOF_STATE, Tier.FIRINGS, Tier.TREES})
+
+    def rebound(self, kb: KB) -> "BackwardGrounder":
+        """Re-snapshot over a rewritten KB (transforms) with identical knobs."""
+        return BackwardGrounder(kb, **self._ctor_kwargs)
 
     def capability_row(self) -> CapabilityRow:
         """Declared (layout, compile) cells: dense-eager/-graph/-dynamic + flat-eager (pbc and sld/rtf)."""
@@ -239,7 +293,11 @@ class BackwardGrounder(nn.Module):
         prev = self._collect_rule_groundings
         self._collect_rule_groundings = True
         try:
-            out = run_backward(self, queries, query_mask, **init_kwargs)
+            excluded = init_kwargs.pop("excluded_queries", None)
+            spec = self._default_output_spec()  # forces FIRINGS (flag is True here)
+            self.output_spec = spec
+            out = run_backward(self, queries, query_mask,
+                               excluded_queries=excluded, **init_kwargs)
         finally:
             self._collect_rule_groundings = prev
         rg = out.rule_groundings

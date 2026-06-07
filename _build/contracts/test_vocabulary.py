@@ -15,11 +15,25 @@ from pathlib import Path
 
 from grounder._build import state as state_mod
 from grounder._build import types as types_mod
+from grounder._build.core import request as request_mod
 from grounder._build.glossary import FIELDS
 
 _GLOSSARY_SRC = Path(__file__).parent.parent / "glossary.py"
 
-_MODULES = (state_mod, types_mod)
+_MODULES = (state_mod, types_mod, request_mod)
+
+# Tokens that legitimately span GLOSSARY (concept) and FIELDS (field) — the same
+# concept named in both registries. The disjointness check (below) allows ONLY
+# these and flags any other overlap. `evidence` is a KNOWN pending collision
+# (the evidence concept/type/field collapse to `completed_tree_firings` lands in
+# the Phase-C rename); `layout` is a genuine same-concept span (the layout value).
+_GLOSSARY_FIELDS_CROSSLINKS = frozenset({"evidence", "layout"})
+
+
+# OutputSpec's one-window back-compat accessors over its ``tiers`` field. They are
+# @property (not dataclass fields) but remain part of the documented field surface
+# until the Phase-C bool drop, so they are NOT "dead" FIELDS entries.
+_OUTPUTSPEC_BACKCOMPAT = frozenset({"groundings", "firings", "trees"})
 
 
 def _collect_fields() -> dict[str, set[str]]:
@@ -53,8 +67,11 @@ def test_all_field_names_registered() -> None:
 
 
 def test_no_dead_vocab_entries() -> None:
-    """FIELDS shouldn't accumulate names nothing uses (keeps the vocab honest)."""
-    used = set(_collect_fields())
+    """FIELDS shouldn't accumulate names nothing uses (keeps the vocab honest).
+
+    The typed OutputSpec back-compat accessors (groundings/firings/trees) count as
+    live until the Phase-C bool drop, even though they are properties not fields."""
+    used = set(_collect_fields()) | _OUTPUTSPEC_BACKCOMPAT
     dead = sorted(set(FIELDS) - used)
     assert not dead, f"FIELDS entries used by no data structure (remove them): {dead}"
 
@@ -81,6 +98,24 @@ def test_no_duplicate_vocab_keys() -> None:
         keys = _literal_keys(name)
         dupes = sorted(k for k, c in collections.Counter(keys).items() if c > 1)
         assert not dupes, f"{name} has duplicate keys (a dict literal hides these!): {dupes}"
+
+
+def test_glossary_fields_token_disjoint() -> None:
+    """GLOSSARY (concepts) and FIELDS (field names) must be token-disjoint, EXCEPT
+    where a token legitimately spans both as the same concept — those must be
+    declared in ``_GLOSSARY_FIELDS_CROSSLINKS``. Catches the ``evidence``
+    concept/field collision and any future accidental overlap (e.g. a new field
+    name silently shadowing a concept term)."""
+    from grounder._build.glossary import GLOSSARY
+    overlap = set(GLOSSARY) & set(FIELDS)
+    undeclared = sorted(overlap - _GLOSSARY_FIELDS_CROSSLINKS)
+    assert not undeclared, (
+        "GLOSSARY concept and FIELDS field share a token without a declared "
+        f"cross-link: {undeclared}. Rename one, or add it to "
+        "_GLOSSARY_FIELDS_CROSSLINKS if it is the SAME concept in both.")
+    # keep the allow-list honest: every declared crosslink must actually overlap.
+    stale = sorted(_GLOSSARY_FIELDS_CROSSLINKS - overlap)
+    assert not stale, f"_GLOSSARY_FIELDS_CROSSLINKS lists non-overlapping tokens: {stale}"
 
 
 def test_shape_symbols_match_vocab() -> None:

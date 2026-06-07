@@ -26,6 +26,8 @@ from grounder._build.execution.capability import (
 )
 from grounder._build.execution.cudagraph import detach_from_pool
 from grounder._build.execution.depth import DepthSelector
+from grounder._build.config import FCConfig, PBCConfig, RTFConfig, SLDConfig
+from grounder._build.factory import create_grounder, make_bcwd, make_grounder
 from grounder._build.glossary import COMPILE_BACKENDS, INTEGRATIONS
 from grounder._build.grounder.backward import BackwardGrounder
 from grounder._build.plan import RunPlan
@@ -210,3 +212,65 @@ def test_depth_selector_duality() -> None:
     acc = torch.zeros(1, 1, 3, 2)
     out = eager.write_slot(acc, torch.ones(1, 1, 2))
     assert torch.equal(out[:, :, 1], torch.ones(1, 1, 2)) and torch.equal(out[:, :, 0], torch.zeros(1, 1, 2))
+
+
+# ── make_grounder: typed-config dispatch + construction-path equivalence ──
+
+def _bc_kb() -> KB:
+    facts = torch.tensor([[1, 1, 2], [1, 2, 3]])
+    H = torch.tensor([[2, 4, 5]])
+    B = torch.tensor([[[1, 4, 6], [1, 6, 5]]])
+    L = torch.tensor([2])
+    return KB(facts, H, B, L, constant_no=3, predicate_no=12,
+              padding_idx=9, device=torch.device("cpu"))
+
+
+def _bc_fingerprint(g: BackwardGrounder) -> tuple:
+    """The resolved knobs that define a backward grounder's behavior."""
+    return (g.resolution, g.filter_mode, g.depth, g.width, g._w_last_depth,
+            g._all_anchors, g._flat_intermediate, g._collect_rule_groundings,
+            g.S, g.C, g.max_goals)
+
+
+def test_make_grounder_dispatches_on_config_type() -> None:
+    kb = _bc_kb()
+    sld = make_grounder(kb, SLDConfig(depth=2, max_total_groundings=4096),
+                        max_derived_per_state=64)
+    rtf = make_grounder(kb, RTFConfig(depth=2, max_total_groundings=4096),
+                        max_derived_per_state=64)
+    assert isinstance(sld, BackwardGrounder) and sld.resolution == "sld"
+    assert rtf.resolution == "rtf"
+    assert make_grounder(kb, PBCConfig(depth=2, w=1, max_total_groundings=64)).resolution == "pbc"
+    from grounder._build.forward.grounder import ForwardGrounder
+    assert isinstance(make_grounder(kb, FCConfig(depth=3)), ForwardGrounder)
+
+
+def test_make_grounder_pbc_forces_invariants() -> None:
+    # PBC forces all_anchors + (u=0) fp_batch filter — today's defaults, via config.
+    g = make_grounder(_bc_kb(), PBCConfig(depth=2, w=1, max_total_groundings=64))
+    assert g._all_anchors is True
+    assert g.filter_mode == "fp_batch"
+    # u>0 -> none filter, derived by the ctor (config.filter() not forced).
+    g_u = make_grounder(_bc_kb(), PBCConfig(depth=2, w=1, u=1, max_total_groundings=64))
+    assert g_u.filter_mode == "none"
+
+
+def test_construction_paths_equivalent() -> None:
+    """type-string create_grounder, make_bcwd, and direct PBCConfig produce the
+    same resolved backward grounder (the BC/FC fork collapsed to one factory)."""
+    raw = dict(facts_idx=torch.tensor([[1, 1, 2], [1, 2, 3]]),
+               rule_heads=torch.tensor([[2, 4, 5]]),
+               rule_bodies=torch.tensor([[[1, 4, 6], [1, 6, 5]]]),
+               rule_lens=torch.tensor([2]), constant_no=3, predicate_no=12,
+               padding_idx=9, device=torch.device("cpu"))
+    via_str = create_grounder("bc12", **raw)
+    via_bcwd = make_bcwd(_bc_kb(), w=1, d=2, u=0)
+    via_cfg = make_grounder(_bc_kb(), PBCConfig(depth=2, w=1, u=0, flat_intermediate=True,
+                                                max_groundings_per_query=32,
+                                                max_total_groundings=64))
+    assert _bc_fingerprint(via_str) == _bc_fingerprint(via_bcwd) == _bc_fingerprint(via_cfg)
+
+
+def test_make_grounder_rejects_unknown_config() -> None:
+    with pytest.raises(TypeError):
+        make_grounder(_bc_kb(), object())

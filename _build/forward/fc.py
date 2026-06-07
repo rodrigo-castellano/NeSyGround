@@ -1185,27 +1185,19 @@ def run_forward_chaining(
         sorted_hashes: 1-D sorted tensor of provable atom hashes.
         n_provable: Number of provable atoms (0 if none).
     """
-    if method == "spmm":
-        # SpMM supports 1/2/3-body rules whose binding shape matches the
-        # ops table (COPY, TRANSPOSE, MATMUL, ELEM_AND, CASE_A, EXIST_AND,
-        # MATMUL3). Anything else — 4+ body rules or 1/2/3-body rules
-        # classified UNSUPPORTED (e.g. compositional rules wrapped with a
-        # disequality-guard body) — silently skips inside SpMM. Pre-check
-        # the whole set: if any rule is UNSUPPORTED, fall through to
-        # FCDynamic so it can handle the full mix.
-        from grounder._build.forward.spmm import run_forward_chaining_spmm
-        from grounder._build.forward.spmm.ops import SpMMOp, classify_rule
-        all_supported = all(
-            classify_rule(cr).op != SpMMOp.UNSUPPORTED for cr in compiled_rules
-        )
-        if all_supported:
-            return run_forward_chaining_spmm(
-                compiled_rules, facts_idx, num_entities, num_predicates,
-                depth=depth, device=device)
-        # Fall through to staged for any UNSUPPORTED rule.
-
-    fc = FCDynamic(compiled_rules, facts_idx, num_entities, num_predicates,
-                   device,
-                   join_algo=join_algo,
-                   join_chunk_size=join_chunk_size)
-    return fc.run(depth)
+    # Per-rule ROUTER over FORWARD_METHODS (AXIS 3). The spmm WHOLE-SET fast
+    # path is gated by SpmmMethod.supports(): SpMM handles 1/2/3-body rules
+    # whose binding shape matches the ops table (COPY, TRANSPOSE, MATMUL,
+    # ELEM_AND, CASE_A, EXIST_AND, MATMUL3). Anything else — 4+ body rules or
+    # 1/2/3-body rules classified UNSUPPORTED (e.g. compositional rules wrapped
+    # with a disequality-guard body) — falls through to StagedMethod (FCDynamic)
+    # so it can handle the full mix. Reproduces the historical fallback exactly.
+    from grounder._build.forward.methods import FORWARD_METHODS
+    spmm = FORWARD_METHODS["spmm"]
+    chosen = spmm if (method == "spmm" and spmm.supports(compiled_rules)) \
+        else FORWARD_METHODS["staged"]
+    closure = chosen.run(
+        compiled_rules, facts_idx, num_entities, num_predicates,
+        depth=depth, device=device, join_algo=join_algo,
+        join_chunk_size=join_chunk_size)
+    return closure.hashes, closure.n_provable

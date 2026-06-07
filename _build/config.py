@@ -7,7 +7,7 @@ carries exactly its own parameters, and the factory dispatches on config type.
   - ``PBCConfig``                 — Parametrized Backward Chaining, the IJCAI
                                     ``BC_{w,d,u}`` grounder (params: depth, w, u);
                                     always uses the fp_batch filter
-  - ``FCConfig``                  — forward chaining (params: depth, method)
+  - ``FCConfig``                  — forward chaining (params: depth, method, join_algo)
 
 Each backward config knows its own ``filter()`` (PBC→fp_batch, sld/rtf→none), so
 there is no separate filter-derivation site. ``all_anchors`` is a PBC invariant
@@ -33,7 +33,7 @@ class BackwardConfig:
 
     depth: int                              # D
     max_total_groundings: int               # C
-    collect_rule_groundings: bool = True
+    collect_rule_groundings: bool = False   # matches BackwardGrounder ctor default
     standardize: bool = False
 
     def __post_init__(self) -> None:
@@ -83,11 +83,16 @@ class FCConfig:
     """Forward chaining grounder (no soundness filter — computes a closure)."""
 
     depth: int
-    method: str = "spmm"            # spmm | triejoin
+    method: str = "spmm"            # spmm | staged (AXIS 3 ForwardMethod)
+    join_algo: str = "staged"       # staged | chunked (StagedMethod sub-axis)
 
     def __post_init__(self) -> None:
         if self.depth < 1:
             raise ConfigError(f"depth must be >= 1, got {self.depth}")
+        if self.method not in ("spmm", "staged"):
+            raise ConfigError(f"method must be 'spmm' or 'staged', got {self.method!r}")
+        if self.join_algo not in ("staged", "chunked"):
+            raise ConfigError(f"join_algo must be 'staged' or 'chunked', got {self.join_algo!r}")
 
 
 __all__ = [

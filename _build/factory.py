@@ -1,4 +1,13 @@
-"""Grounder factory — parse a type string and build a grounder.
+"""Grounder factory — ONE construction entry: ``make_grounder(kb, config, ...)``.
+
+``make_grounder`` dispatches on the config TYPE (the config encodes resolution +
+``filter()``), collapsing the old BC/FC string fork:
+  SLDConfig / RTFConfig / PBCConfig -> BackwardGrounder
+  FCConfig                          -> ForwardGrounder
+
+``create_grounder`` / ``parse_grounder_type`` / ``make_bcwd`` are thin shims that
+build a typed config and delegate. They preserve today's defaults exactly
+(u->filter, all_anchors forced in the ctor, flat_intermediate).
 
 Type grammar (dot-separated):  {resolution}[.{filter}][.pd][.full|.wW][.dD]
   sld.fp_batch.d2 · rtf.d4 · pbc.fp_batch.w1.d2 · pbc.full · closure
@@ -10,14 +19,17 @@ BC_{w,d}[u] shorthand: bc12, bc13, bc12u1 → pbc with the paper-aligned filter.
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+from grounder._build.config import FCConfig, PBCConfig, RTFConfig, SLDConfig
 from grounder._build.data.kb import KB
 from grounder._build.grounder.backward import BackwardGrounder
+
+GrounderConfigT = Union[SLDConfig, RTFConfig, PBCConfig, FCConfig]
 
 _PATTERN = re.compile(
     r"^(?P<resolution>sld|rtf|enum|pbc|closure)"
@@ -67,6 +79,65 @@ def parse_grounder_type(grounder_type: str) -> Dict[str, Any]:
             "step_prune_dead": bool(m.group("pd")), "flat_intermediate": flat_intermediate, "u": 0}
 
 
+# ── make_grounder: the single construction entry (dispatch on config TYPE) ──
+
+def _build_backward(kb: KB, config: GrounderConfigT, *, resolution: str,
+                    layout: str, compile: str, chunk_size: Optional[int],
+                    extra: Dict[str, Any]) -> BackwardGrounder:
+    """Translate a backward config + exec knobs into BackwardGrounder ctor kwargs.
+
+    ``filter`` is NOT forced from ``config.filter()`` here: an explicit filter
+    (type-string / make_bcwd) rides in ``extra``; otherwise the ctor derives the
+    u-based default (pbc u=0 -> fp_batch, u>0 -> none; sld/rtf -> none), which is
+    exactly today's behavior and what ``config.filter()`` encodes for u=0/PBC."""
+    kw: Dict[str, Any] = dict(
+        resolution=resolution, depth=config.depth,
+        max_total_groundings=config.max_total_groundings,
+        collect_rule_groundings=config.collect_rule_groundings,
+        layout=layout, compile=compile, chunk_size=chunk_size)
+    if isinstance(config, PBCConfig):
+        kw["width"] = config.w
+        kw["u"] = config.u
+        kw["flat_intermediate"] = config.flat_intermediate
+        if config.max_groundings_per_query is not None:
+            kw["max_groundings_per_query"] = config.max_groundings_per_query
+    kw.update(extra)
+    return BackwardGrounder(kb, **kw)
+
+
+def make_grounder(
+    kb: KB,
+    config: GrounderConfigT,
+    *,
+    layout: str = "auto",
+    compile: str = "off",
+    chunk_size: Optional[int] = None,
+    transforms: Sequence = (),
+    **extra: Any,
+) -> nn.Module:
+    """Build the family grounder over ``kb`` by dispatching on ``type(config)``.
+
+    ``transforms`` (Phase A: empty) will wrap the grounder in a ``Pipeline``; the
+    seam lands with the transform axis, so a non-empty list raises here for now.
+    """
+    if transforms:
+        from grounder._build.core.pipeline import Pipeline
+        base = make_grounder(kb, config, layout=layout, compile=compile,
+                             chunk_size=chunk_size, **extra)
+        return Pipeline(transforms, base)
+
+    if isinstance(config, FCConfig):
+        from grounder._build.forward.grounder import ForwardGrounder
+        return ForwardGrounder(kb, method=config.method, depth=config.depth,
+                               join_algo=config.join_algo, **extra)
+    if isinstance(config, (SLDConfig, RTFConfig, PBCConfig)):
+        resolution = ("pbc" if isinstance(config, PBCConfig)
+                      else "rtf" if isinstance(config, RTFConfig) else "sld")
+        return _build_backward(kb, config, resolution=resolution, layout=layout,
+                               compile=compile, chunk_size=chunk_size, extra=extra)
+    raise TypeError(f"Unknown grounder config type: {type(config).__name__}")
+
+
 def create_grounder(
     grounder_type: str,
     *,
@@ -86,42 +157,48 @@ def create_grounder(
     max_goals: Optional[int] = None,
     **kwargs,
 ) -> nn.Module:
-    """Build a KB + grounder from a type string (the one construction entry)."""
+    """Build a KB + grounder from a type string — a shim over ``make_grounder``."""
     cfg = parse_grounder_type(grounder_type)
     kb = KB(facts_idx, rule_heads, rule_bodies, rule_lens,
             constant_no=constant_no, predicate_no=predicate_no, padding_idx=padding_idx,
             device=device, max_facts_per_query=max_facts_per_query, fact_index_type=fact_index_type)
 
     if cfg["resolution"] == "closure":
-        from grounder._build.forward.grounder import ForwardGrounder
-        return ForwardGrounder(kb, method=fc_method, **kwargs)
+        return make_grounder(kb, FCConfig(depth=10, method=fc_method), **kwargs)
 
-    g_kwargs: Dict[str, Any] = dict(
-        resolution=cfg["resolution"], filter=cfg["filter"], depth=cfg["depth"],
-        max_total_groundings=max_total_groundings, max_goals=max_goals)
+    extra: Dict[str, Any] = dict(max_goals=max_goals)
     if cfg["resolution"] == "pbc":
-        if cfg["is_full"]:
-            g_kwargs["width"] = None
-            g_kwargs["depth"] = 1
-        else:
-            g_kwargs["width"] = cfg["width"]
-        g_kwargs["max_groundings_per_query"] = max_groundings
-        g_kwargs["flat_intermediate"] = cfg["flat_intermediate"]
-        g_kwargs["fc_method"] = fc_method
-    else:
-        g_kwargs["width"] = cfg["width"]
-    g_kwargs.update(kwargs)
-    return BackwardGrounder(kb, **g_kwargs)
+        depth = 1 if cfg["is_full"] else cfg["depth"]
+        width = None if cfg["is_full"] else cfg["width"]
+        config: GrounderConfigT = PBCConfig(
+            depth=depth, w=width, u=cfg["u"], flat_intermediate=cfg["flat_intermediate"],
+            max_groundings_per_query=max_groundings,
+            max_total_groundings=max_total_groundings)
+        extra["fc_method"] = fc_method
+        # filter() on PBCConfig is always fp_batch; honor an explicit type-string filter.
+        extra["filter"] = cfg["filter"]
+    elif cfg["resolution"] == "rtf":
+        config = RTFConfig(depth=cfg["depth"], max_total_groundings=max_total_groundings)
+        extra["width"] = cfg["width"]
+        extra["filter"] = cfg["filter"]
+    else:  # sld
+        config = SLDConfig(depth=cfg["depth"], max_total_groundings=max_total_groundings)
+        extra["width"] = cfg["width"]
+        extra["filter"] = cfg["filter"]
+    extra.update(kwargs)
+    return make_grounder(kb, config, **extra)
 
 
 def make_bcwd(kb: KB, w: int, d: int, u: int = 0, *,
               flat_intermediate: bool = True, filter: Optional[str] = None,
               **kwargs) -> BackwardGrounder:
-    """The paper's BC_{w,d,u} grounder directly (resolution='pbc')."""
-    if filter is None:
-        filter = _default_pbc_filter(u)
-    return BackwardGrounder(kb, resolution="pbc", depth=d, width=w, u=u,
-                            filter=filter, flat_intermediate=flat_intermediate, **kwargs)
+    """The paper's BC_{w,d,u} grounder directly — a shim over ``make_grounder``."""
+    config = PBCConfig(depth=d, w=w, u=u, flat_intermediate=flat_intermediate,
+                       max_total_groundings=kwargs.pop("max_total_groundings", 64))
+    extra: Dict[str, Any] = dict(kwargs)
+    if filter is not None:                # else PBCConfig.filter()==fp_batch derives it
+        extra["filter"] = filter
+    return make_grounder(kb, config, **extra)
 
 
-__all__ = ["parse_grounder_type", "create_grounder", "make_bcwd"]
+__all__ = ["parse_grounder_type", "make_grounder", "create_grounder", "make_bcwd"]

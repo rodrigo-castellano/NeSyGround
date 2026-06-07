@@ -14,11 +14,13 @@ import torch
 from torch import Tensor
 
 from grounder._build.data.encoding import Encoding
+from grounder._build.execution.capability import Cell, EAGER
 from grounder._build.resolution.mgu import empty_rule_results, resolve_facts, resolve_rules
 from grounder._build.types import FlatResolvedChildren, Layout, ResolvedChildren
 
 if TYPE_CHECKING:
     from grounder._build.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
+    from grounder._build.resolution.api import ResolveRequest
 
 
 def resolve_rtf(
@@ -190,4 +192,36 @@ def resolve_rtf_flat(
         b_r, s_r, flat_subs, flat_is_fact, flat_top_ridx, B, S, False)
 
 
-__all__ = ["resolve_rtf", "resolve_rtf_flat"]
+class RtfResolver:
+    """RESOLVERS["rtf"] — wraps resolve_rtf / resolve_rtf_flat (byte-identical dispatch)."""
+    name = "rtf"
+
+    def declared_cells(self) -> frozenset:
+        return frozenset({Cell(Layout.DENSE, EAGER), Cell(Layout.FLAT, EAGER)})
+
+    def resolve(self, req: "ResolveRequest"):
+        plan, fr, kb = req.plan, req.frontier, req.plan.kb
+        flat = plan.strategy.layout() is Layout.FLAT
+        if flat:
+            return resolve_rtf_flat(
+                req.queries, req.remaining, req.state_valid, req.active_mask,
+                next_var_indices=fr.next_var,
+                fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
+                rule_index=kb.rule_index, enc=kb.encoding,
+                K_f=kb.K_f, K_r=kb.K_r,
+                max_vars_per_rule=plan.max_vars_per_rule, num_rules=kb.num_rules,
+                max_fact_pairs_body=plan.max_fact_pairs_body,
+                top_rule_idx=fr.top_rule_idx,
+                fact_hook=req.fact_hook, rule_hook=req.rule_hook)
+        return resolve_rtf(
+            req.queries, req.remaining, req.state_valid, req.active_mask,
+            next_var_indices=fr.next_var,
+            fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
+            rule_index=kb.rule_index, enc=kb.encoding,
+            K_f=kb.K_f, K_r=kb.K_r,
+            max_vars_per_rule=plan.max_vars_per_rule, num_rules=kb.num_rules,
+            max_fact_pairs_body=plan.max_fact_pairs_body,
+            fact_hook=req.fact_hook, rule_hook=req.rule_hook)
+
+
+__all__ = ["resolve_rtf", "resolve_rtf_flat", "RtfResolver"]

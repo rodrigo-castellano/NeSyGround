@@ -23,19 +23,11 @@ from typing import Optional, Tuple
 
 from torch import Tensor
 
-
 # ── What to produce (drives which accumulators are active) ──
-@dataclass(frozen=True)
-class OutputSpec:
-    """Per-call request. ``groundings`` is the always-on base; ``firings`` and
-    ``trees`` add accumulators (and require provenance on the Frontier)."""
-
-    groundings: bool = True
-    firings: bool = False
-    trees: bool = False
-
-    def needs_provenance(self) -> bool:
-        return self.firings or self.trees
+# Step 2: the engine now carries the TYPED tier set (core.OutputSpec.tiers); the
+# bool surface (groundings/firings/trees + needs_provenance) is kept as @property
+# so plan/loop/finalize/buffers read exactly as before (byte-identical).
+from grounder._build.core.request import OutputSpec
 
 
 # ── Working frontier (chunk-scoped, threaded step→step; PURE — no accumulators) ──

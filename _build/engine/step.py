@@ -1,10 +1,10 @@
 """Per-depth proof step — SELECT → RESOLVE → PACK → POSTPROCESS(+sync).
 
 Ported from OLD ``bc/step.py`` (eager path only — the fingerprint runs CPU/eager).
-Dispatches the resolver on ``plan.resolution`` (sld/rtf/pbc) using the NEW
-resolution signatures. The considered ``capture_step`` runs AFTER resolve and
-BEFORE pack. Working state is a frozen ``Frontier`` (+ private ``_Collected``);
-each phase returns a functional update.
+RESOLVE dispatches via the ``RESOLVERS`` registry keyed on ``plan.resolution``
+(sld/rtf/pbc) — a pure lookup returning the same tuples the old if/elif did. The
+considered ``capture_step`` runs AFTER resolve and BEFORE pack. Working state is a
+frozen ``Frontier`` (+ private ``_Collected``); each phase returns a functional update.
 """
 from __future__ import annotations
 
@@ -19,14 +19,10 @@ from grounder._build.engine.pack import compact_atoms, pack_states, pack_states_
 from grounder._build.engine.postprocess import collect_groundings
 from grounder._build.engine.sync import sync_accumulated
 from grounder._build.filters.prune_facts import prune_ground_facts
-from grounder._build.resolution.pbc import resolve_step
-from grounder._build.resolution.pbc.resolve import (
-    DenseMaterializer, FlatMaterializer, StepInputs,
-)
-from grounder._build.resolution.rtf import resolve_rtf, resolve_rtf_flat
-from grounder._build.resolution.sld import resolve_sld, resolve_sld_flat
+from grounder._build.grounder.registry import RESOLVERS
+from grounder._build.resolution.api import ResolveRequest
 from grounder._build.state import Frontier
-from grounder._build.types import FlatResolvedChildren, Layout
+from grounder._build.types import FlatResolvedChildren
 
 
 def capture_selected_goal(plan, fr: Frontier) -> Frontier:
@@ -67,60 +63,16 @@ def select(plan, fr: Frontier) -> Tuple[Tensor, Tensor, Tensor]:
 
 def resolve(plan, queries, remaining, fr: Frontier, active_mask, dsel,
             excluded_queries):
-    """Dispatch to resolution strategy → ResolvedChildren / FlatResolvedChildren."""
-    kb = plan.kb
-    flat = plan.strategy.layout() is Layout.FLAT
-    if plan.resolution == "sld":
-        if flat:
-            return resolve_sld_flat(
-                queries, remaining, fr.state_valid, active_mask,
-                next_var_indices=fr.next_var,
-                fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
-                rule_index=kb.rule_index, enc=kb.encoding,
-                K_f=kb.K_f, K_r=kb.K_r, max_vars_per_rule=plan.max_vars_per_rule,
-                num_rules=kb.num_rules, top_rule_idx=fr.top_rule_idx,
-                body_count=fr.body_count, excluded_queries=excluded_queries,
-                fact_hook=plan.fact_hook, rule_hook=plan.rule_hook,
-                collect_evidence=plan.collect_evidence)
-        return resolve_sld(
-            queries, remaining, fr.state_valid, active_mask,
-            next_var_indices=fr.next_var,
-            fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
-            rule_index=kb.rule_index, enc=kb.encoding,
-            K_f=kb.K_f, K_r=kb.K_r, max_vars_per_rule=plan.max_vars_per_rule,
-            num_rules=kb.num_rules, excluded_queries=excluded_queries,
-            fact_hook=plan.fact_hook, rule_hook=plan.rule_hook)
-    elif plan.resolution == "rtf":
-        if flat:
-            return resolve_rtf_flat(
-                queries, remaining, fr.state_valid, active_mask,
-                next_var_indices=fr.next_var,
-                fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
-                rule_index=kb.rule_index, enc=kb.encoding,
-                K_f=kb.K_f, K_r=kb.K_r,
-                max_vars_per_rule=plan.max_vars_per_rule, num_rules=kb.num_rules,
-                max_fact_pairs_body=plan.max_fact_pairs_body,
-                top_rule_idx=fr.top_rule_idx,
-                fact_hook=plan.fact_hook, rule_hook=plan.rule_hook)
-        return resolve_rtf(
-            queries, remaining, fr.state_valid, active_mask,
-            next_var_indices=fr.next_var,
-            fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
-            rule_index=kb.rule_index, enc=kb.encoding,
-            K_f=kb.K_f, K_r=kb.K_r,
-            max_vars_per_rule=plan.max_vars_per_rule, num_rules=kb.num_rules,
-            max_fact_pairs_body=plan.max_fact_pairs_body,
-            fact_hook=plan.fact_hook, rule_hook=plan.rule_hook)
-    else:  # pbc
-        pbc = plan.pbc
-        mat = (FlatMaterializer() if (plan.flat_intermediate and pbc.V >= 1)
-               else DenseMaterializer())
-        inp = StepInputs(
-            queries, remaining, fr.grounding_body, fr.state_valid, active_mask,
-            padding_idx=kb.padding_idx, d=dsel.d, depth=plan.depth, is_last=None,
-            width=plan.width, w_last_depth=plan.w_last_depth,
-            collect_evidence=plan.collect_evidence, dedup_goals=False)
-        return resolve_step(inp, pbc, kb.fact_index, mat)
+    """Dispatch via the Resolver registry → ResolvedChildren / FlatResolvedChildren.
+
+    Pure lookup: RESOLVERS[plan.resolution].resolve(req) returns the IDENTICAL
+    tuples the old if/elif did. Hooks ride the request (inert for pbc)."""
+    req = ResolveRequest(
+        plan=plan, queries=queries, remaining=remaining,
+        state_valid=fr.state_valid, active_mask=active_mask, frontier=fr,
+        depth_selector=dsel, excluded_queries=excluded_queries,
+        fact_hook=plan.fact_hook, rule_hook=plan.rule_hook)
+    return RESOLVERS[plan.resolution].resolve(req)
 
 
 def pack(plan, resolved, fr: Frontier) -> Tuple[Frontier, dict]:
