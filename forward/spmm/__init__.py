@@ -8,12 +8,12 @@ collapses to a sparse matmul ``M_p @ M_q``.
 
 Module layout (each file owns one responsibility):
 
-  ops.py         — ``SpMMOp``, ``SpMMRuleDesc``, ``classify_rule``
+  classify.py    — ``SpMMOp``, ``SpMMRuleDesc``, ``classify_rule``
   matrices.py    — sparse helpers (build, transpose, merge, hash IO)
-  kernels.py     — ``apply_spmm_rule_slots`` per-rule fire kernel
+  apply.py       — ``apply_spmm_rule_slots`` per-rule fire kernel
   state.py       — ``ClosureState``, ``TransposeCache`` (lazy)
   strategies.py  — ``IterationStrategy``: Seminaive / TrueIStar / Hybrid
-  runner.py      — ``run_forward_chaining_spmm`` orchestration
+  engine.py      — ``run_forward_chaining_spmm`` semi-naive fixpoint loop
 
 Public API (re-exported here):
 
@@ -27,10 +27,10 @@ All functions accept a ``device`` argument and run unchanged on
 ``cuda`` — sparse CSR matmul, transpose, and the hash-set ops all
 honour the input tensor's device.
 """
-from grounder.forward.spmm.kernels import apply_spmm_rule, apply_spmm_rule_slots
+from grounder.forward.spmm.apply import apply_spmm_rule, apply_spmm_rule_slots
 from grounder.forward.spmm.matrices import build_pred_sparse_matrices
-from grounder.forward.spmm.ops import SpMMOp, SpMMRuleDesc, classify_rule
-from grounder.forward.spmm.runner import run_forward_chaining_spmm
+from grounder.forward.spmm.classify import SpMMOp, SpMMRuleDesc, classify_rule
+from grounder.forward.spmm.engine import run_forward_chaining_spmm
 from grounder.forward.spmm.state import ClosureState, TransposeCache
 from grounder.forward.spmm.strategies import (
     HybridStrategy, IterationStrategy, SeminaiveStrategy, TrueIStarStrategy,

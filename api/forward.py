@@ -21,7 +21,7 @@ from grounder.data.kb import KB
 from grounder.data.rule_index import compile_rules
 from grounder.execution.capability import EAGER, CapabilityRow, Cell
 from grounder.forward.api import Closure
-from grounder.forward.fc import run_forward_chaining
+from grounder.forward.router import run_forward_chaining
 from grounder.base.types import Layout
 
 

@@ -16,12 +16,12 @@ from typing import Dict, List, Set, Tuple
 import torch
 from torch import Tensor
 
-from grounder.forward.spmm.kernels import apply_spmm_rule_slots
+from grounder.forward.spmm.apply import apply_spmm_rule_slots
 from grounder.forward.spmm.matrices import (
     build_pred_sparse_matrices, csr_to_global_hashes, sorted_merge,
     transpose_csr, unique_sorted,
 )
-from grounder.forward.spmm.ops import SpMMOp, classify_rule
+from grounder.forward.spmm.classify import SpMMOp, classify_rule
 from grounder.forward.spmm.state import ClosureState
 from grounder.forward.spmm.strategies import (
     HybridStrategy, IterationStrategy, SeminaiveStrategy, TrueIStarStrategy,
@@ -100,7 +100,7 @@ def run_forward_chaining_spmm(
 
     Returns:
         ``(sorted_hashes, n_provable)`` — same format as
-        :func:`grounder.forward.fc.run_forward_chaining`. Hashes are the
+        :func:`grounder.forward.router.run_forward_chaining`. Hashes are the
         global ``pred * E² + row * E + col`` encoding sorted ascending.
 
     Notes:

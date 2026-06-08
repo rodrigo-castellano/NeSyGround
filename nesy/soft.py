@@ -18,7 +18,7 @@ from torch import Tensor
 
 from grounder.data.rule_index import compile_rules
 from grounder.filters import check_in_fp_global
-from grounder.forward.fc import run_forward_chaining
+from grounder.forward.router import run_forward_chaining
 
 
 class ProvabilityMLP(nn.Module):

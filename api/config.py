@@ -107,15 +107,17 @@ class Forward:
 
     depth: int
     method: str = "spmm"            # spmm | staged (ForwardMethod axis)
-    join_algo: str = "staged"       # staged | chunked (StagedMethod sub-axis)
+    join_algo: str = "staged"       # staged | chunked | leapfrog (StagedMethod sub-axis)
 
     def __post_init__(self) -> None:
         if self.depth < 1:
             raise ConfigError(f"depth must be >= 1, got {self.depth}")
         if self.method not in ("spmm", "staged"):
             raise ConfigError(f"method must be 'spmm' or 'staged', got {self.method!r}")
-        if self.join_algo not in ("staged", "chunked"):
-            raise ConfigError(f"join_algo must be 'staged' or 'chunked', got {self.join_algo!r}")
+        if self.join_algo not in ("staged", "chunked", "leapfrog"):
+            raise ConfigError(
+                f"join_algo must be 'staged', 'chunked', or 'leapfrog', "
+                f"got {self.join_algo!r}")
 
 
 __all__ = ["SLD", "RTF", "PBC", "Resolution", "Backward", "Forward"]

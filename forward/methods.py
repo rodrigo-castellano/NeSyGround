@@ -2,15 +2,16 @@
 
 A ``ForwardMethod`` is the forward-chaining closure engine: ``SpmmMethod``
 (semi-naive sparse-matmul) and ``StagedMethod`` (the staged ragged join,
-FCDynamic). ``run_forward_chaining`` (fc.py) is the per-rule ROUTER over these:
-the spmm WHOLE-SET fast path is gated by ``SpmmMethod.supports(rules)`` (all
-``classify_rule != UNSUPPORTED``); on any UNSUPPORTED rule it falls through to
-``StagedMethod``.
+FCDynamic). ``run_forward_chaining`` (router.py) is the per-rule ROUTER over
+these: the spmm WHOLE-SET fast path is gated by ``SpmmMethod.supports(rules)``
+(all ``classify_rule != UNSUPPORTED``); on any UNSUPPORTED rule it falls through
+to ``StagedMethod``.
 
-The JoinAlgo sub-axis ``{staged, chunked}`` lives INSIDE ``StagedMethod`` (the
-FCDynamic ``join_algo`` knob); ``leapfrog`` is a documented placeholder, NOT a
-registered extension point. The spmm IterationStrategy stays a SUB-strategy
-inside SpmmMethod (the ``mode`` knob on ``run_forward_chaining_spmm``).
+The JoinAlgo sub-axis ``{staged, chunked, leapfrog}`` lives INSIDE
+``StagedMethod`` (the FCDynamic ``join_algo`` knob); ``leapfrog`` is the
+worst-case-optimal join in ``staged/leapfrog.py``. The spmm IterationStrategy
+stays a SUB-strategy inside SpmmMethod (the ``mode`` knob on
+``run_forward_chaining_spmm``).
 """
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ class SpmmMethod:
     name = "spmm"
 
     def supports(self, rules: List[RulePattern]) -> bool:
-        from grounder.forward.spmm.ops import SpMMOp, classify_rule
+        from grounder.forward.spmm.classify import SpMMOp, classify_rule
         return all(classify_rule(cr).op != SpMMOp.UNSUPPORTED for cr in rules)
 
     def run(self, rules: List[RulePattern], facts_idx: Tensor,
@@ -65,7 +66,7 @@ class StagedMethod:
     def run(self, rules: List[RulePattern], facts_idx: Tensor,
             num_entities: int, num_predicates: int, *, depth: int, device: str,
             join_algo: str, join_chunk_size: int) -> Closure:
-        from grounder.forward.fc import FCDynamic
+        from grounder.forward.staged.engine import FCDynamic
         fc = FCDynamic(rules, facts_idx, num_entities, num_predicates, device,
                        join_algo=join_algo, join_chunk_size=join_chunk_size)
         hashes, n = fc.run(depth)

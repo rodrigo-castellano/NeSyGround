@@ -19,7 +19,7 @@ from typing import Dict, List, Optional
 import torch
 from torch import Tensor
 
-from grounder.forward.spmm.ops import SpMMOp, SpMMRuleDesc, slots_for_op
+from grounder.forward.spmm.classify import SpMMOp, SpMMRuleDesc, slots_for_op
 from grounder.forward.spmm.matrices import (
     sparse_nnz, sparse_to_bool_csr, transpose_csr, get_diagonal_mask,
     safe_sparse_mm,

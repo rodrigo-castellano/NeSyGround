@@ -30,7 +30,7 @@ from grounder.transform.api import IdentityTransform, ProgramTransform
 from grounder.transform.magic_set import MagicSetTransform
 
 _STEP_PY = Path(__file__).parent.parent / "backward" / "step.py"
-_FC_PY = Path(__file__).parent.parent / "forward" / "fc.py"
+_FC_PY = Path(__file__).parent.parent / "forward" / "router.py"
 
 
 def test_resolvers_keyed_exactly() -> None:

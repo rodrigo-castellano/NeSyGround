@@ -41,6 +41,10 @@ _MATRIX = [
     ("countries_s2", "staged", {"depth": 10}),
     ("countries_s2", "spmm", {"depth": 3}),
     ("countries_s2", "staged", {"depth": 3}),
+    # leapfrog (worst-case-optimal join) must match the staged closure exactly.
+    ("family", "staged", {"depth": 10, "join_algo": "leapfrog"}),
+    ("countries_s2", "staged", {"depth": 10, "join_algo": "leapfrog"}),
+    ("countries_s2", "staged", {"depth": 3, "join_algo": "leapfrog"}),
 ]
 
 
@@ -54,7 +58,9 @@ def _canonical_fingerprint(hashes, n_provable) -> dict:
 
 
 def _cell_key(dataset, method, cfg) -> str:
-    return f"{dataset}|{method}|d{cfg['depth']}"
+    ja = cfg.get("join_algo")
+    suffix = f"|{ja}" if ja and ja != "staged" else ""
+    return f"{dataset}|{method}|d{cfg['depth']}{suffix}"
 
 
 def _old_closure_facts(hashes: torch.Tensor, n_provable: int, E: int) -> torch.Tensor:
@@ -73,7 +79,8 @@ def compute_fingerprint(dataset, method, cfg, *, data_root) -> dict:
     ds = KGDataset(str(ds_path), device="cpu", rules_file=rules_file)
     kb = ds.build_kb(max_facts_per_query=4096, fact_index_type="block_sparse")
 
-    g = ForwardGrounder(kb, method=method, depth=cfg["depth"])
+    g = ForwardGrounder(kb, method=method, depth=cfg["depth"],
+                        join_algo=cfg.get("join_algo", "staged"))
     with torch.no_grad():
         closure = g.ground()                     # the single verb -> Closure
         hashes, n_provable = closure.hashes, int(closure.n_provable)
