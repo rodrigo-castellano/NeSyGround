@@ -91,76 +91,42 @@ def pack_states(
     n_f = S_in * K_f
     n_r = S_in * K_r
     G = rule_goals.shape[3]
-
     D_bc = body_count.shape[2]                          # body_count always 3-D
-    if K_f > 0:
-        f_goals = fact_goals.reshape(B, n_f, G, 3)
-        f_valid = fact_success.reshape(B, n_f)
-        f_rule_idx = top_rule_idx.unsqueeze(2).expand(B, S_in, K_f).reshape(B, n_f)
-        f_body_count = body_count.unsqueeze(2).expand(
-            B, S_in, K_f, D_bc).reshape(B, n_f, D_bc)
-        f_subs = fact_subs.reshape(B, n_f, 2, 2)
-        f_parents = torch.arange(S_in, device=dev).unsqueeze(1).expand(
-            S_in, K_f).reshape(n_f)
-        f_parents = f_parents.unsqueeze(0).expand(B, n_f)
-        if collect_evidence:
-            uninit = (body_count.sum(dim=-1) == 0)
-            is_initial = (top_rule_idx == -1)
-            skip_fact = uninit & ~is_initial
-            f_valid = f_valid & ~skip_fact.unsqueeze(-1).expand(
-                B, S_in, K_f).reshape(B, n_f)
-        f_grounding_body = torch.full((B, n_f, M_work, 3), pad, dtype=torch.long, device=dev)
-        f_has_new = torch.zeros(B, n_f, dtype=torch.bool, device=dev)
-    else:
-        f_grounding_body = torch.full((B, 0, M_work, 3), pad, dtype=torch.long, device=dev)
-        f_goals = torch.full((B, 0, G, 3), pad, dtype=torch.long, device=dev)
-        f_valid = torch.zeros(B, 0, dtype=torch.bool, device=dev)
-        f_rule_idx = torch.zeros(B, 0, dtype=torch.long, device=dev)
-        f_body_count = torch.zeros(B, 0, D_bc, dtype=torch.long, device=dev)
-        f_subs = torch.full((B, 0, 2, 2), pad, dtype=torch.long, device=dev)
-        f_parents = torch.zeros(B, 0, dtype=torch.long, device=dev)
-        f_has_new = torch.zeros(B, 0, dtype=torch.bool, device=dev)
 
+    # ── RULE children (always present); first-step rules adopt sub_rule_idx as top ──
     first = (top_rule_idx == -1).unsqueeze(2).expand(B, S_in, K_r).reshape(B, n_r)
-
     if collect_evidence:
         r_grounding_body = rule_goals[:, :, :, :M_rule, :].reshape(B, n_r, M_rule, 3)
         r_has_new = rule_success.reshape(B, n_r)
     else:
         r_grounding_body = torch.full((B, n_r, M_work, 3), pad, dtype=torch.long, device=dev)
         r_has_new = torch.zeros(B, n_r, dtype=torch.bool, device=dev)
-
-    r_body_count = body_count.unsqueeze(2).expand(
-        B, S_in, K_r, D_bc).reshape(B, n_r, D_bc)
-
+    r_body_count = body_count.unsqueeze(2).expand(B, S_in, K_r, D_bc).reshape(B, n_r, D_bc)
     r_rule_idx = torch.where(
-        first,
-        sub_rule_idx.reshape(B, n_r),
-        top_rule_idx.unsqueeze(2).expand(B, S_in, K_r).reshape(B, n_r),
-    )
+        first, sub_rule_idx.reshape(B, n_r),
+        top_rule_idx.unsqueeze(2).expand(B, S_in, K_r).reshape(B, n_r))
     r_goals = rule_goals.reshape(B, n_r, G, 3)
     r_valid = rule_success.reshape(B, n_r)
     r_subs = rule_subs.reshape(B, n_r, 2, 2)
-    r_parents = torch.arange(S_in, device=dev).unsqueeze(1).expand(
-        S_in, K_r).reshape(n_r)
-    r_parents = r_parents.unsqueeze(0).expand(B, n_r)
-
-    f_current_rule_idx = torch.full(
-        (B, n_f), -1, dtype=torch.long, device=dev) if K_f > 0 else (
-        torch.zeros(B, 0, dtype=torch.long, device=dev))
+    r_parents = (torch.arange(S_in, device=dev).unsqueeze(1)
+                 .expand(S_in, K_r).reshape(n_r).unsqueeze(0).expand(B, n_r))
     r_current_rule_idx = sub_rule_idx.reshape(B, n_r)
 
-    if K_f == 0:
-        all_grounding_body = r_grounding_body
-        all_goals = r_goals
-        all_valid = r_valid
-        all_rule_idx = r_rule_idx
-        all_body_count = r_body_count
-        all_subs = r_subs
-        all_parents = r_parents
-        all_has_new = r_has_new
-        all_current_rule_idx = r_current_rule_idx
-    else:
+    # ── FACT children prepended (facts FIRST, matching the flat path); else rules-only ──
+    if K_f > 0:
+        f_goals = fact_goals.reshape(B, n_f, G, 3)
+        f_valid = fact_success.reshape(B, n_f)
+        f_rule_idx = top_rule_idx.unsqueeze(2).expand(B, S_in, K_f).reshape(B, n_f)
+        f_body_count = body_count.unsqueeze(2).expand(B, S_in, K_f, D_bc).reshape(B, n_f, D_bc)
+        f_subs = fact_subs.reshape(B, n_f, 2, 2)
+        f_parents = (torch.arange(S_in, device=dev).unsqueeze(1)
+                     .expand(S_in, K_f).reshape(n_f).unsqueeze(0).expand(B, n_f))
+        if collect_evidence:                            # skip facts on a started-but-non-initial state
+            skip_fact = (body_count.sum(dim=-1) == 0) & ~(top_rule_idx == -1)
+            f_valid = f_valid & ~skip_fact.unsqueeze(-1).expand(B, S_in, K_f).reshape(B, n_f)
+        f_grounding_body = torch.full((B, n_f, M_work, 3), pad, dtype=torch.long, device=dev)
+        f_has_new = torch.zeros(B, n_f, dtype=torch.bool, device=dev)
+        f_current_rule_idx = torch.full((B, n_f), -1, dtype=torch.long, device=dev)
         all_grounding_body = torch.cat([f_grounding_body, r_grounding_body], dim=1)
         all_goals = torch.cat([f_goals, r_goals], dim=1)
         all_valid = torch.cat([f_valid, r_valid], dim=1)
@@ -170,6 +136,11 @@ def pack_states(
         all_parents = torch.cat([f_parents, r_parents], dim=1)
         all_has_new = torch.cat([f_has_new, r_has_new], dim=1)
         all_current_rule_idx = torch.cat([f_current_rule_idx, r_current_rule_idx], dim=1)
+    else:
+        all_grounding_body, all_goals, all_valid = r_grounding_body, r_goals, r_valid
+        all_rule_idx, all_body_count, all_subs = r_rule_idx, r_body_count, r_subs
+        all_parents, all_has_new = r_parents, r_has_new
+        all_current_rule_idx = r_current_rule_idx
 
     cumsum = all_valid.long().cumsum(dim=1)
     target = torch.where(

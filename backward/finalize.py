@@ -8,6 +8,7 @@ Produces the output types:
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Callable, Optional, Sequence
 
 import torch
@@ -18,15 +19,8 @@ from grounder.base.types import CompletedTreeFirings, GoalState, RuleGroundings
 
 
 def _make_shapes(plan, B: int, Y_q: int) -> Shapes:
-    """Minimal valid Shapes for the completed-tree-firings view (consumers preserve D/M).
-    Shapes.G=plan.S (states/goals per step), Shapes.L=plan.max_goals (atoms per goal)."""
-    kb, sh = plan.kb, plan.shapes
-    return Shapes(
-        B=B, G=plan.S, L=plan.max_goals, M=kb.M, D=plan.depth,
-        A=plan.depth * kb.M, Y_q=Y_q,
-        K_f=kb.K_f, K_r=sh.K_r, Y_r=sh.Y_r, K_v=sh.K_v, V=sh.V,
-        E=kb.constant_no + 1, N=B * plan.S, pad=kb.padding_idx,
-    )
+    """plan.shapes rebatched to B for the completed-tree-firings view (E = entities+1)."""
+    return replace(plan.shapes, B=B, N=B * plan.S, Y_q=Y_q, E=plan.kb.constant_no + 1)
 
 
 def finalize_evidence(plan, trees) -> Optional[CompletedTreeFirings]:

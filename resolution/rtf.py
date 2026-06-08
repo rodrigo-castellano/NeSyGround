@@ -19,7 +19,7 @@ from grounder.resolution.mgu import empty_rule_results, resolve_facts, resolve_r
 from grounder.base.types import FlatResolvedChildren, Layout, ResolvedChildren
 
 if TYPE_CHECKING:
-    from grounder.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
+    from grounder.nesy.hooks import ResolutionRuleHook
     from grounder.resolution.api import ResolveRequest
 
 
@@ -92,12 +92,10 @@ def resolve_rtf(
     facts_idx: Tensor,
     rule_index,
     enc: Encoding,
-    K_f: int,
     K_r: int,
     max_vars_per_rule: int,
     num_rules: int,
     max_fact_pairs_body: int,
-    fact_hook: Optional["ResolutionFactHook"] = None,
     rule_hook: Optional["ResolutionRuleHook"] = None,
 ) -> ResolvedChildren:
     """RTF: rules first, then facts on each rule child's first body atom."""
@@ -141,13 +139,11 @@ def resolve_rtf_flat(
     facts_idx: Tensor,
     rule_index,
     enc: Encoding,
-    K_f: int,
     K_r: int,
     max_vars_per_rule: int,
     num_rules: int,
     max_fact_pairs_body: int,
     top_rule_idx: Tensor,      # [B, G]
-    fact_hook: Optional["ResolutionFactHook"] = None,
     rule_hook: Optional["ResolutionRuleHook"] = None,
 ) -> FlatResolvedChildren:
     """RTF flat: same L1->L2 cascade as resolve_rtf, flattened (rule children only)."""
@@ -202,21 +198,17 @@ class RtfResolver:
                 req.queries, req.remaining, req.goal_valid, req.active_mask,
                 next_var=fr.next_var,
                 fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
-                rule_index=kb.rule_index, enc=kb.encoding,
-                K_f=kb.K_f, K_r=kb.K_r,
+                rule_index=kb.rule_index, enc=kb.encoding, K_r=kb.K_r,
                 max_vars_per_rule=plan.max_vars_per_rule, num_rules=kb.num_rules,
                 max_fact_pairs_body=plan.max_fact_pairs_body,
-                top_rule_idx=fr.top_rule_idx,
-                fact_hook=req.fact_hook, rule_hook=req.rule_hook)
+                top_rule_idx=fr.top_rule_idx, rule_hook=req.rule_hook)
         return resolve_rtf(
             req.queries, req.remaining, req.goal_valid, req.active_mask,
             next_var=fr.next_var,
             fact_index=kb.fact_index, facts_idx=kb.fact_index.facts_idx,
-            rule_index=kb.rule_index, enc=kb.encoding,
-            K_f=kb.K_f, K_r=kb.K_r,
+            rule_index=kb.rule_index, enc=kb.encoding, K_r=kb.K_r,
             max_vars_per_rule=plan.max_vars_per_rule, num_rules=kb.num_rules,
-            max_fact_pairs_body=plan.max_fact_pairs_body,
-            fact_hook=req.fact_hook, rule_hook=req.rule_hook)
+            max_fact_pairs_body=plan.max_fact_pairs_body, rule_hook=req.rule_hook)
 
 
 __all__ = ["resolve_rtf", "resolve_rtf_flat", "RtfResolver"]

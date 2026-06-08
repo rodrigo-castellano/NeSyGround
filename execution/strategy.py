@@ -57,10 +57,6 @@ class ExecStrategy:
     def layout(self) -> Layout:
         return self.cell.layout
 
-    def clones_between_steps(self) -> bool:
-        """CUDA-graph paths must clone step outputs out of the private pool."""
-        return self.cell.compile.uses_cudagraphs()
-
     def depth_selector(self, d: int, depth: int,
                        device: Optional[Any] = None) -> DepthSelector:
         return DepthSelector.make(d, depth,

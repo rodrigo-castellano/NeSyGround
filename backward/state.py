@@ -115,14 +115,11 @@ class RunState:
             trees=ProofTrees.empty() if spec.trees else None,
         )
 
-    def with_chunk(self, *, firings: Optional[FiringSet] = None,
-                   trees: Optional[ProofTrees] = None, n_chunk: int) -> "RunState":
-        """Fold one chunk's pieces in (caller has already lifted firing query_idx
-        to global) and advance the offset. Returns a new RunState."""
-        f = self.firings.extend(firings) if (self.firings is not None and firings is not None) else self.firings
+    def with_chunk(self, *, trees: Optional[ProofTrees] = None, n_chunk: int) -> "RunState":
+        """Fold one chunk's trees piece in and advance the global query offset.
+        Firings accumulate per-step in ``capture_step`` (already lifted to global), not here."""
         t = self.trees.extend(trees) if (self.trees is not None and trees is not None) else self.trees
-        return replace(self, firings=f, trees=t,
-                       chunk_query_offset=self.chunk_query_offset + n_chunk)
+        return replace(self, trees=t, chunk_query_offset=self.chunk_query_offset + n_chunk)
 
 
 __all__ = ["OutputSpec", "Frontier", "FiringSet", "ProofTrees", "RunState"]

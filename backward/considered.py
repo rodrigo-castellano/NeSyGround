@@ -1,15 +1,12 @@
 """Per-step rule-application accumulator (PRIMARY for RuleGroundings).
 
-Captures every rule application the BFS proposes at each step, BEFORE pack/prune
-drops dead candidates. Firings are run-scoped (``RunState.firings``);
-``capture_step`` appends one ``FiringSet`` emission per step (query_idx lifted by
-chunk offset; finalize IGNORES it so the global concat+single finalize stays
-order-invariant). ``capture_step`` runs AFTER resolve, BEFORE pack. Bodies stored
-in canonical rule order. ``finalize`` builds the ``RuleGroundings`` via
-injective-int64 atom dedup + (orig_rule, head, body) row dedup +
-binding-consistency filter + CSR sort.
-
-(Tabling / subgoal memo are default-OFF and off the fingerprint path.)
+``capture_step`` runs AFTER resolve, BEFORE pack: it appends one ``FiringSet``
+emission of every rule application the BFS proposed (bodies in canonical rule
+order), capturing candidates before pack/prune drop them. Firings are run-scoped;
+query_idx is lifted by the chunk offset but finalize IGNORES it, so the global
+concat + single finalize is order-invariant. ``finalize`` builds the
+``RuleGroundings`` by: injective-int64 atom dedup → (orig_rule, head, body) row
+dedup → binding-consistency filter → CSR sort.
 """
 from __future__ import annotations
 
@@ -43,12 +40,10 @@ def _extract_considered_rows(plan, resolved, fr):
         body = goals.reshape(-1, M, 3)
         rule_idx = torch.where(success.reshape(-1), rule_idx,
                                torch.full_like(rule_idx, -1))
-        bi = (torch.arange(B, device=dev).view(B, 1, 1)
-              .expand(B, S, K_r).reshape(-1))
-        si = (torch.arange(S, device=dev).view(1, S, 1)
-              .expand(B, S, K_r).reshape(-1))
-        b_idx = bi
-        s_idx = si
+        b_idx = (torch.arange(B, device=dev).view(B, 1, 1)
+                 .expand(B, S, K_r).reshape(-1))
+        s_idx = (torch.arange(S, device=dev).view(1, S, 1)
+                 .expand(B, S, K_r).reshape(-1))
 
     rule_idx = rule_idx.long()
     active_atom = body[..., 0] != pad
