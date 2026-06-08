@@ -32,13 +32,12 @@ class StandardizationConfig:
     padding_idx: int
     body_width: int
     enforce_runtime_range: bool = False
-    compile_mode: Optional[str] = None   # accepted for consumer compat; no-op (ExecStrategy owns compile)
 
 
 def standardize_vars_offset(
     states: Tensor,                       # [B, K, M, 3]
     counts: Tensor,                       # [B] (signature compat; unused)
-    next_var_indices: Tensor,             # [B]
+    next_var: Tensor,             # [B]
     constant_no: int,
     runtime_var_end_index: Optional[int],
     padding_idx: int,
@@ -56,7 +55,7 @@ def standardize_vars_offset(
     B, K, M, _ = states.shape
     pad = padding_idx
     if B == 0 or states.numel() == 0:
-        return states, next_var_indices
+        return states, next_var
 
     LARGE = 1_000_000
     min_var_in = torch.full((B,), LARGE, dtype=torch.long, device=device)
@@ -71,8 +70,8 @@ def standardize_vars_offset(
         max_var_in = torch.where(is_var_in, in_args, torch.zeros_like(in_args)).amax(dim=(-1, -2))
         has_input_vars = min_var_in < LARGE
 
-    offset = torch.where(has_input_vars, next_var_indices - min_var_in,
-                         torch.zeros_like(next_var_indices))
+    offset = torch.where(has_input_vars, next_var - min_var_in,
+                         torch.zeros_like(next_var))
 
     args = states[:, :, :, 1:3]
     is_var_out = (args > constant_no) & (args != pad)
@@ -94,7 +93,7 @@ def standardize_vars_offset(
 
     max_in_shifted = torch.where(has_input_vars, max_var_in + offset,
                                  torch.zeros_like(max_var_in))
-    max_gen_shifted = next_var_indices + extra_new_vars
+    max_gen_shifted = next_var + extra_new_vars
     new_next_var = torch.maximum(max_in_shifted, max_gen_shifted) + 1
 
     if enforce_runtime_range and runtime_var_end_index is not None:
@@ -107,7 +106,7 @@ def standardize_vars_offset(
 def standardize_vars_canonical(
     states: Tensor,                       # [B, K, M, 3]
     counts: Tensor,                       # [B] (signature compat; unused)
-    next_var_indices: Tensor,             # [B]
+    next_var: Tensor,             # [B]
     constant_no: int,
     runtime_var_end_index: int,
     padding_idx: int,
@@ -118,16 +117,16 @@ def standardize_vars_canonical(
     a contiguous block starting at ``next_var``, ordered by first appearance.
     """
     if states.numel() == 0:
-        return states, next_var_indices
+        return states, next_var
     device = states.device
     B, K, M, _ = states.shape
     if B == 0 or K == 0:
-        return states, next_var_indices
+        return states, next_var
 
     N, P = B * K, M * 2
     flat = states.view(N, M, 3)
     owners = torch.arange(B, device=device).repeat_interleave(K)
-    base = next_var_indices.index_select(0, owners).view(N, 1)
+    base = next_var.index_select(0, owners).view(N, 1)
 
     args = flat[:, :, 1:3].reshape(N, P)
     is_var = (args > constant_no) & (args != padding_idx)
@@ -175,9 +174,9 @@ def standardize_vars_canonical(
 
     vars_per_state = group_new.sum(dim=1).long()
     next_end = base.view(N) + vars_per_state
-    next_end_B = next_var_indices.clone()
+    next_end_B = next_var.clone()
     next_end_B.scatter_reduce_(0, owners, next_end, reduce="amax", include_self=True)
-    new_next_var = torch.maximum(next_var_indices, next_end_B)
+    new_next_var = torch.maximum(next_var, next_end_B)
 
     if _STD_ASSERTS:
         is_var_out = (args_out > constant_no) & (args_out != padding_idx)

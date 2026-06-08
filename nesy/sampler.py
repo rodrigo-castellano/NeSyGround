@@ -1,4 +1,4 @@
-"""Random sampler — PostResolutionHook.
+"""Random sampler — GroundingHook.
 
 Selects a random subset of valid groundings (train) or valid-first (eval).
 """

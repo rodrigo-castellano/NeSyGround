@@ -1,11 +1,9 @@
 """Accumulated-body sync — gather from parents, apply subs, write at depth d.
 
-Ported from OLD ``bc/step.py:sync_accumulated``. The structured accumulator
-``accumulated_body[B,S,D,M,3]`` writes each depth's body atoms at slot ``d``.
-``apply_substitutions`` is the identity when ``subs_noop`` (flat enum path).
-
-Adapted: NEW ``apply_substitutions`` takes ``enc`` (Encoding) instead of ``pad``.
-``d`` is always a Python int on the eager fingerprint path.
+The structured accumulator ``accumulated_body[B,G,D,M,3]`` writes each depth's
+body atoms at slot ``d``. ``apply_substitutions`` is the identity when
+``subs_noop`` (flat enum path) and takes ``enc`` (Encoding). ``d`` is always a
+Python int on the eager fingerprint path.
 """
 from __future__ import annotations
 
@@ -21,10 +19,10 @@ def sync_accumulated(plan, fr: Frontier, sync, dsel) -> Frontier:
     parent_map = sync["parent_map"]
     winning_subs = sync["winning_subs"]
     has_new_body = sync["has_new_body"]
-    parent_bcount = sync["parent_bcount"]
+    parent_body_count = sync["parent_body_count"]
 
     if not plan.collect_evidence:
-        return fr.replace(body_count=parent_bcount)
+        return fr.replace(body_count=parent_body_count)
 
     B, S_out = parent_map.shape
     D_dim = fr.accumulated_body.shape[2]
@@ -40,7 +38,7 @@ def sync_accumulated(plan, fr: Frontier, sync, dsel) -> Frontier:
     acc = fr.accumulated_body.gather(1, pi)
 
     rpi = parent_map[:, :, None].expand(-1, -1, D_dim)
-    ridx = fr.ridx_per_depth.gather(1, rpi)
+    rule_idx = fr.rule_idx_per_depth.gather(1, rpi)
     bc = fr.body_count.gather(1, rpi)
 
     if subs_noop:
@@ -62,14 +60,14 @@ def sync_accumulated(plan, fr: Frontier, sync, dsel) -> Frontier:
         write_atoms = new_atoms
     write_mask = has_new_body[:, :, None, None]
 
-    cur_ridx = sync["current_ridx"]
+    cur_rule_idx = sync["current_rule_idx"]
     if plan.all_anchors:
         v2o = plan.variant_to_orig
-        cur_ridx = torch.where(cur_ridx >= 0, v2o[cur_ridx.clamp(min=0)], cur_ridx)
+        cur_rule_idx = torch.where(cur_rule_idx >= 0, v2o[cur_rule_idx.clamp(min=0)], cur_rule_idx)
 
     d = dsel.d
     acc = dsel.write_slot(acc, torch.where(write_mask, write_atoms, acc[:, :, d, :, :]))
-    ridx = dsel.write_slot(ridx, torch.where(has_new_body, cur_ridx, ridx[:, :, d]))
+    rule_idx = dsel.write_slot(rule_idx, torch.where(has_new_body, cur_rule_idx, rule_idx[:, :, d]))
     new_active = (write_atoms[:, :, :, 0] != pad)
     new_lens = new_active.long().sum(dim=-1)
     bc = dsel.write_slot(bc, torch.where(has_new_body, new_lens, bc[:, :, d]))
@@ -80,8 +78,8 @@ def sync_accumulated(plan, fr: Frontier, sync, dsel) -> Frontier:
         head_flat = head.reshape(B * S_out, D_dim, 3)
         head_flat = apply_substitutions(head_flat, subs_flat, enc)
         head = head_flat.reshape(B, S_out, D_dim, 3)
-    if fr.selected_goal is not None:
-        sel = fr.selected_goal
+    if fr.selected_atom is not None:
+        sel = fr.selected_atom
         sel_parent = sel.gather(1, parent_map.unsqueeze(-1).expand(-1, -1, 3))
         if not subs_noop:
             sel_flat = sel_parent.reshape(B * S_out, 1, 3)
@@ -92,7 +90,7 @@ def sync_accumulated(plan, fr: Frontier, sync, dsel) -> Frontier:
 
     return fr.replace(
         accumulated_body=acc, body_count=bc,
-        ridx_per_depth=ridx, head_per_depth=head)
+        rule_idx_per_depth=rule_idx, head_per_depth=head)
 
 
 __all__ = ["sync_accumulated"]

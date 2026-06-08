@@ -1,4 +1,4 @@
-"""Soft provability scorer — PostResolutionHook.
+"""Soft provability scorer — GroundingHook.
 
 Known atoms (facts or provable) -> score 1.0.
 Unknown atoms -> sigmoid(KGE score) or learned MLP.

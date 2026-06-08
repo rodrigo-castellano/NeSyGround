@@ -20,11 +20,11 @@ from pathlib import Path
 
 import torch
 
-from grounder.core.request import GroundRequest
+from grounder.core import GroundRequest
 from grounder.data.kb import KB
 from grounder.execution.capability import Cell
 from grounder.forward.methods import ForwardMethod
-from grounder.grounder.registry import FORWARD_METHODS, RESOLVERS, TRANSFORMS
+from grounder.api.registry import FORWARD_METHODS, RESOLVERS, TRANSFORMS
 from grounder.resolution.api import Resolver
 from grounder.transform.api import IdentityTransform, ProgramTransform
 from grounder.transform.magic_set import MagicSetTransform

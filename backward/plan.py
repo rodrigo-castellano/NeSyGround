@@ -12,13 +12,13 @@ from typing import Callable, TYPE_CHECKING, Optional
 
 from torch import Tensor
 
-from grounder.core.request import OutputSpec   # typed tier set (threaded through the plan)
+from grounder.core import OutputSpec   # typed tier set (threaded through the plan)
 from grounder.execution.capability import EAGER, CapabilityRow, Cell
 from grounder.execution.chunk_policy import ChunkPolicy
 from grounder.execution.strategy import ExecStrategy
 from grounder.resolution.pbc import PbcPlan, build_plan
-from grounder.shapes import Shapes
-from grounder.types import Layout
+from grounder.vocab.shapes import Shapes
+from grounder.base.types import Layout
 
 if TYPE_CHECKING:                       # cross-layer types
     from grounder.data.kb import KB
@@ -51,7 +51,7 @@ class RunPlan:
     width: Optional[int]
     w_last_depth: int
     S: int
-    C: int
+    Y_q: int
     max_goals: int
     max_vars_per_rule: int
     max_fact_pairs_body: int
@@ -76,10 +76,10 @@ class RunPlan:
         is_pbc = grounder.resolution == "pbc"
         pbc = build_plan(grounder) if is_pbc else None
         shapes = Shapes(
-            B=getattr(grounder, "B", 1), S=grounder.S, G=grounder.max_goals,
+            B=getattr(grounder, "B", 1), G=grounder.S, L=grounder.max_goals,
             M=kb.M, D=grounder.depth, A=grounder.A,
-            C=grounder.C, K_f=kb.K_f, K_r=getattr(grounder, "K_r", kb.K_r),
-            G_r=getattr(grounder, "G_r", 1), K_v=getattr(grounder, "K_v", 1),
+            Y_q=grounder.Y_q, K_f=kb.K_f, K_r=getattr(grounder, "K_r", kb.K_r),
+            Y_r=getattr(grounder, "Y_r", 1), K_v=getattr(grounder, "K_v", 1),
             V=getattr(grounder, "V", 1), E=getattr(grounder, "_E", kb.constant_no),
             N=getattr(grounder, "B", 1) * grounder.S, pad=kb.padding_idx)
         row = grounder.capability_row()
@@ -88,9 +88,9 @@ class RunPlan:
                                              _resolve_chunk(grounder, shapes))
         else:
             strategy = ExecStrategy.auto(row, shapes=shapes)
-            # Eager-port: compile is opt-in; downgrade an auto-picked compiled cell to
-            # its eager-declared sibling, keyed on the legacy flat flag (deterministic
-            # now that PBC declares two eager cells), so wrap_step stays byte-identical.
+            # Compile is opt-in: downgrade an auto-picked compiled cell to its
+            # eager-declared sibling, keyed on the flat flag (PBC declares two eager
+            # cells), so wrap_step stays eager.
             if (not strategy.cell.compile.eager
                     and not getattr(grounder, "compile_enabled", False)):
                 want = Layout.FLAT if grounder._flat_intermediate else Layout.DENSE
@@ -106,7 +106,7 @@ class RunPlan:
             resolution=getattr(grounder, "_dispatch_resolution", grounder.resolution),
             filter_mode=grounder.filter_mode,
             depth=grounder.depth, width=grounder.width,
-            w_last_depth=grounder._w_last_depth, S=grounder.S, C=grounder.C,
+            w_last_depth=grounder.w_last_depth, S=grounder.S, Y_q=grounder.Y_q,
             max_goals=grounder.max_goals, max_vars_per_rule=grounder.max_vars_per_rule,
             max_fact_pairs_body=getattr(grounder, "_max_fact_pairs_body", 0),
             collect_evidence=grounder.collect_evidence,

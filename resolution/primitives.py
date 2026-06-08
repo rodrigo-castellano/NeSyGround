@@ -1,14 +1,11 @@
 """Core unification primitives: pairwise MGU and substitution application.
 
-Leaf-level, dependency-free, vectorized, torch.compile-safe. Generic leading
-dims ``[...]`` (works for ``[L,3]`` facts and ``[B,S,3]`` states alike).
-
-Re-implemented from scratch against the redesign contract; classification is
-delegated to ``Encoding`` (the single id source of truth). Two semantics learned
-from the old code and reproduced exactly (proven bit-identical by an A/B test):
-  1. var boundary at ``constant_no+1`` with ``pad`` inert (owned by Encoding);
-  2. ``apply_substitutions`` applies its two slots SEQUENTIALLY (slot 1 sees
-     slot 0's result) — the grounder's S=2 path.
+Leaf-level, dependency-free, vectorized, torch.compile-safe; generic leading dims
+``[...]`` (``[L,3]`` facts and ``[B,S,3]`` states alike). Id classification is owned
+by ``Encoding``. Two non-obvious invariants:
+  1. var boundary at ``constant_no+1``, ``pad`` inert;
+  2. ``apply_substitutions`` applies its two slots SEQUENTIALLY (slot 1 sees slot 0's
+     result) — the grounder's S=2 path.
 """
 from __future__ import annotations
 
@@ -23,18 +20,9 @@ if TYPE_CHECKING:
 
 @torch.no_grad()
 def unify_one_to_one(a: Tensor, b: Tensor, enc: "Encoding") -> Tuple[Tensor, Tensor]:
-    """Pairwise most-general unifier of two atom tensors.
-
-    Args:
-        a, b: ``[...,3]`` atoms (pred, arg0, arg1).
-        enc:  id convention (``is_const``/``is_var``).
-    Returns:
-        ok:   ``[...]`` bool — whether each pair unified.
-        subs: ``[...,2,2]`` — per arg position ``(from, to)``; ``pad`` = no binding.
-
-    A pair fails on predicate mismatch, a constant clash, or the same variable
-    bound to two different targets across the two positions.
-    """
+    """Pairwise MGU of two ``[...,3]`` atoms → (ok ``[...]`` bool, subs ``[...,2,2]``
+    per-arg ``(from,to)``, ``pad``=no binding). Fails on predicate mismatch, constant
+    clash, or one variable bound to two different targets."""
     pad = enc.pad
     pad_t = torch.tensor(pad, dtype=a.dtype, device=a.device)
 

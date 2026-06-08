@@ -1,4 +1,4 @@
-"""Neural attention scorer — PostResolutionHook.
+"""Neural attention scorer — GroundingHook.
 
 Scores groundings by learned attention MLP over body embeddings, selects top-k.
 """

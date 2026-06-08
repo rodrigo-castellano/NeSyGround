@@ -5,7 +5,7 @@ A ``ForwardMethod`` is the forward-chaining closure engine: ``SpmmMethod``
 FCDynamic). ``run_forward_chaining`` (fc.py) is the per-rule ROUTER over these:
 the spmm WHOLE-SET fast path is gated by ``SpmmMethod.supports(rules)`` (all
 ``classify_rule != UNSUPPORTED``); on any UNSUPPORTED rule it falls through to
-``StagedMethod`` — reproducing today's exact fallback.
+``StagedMethod``.
 
 The JoinAlgo sub-axis ``{staged, chunked}`` lives INSIDE ``StagedMethod`` (the
 FCDynamic ``join_algo`` knob); ``leapfrog`` is a documented placeholder, NOT a

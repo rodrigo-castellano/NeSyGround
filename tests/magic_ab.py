@@ -20,7 +20,7 @@ Two assertions (do NOT weaken):
    A + its magic bookkeeping but skips ALL of component B. The "fewer groundings"
    proof, achievable precisely because FC accumulates the closure.
 
-The transform is exercised through the FULL seam: ``make_grounder(kb, FCConfig,
+The transform is exercised through the FULL seam: ``make_grounder(kb, Forward,
 transforms=[MagicSetTransform(...)])`` -> a ``core.Pipeline`` that per-call seeds
 the magic demand facts and re-snapshots the base ForwardGrounder.
 
@@ -33,11 +33,11 @@ import sys
 
 import torch
 
-from grounder.config import FCConfig
-from grounder.core.request import GroundRequest
+from grounder.api.config import Forward
+from grounder.core import GroundRequest
 from grounder.data.kb import KB
-from grounder.factory import make_grounder
-from grounder.forward.grounder import ForwardGrounder
+from grounder.api.factory import make_grounder
+from grounder.api.forward import ForwardGrounder
 from grounder.transform.magic_set import MagicSetTransform
 
 # Toy KB encoding (entities 1..11; predicate ids parent=0, ancestor=1; vars > C).
@@ -88,7 +88,7 @@ def main() -> None:
 
     # ── magic-set via the full Pipeline seam ──
     mt = MagicSetTransform(kb, query_pred=_P_ANC)
-    g = make_grounder(kb, FCConfig(depth=10), transforms=[mt])
+    g = make_grounder(kb, Forward(depth=10), transforms=[mt])
     with torch.no_grad():
         magic = g.ground(GroundRequest(queries=queries))
     n_magic = int(magic.n_provable)

@@ -1,12 +1,11 @@
-"""NEW grounding-fingerprint harness — gates the rebuilt engine against the frozen
-oracle baseline (``tests/baselines/ground_fingerprint.json``, frozen from the OLD
-grounder).
+"""Grounding-fingerprint harness — gates the engine against the frozen oracle
+baseline (``tests/baselines/ground_fingerprint.json``).
 
-For every cell it builds the NEW ``BackwardGrounder`` (CPU/eager, 50 queries) and
-computes the SAME canonical SHA the OLD harness uses over ``out.rule_groundings`` +
-``out.evidence.count``, then checks TWO things:
+For every cell it builds the ``BackwardGrounder`` (CPU/eager, 50 queries) and
+computes the canonical SHA over ``out.rule_groundings`` +
+``out.completed_tree_firings.count``, then checks TWO things:
 
-  1. byte-identity vs the frozen baseline  (new == old grounding output), and
+  1. byte-identity vs the frozen baseline, and
   2. batch-size invariance: the cell is re-run at chunk sizes {None, 8, 4, 1} and
      every run must produce the IDENTICAL SHA (the chunk driver must not change
      what is grounded).
@@ -30,9 +29,12 @@ from pathlib import Path
 
 import torch
 
+from grounder.api.config import Backward, PBC, RTF, SLD
 from grounder.data.dataset import KGDataset
-from grounder.grounder.backward import BackwardGrounder
+from grounder.api.backward import BackwardGrounder
+from grounder.core import GroundRequest, OutputSpec, Tier
 
+_ALL_TIERS = OutputSpec(frozenset({Tier.PROOF_STATE, Tier.FIRINGS, Tier.TREES}))
 _HERE = Path(__file__).resolve().parent
 _BASELINE = (_HERE / "baselines" / "ground_fingerprint.json")
 _RULES_FILE = {"family": "rules_old.txt"}
@@ -63,26 +65,23 @@ _MATRIX = _build_matrix()
 def _build_grounder(kind: str, kb, cfg: dict, chunk_size=None) -> BackwardGrounder:
     """Mirror ``tests/_runners.build_torch_grounder`` config exactly."""
     if kind in ("SLD", "RTF"):
-        return BackwardGrounder(
-            kb, resolution="sld" if kind == "SLD" else "rtf", filter="none",
-            depth=cfg["depth"], max_total_groundings=4096,
-            max_derived_per_state=64, max_states=256, prune_facts=True,
-            collect_evidence=True, collect_rule_groundings=True,
-            chunk_size=chunk_size)
+        res = SLD(depth=cfg["depth"]) if kind == "SLD" else RTF(depth=cfg["depth"])
+        config = Backward(res, filter="none", max_groundings_per_query=4096,
+                          max_children=64, max_states=256, prune_facts=True)
+        return BackwardGrounder(kb, config, chunk_size=chunk_size)
     if kind in ("enum-flat", "enum-dense"):
         flat = (kind == "enum-flat")
-        return BackwardGrounder(
-            kb, resolution="pbc", w=cfg["w"], depth=cfg["d"], u=0,
-            flat_intermediate=flat, max_groundings_per_query=64,
-            max_total_groundings=4096, max_states=256, prune_facts=True,
-            bump_s_to_k=False, init_state_shape="minimal",
-            collect_evidence=True, collect_rule_groundings=True,
-            chunk_size=chunk_size)
+        config = Backward(
+            PBC(depth=cfg["d"], width=cfg["w"], u=0, flat_intermediate=flat,
+                max_groundings_per_rule=64),
+            max_groundings_per_query=4096, max_states=256, prune_facts=True,
+            bump_s_to_k=False, init_state_shape="minimal")
+        return BackwardGrounder(kb, config, chunk_size=chunk_size)
     raise ValueError(f"unsupported kind: {kind!r}")
 
 
 def _ground_proofs(out) -> int:
-    ev = getattr(out, "evidence", None)
+    ev = getattr(out, "completed_tree_firings", None)
     if ev is not None and getattr(ev, "count", None) is not None:
         return int(ev.count.sum().item())
     return 0
@@ -99,7 +98,7 @@ def _canonical_fingerprint(out) -> dict:
     head_idx = rg.head_pool_idx.to("cpu", torch.int64)
     body_idx = rg.body_pool_idx.to("cpu", torch.int64)
     bvalid = rg.body_atom_valid.to("cpu", torch.bool)
-    ridx = rg.rule_idx.to("cpu", torch.int64)
+    rule_idx = rg.rule_idx.to("cpu", torch.int64)
     fvalid = (rg.firing_valid.to("cpu", torch.bool)
               if getattr(rg, "firing_valid", None) is not None
               else torch.ones(head_idx.shape[0], dtype=torch.bool))
@@ -110,7 +109,7 @@ def _canonical_fingerprint(out) -> dict:
     for f in range(F):
         if not bool(fvalid[f]):
             continue
-        r = int(ridx[f])
+        r = int(rule_idx[f])
         head = tuple(at[head_idx[f]].tolist())
         body = sorted(tuple(at[body_idx[f, j]].tolist())
                       for j in range(body_idx.shape[1]) if bool(bvalid[f, j]))
@@ -146,7 +145,7 @@ def compute_fingerprint(dataset, kind, cfg, *, data_root,
 
     g = _build_grounder(kind, kb, cfg, chunk_size=chunk_size)
     with torch.no_grad():
-        out = g(queries, qmask)
+        out = g.ground(GroundRequest(queries=queries, query_mask=qmask, output_spec=_ALL_TIERS))
 
     fp = _canonical_fingerprint(out)
     fp.update(dataset=dataset, kind=kind, cfg=cfg, rules=rules_file,

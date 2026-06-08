@@ -1,16 +1,15 @@
-"""Per-step "considered" rule-application accumulator (PRIMARY for RuleGroundings).
+"""Per-step rule-application accumulator (PRIMARY for RuleGroundings).
 
-Ported from OLD ``bc/considered.py``. Captures every rule application the BFS
-proposes at each step, BEFORE pack/prune drops dead candidates. Firings are
-run-scoped (``RunState.firings``); ``capture_step`` appends one ``FiringSet``
-emission per step (query_idx lifted by chunk offset; finalize IGNORES it so the
-global concat+single finalize stays order-invariant). ``capture_step`` runs AFTER
-resolve, BEFORE pack. Bodies stored in canonical rule order. ``finalize`` builds
-the NEW ``RuleGroundings`` via injective-int64 atom dedup + (orig_rule, head,
-body) row dedup + binding-consistency filter + CSR sort.
+Captures every rule application the BFS proposes at each step, BEFORE pack/prune
+drops dead candidates. Firings are run-scoped (``RunState.firings``);
+``capture_step`` appends one ``FiringSet`` emission per step (query_idx lifted by
+chunk offset; finalize IGNORES it so the global concat+single finalize stays
+order-invariant). ``capture_step`` runs AFTER resolve, BEFORE pack. Bodies stored
+in canonical rule order. ``finalize`` builds the ``RuleGroundings`` via
+injective-int64 atom dedup + (orig_rule, head, body) row dedup +
+binding-consistency filter + CSR sort.
 
-(Tabling / subgoal memo are default-OFF and not ported — they are not on the
-fingerprint path.)
+(Tabling / subgoal memo are default-OFF and off the fingerprint path.)
 """
 from __future__ import annotations
 
@@ -21,7 +20,7 @@ import torch
 from torch import Tensor
 
 from grounder.backward.state import FiringSet
-from grounder.types import FlatResolvedChildren, RuleGroundings
+from grounder.base.types import FlatResolvedChildren, RuleGroundings
 
 
 def _extract_considered_rows(plan, resolved, fr):
@@ -31,16 +30,16 @@ def _extract_considered_rows(plan, resolved, fr):
 
     if isinstance(resolved, FlatResolvedChildren):
         rule_idx = resolved.flat_rule_idx
-        body = resolved.flat_goals[:, :M, :]
+        body = resolved.flat_child_goals[:, :M, :]
         b_idx = resolved.flat_batch_idx
         s_idx = resolved.flat_state_idx
     else:
-        ridx = resolved.sub_rule_idx                  # [B, S, K_r]
-        success = resolved.rule_success               # [B, S, K_r]
-        goals = resolved.rule_goals[..., :M, :]       # [B, S, K_r, M, 3]
-        B, S, K_r = ridx.shape
-        dev = ridx.device
-        rule_idx = ridx.reshape(-1)
+        rule_idx = resolved.sub_rule_idx                  # [B, G, K_r]
+        success = resolved.rule_success               # [B, G, K_r]
+        goals = resolved.rule_child_goals[..., :M, :]  # [B, G, K_r, M, 3]
+        B, S, K_r = rule_idx.shape
+        dev = rule_idx.device
+        rule_idx = rule_idx.reshape(-1)
         body = goals.reshape(-1, M, 3)
         rule_idx = torch.where(success.reshape(-1), rule_idx,
                                torch.full_like(rule_idx, -1))
@@ -60,7 +59,7 @@ def _extract_considered_rows(plan, resolved, fr):
     if v2o is not None:
         rule_idx = v2o[rule_idx.clamp(min=0)]
 
-    sel = fr.selected_goal  # always set when capture_step runs
+    sel = fr.selected_atom  # always set when capture_step runs
     head = sel[b_idx.long(), s_idx.long()]
 
     return (rule_idx[valid], head[valid], body[valid], b_idx[valid].long())
@@ -165,147 +164,4 @@ def finalize(plan, firings) -> Optional[RuleGroundings]:
     )
 
 
-def _atom_hash(atoms: Tensor) -> Tensor:
-    """Injective int64 key for atom triples ``(p, a0, a1)`` (..., 3) -> (...)."""
-    a = atoms.long()
-    base = int(a.max().item()) + 1 if a.numel() else 1
-    return (a[..., 0] * base + a[..., 1]) * base + a[..., 2]
-
-
-def populate_query_pool_idx(
-    rg: RuleGroundings, queries: Tensor, padding_idx: int,
-) -> RuleGroundings:
-    """Extend ``rg.atom_table`` to cover every query atom and set ``query_pool_idx``.
-
-    Pool-iter reasoners (SBR/DCR/R2N via tkk ``_rule_loop``) gather
-    ``pool[query_pool_idx]`` regardless of provability, so each query
-    ``(pred, h, t)`` needs a slot in the atom table even when no firing
-    produced it as a head. Atoms already present keep their slot; novel
-    queries are appended (the 0..N-1 prefix stays stable so existing
-    body/head pool indices remain valid). ``query_pool_idx`` is ``[B]``."""
-    queries = queries.long()
-    device = queries.device
-    pool = rg.atom_table.to(device)
-
-    # Hash over the union so query and pool keys share one base — atom_hash's
-    # per-call max base would diverge between the two tensors otherwise.
-    both = torch.cat([pool, queries], dim=0) if pool.numel() else queries
-    base = int(both.max().item()) + 1 if both.numel() else 1
-
-    def _h(a: Tensor) -> Tensor:
-        a = a.long()
-        return (a[..., 0] * base + a[..., 1]) * base + a[..., 2]
-
-    pool_h = _h(pool)
-    query_h = _h(queries)
-    in_pool = (query_h.unsqueeze(1) == pool_h.unsqueeze(0)).any(dim=1) \
-        if pool.numel() else torch.zeros_like(query_h, dtype=torch.bool)
-
-    novel = queries[~in_pool]
-    novel_h = _h(novel)
-    nuniq_h, ninv = torch.unique(novel_h, return_inverse=True)
-    rep = torch.zeros(nuniq_h.shape[0], dtype=torch.long, device=device)
-    rep.scatter_reduce_(0, ninv, torch.arange(novel.size(0), device=device),
-                        reduce="amax", include_self=False)
-    new_pool = torch.cat([pool, novel[rep]], dim=0)
-
-    new_h = _h(new_pool)
-    sort_idx = new_h.argsort()
-    pos = torch.searchsorted(new_h[sort_idx], query_h)
-    query_pool_idx = sort_idx[pos]
-
-    return replace(rg, atom_table=new_pool.contiguous(),
-                   num_atoms=int(new_pool.shape[0]),
-                   query_pool_idx=query_pool_idx)
-
-
-def next_pow2(n: int) -> int:
-    """Smallest power of 2 >= n. Returns 1 for n <= 1."""
-    if n <= 1:
-        return 1
-    return 1 << ((n - 1).bit_length())
-
-
-def pad_rule_groundings(
-    rg: RuleGroundings, *,
-    pad_per_rule_to: Optional[int] = None,
-    pad_atom_table_to: Optional[int] = None,
-    pad_idx_for_atoms: int = 0,
-) -> RuleGroundings:
-    """Pad each rule's firing slice to ``pad_per_rule_to`` rows and ``atom_table``
-    to ``pad_atom_table_to`` rows (``run_bc(pad_outputs=True)``).
-
-    Gives the downstream compiled reasoner a fixed-shape input on cells whose
-    flat-path output would otherwise oscillate per batch (countries_s3+BC13,
-    family+BC{12,13}) and blow the reduce-overhead CUDA-graph pool. Padding rows
-    point at the sentinel pool slot ``pad_idx_for_atoms`` and carry
-    ``firing_valid=False`` so the rule loop masks them out. No-op when both pads
-    are ``None``."""
-    if pad_per_rule_to is None and pad_atom_table_to is None:
-        return rg
-
-    atom_table = rg.atom_table
-    device = atom_table.device
-    M_max = rg.M_max
-    num_rules = rg.num_rules
-
-    if pad_per_rule_to is not None:
-        G = pad_per_rule_to
-        rule_offsets_in = rg.rule_offsets                              # [num_rules+1]
-        rule_sizes = (rule_offsets_in[1:] - rule_offsets_in[:-1]).long()
-        K_clamped = rule_sizes.clamp(max=G)
-        new_N = num_rules * G
-        if new_N == 0:
-            body_pool_idx = torch.empty((0, M_max), dtype=rg.body_pool_idx.dtype, device=device)
-            body_atom_valid = torch.empty((0, M_max), dtype=torch.bool, device=device)
-            head_pool_idx = torch.empty((0,), dtype=rg.head_pool_idx.dtype, device=device)
-            firing_valid = torch.empty((0,), dtype=torch.bool, device=device)
-        else:
-            rule_idx_flat = torch.arange(num_rules, device=device, dtype=torch.long).repeat_interleave(G)
-            local_idx = torch.arange(new_N, device=device, dtype=torch.long) % G
-            K_per_slot = K_clamped.repeat_interleave(G)
-            valid = local_idx < K_per_slot
-            src_idx_raw = rule_offsets_in[rule_idx_flat] + local_idx
-            src_size = rg.body_pool_idx.size(0)
-            pad_atom_id = torch.tensor(pad_idx_for_atoms, dtype=rg.body_pool_idx.dtype, device=device)
-            if src_size > 0:
-                src_idx_safe = src_idx_raw.clamp(max=src_size - 1)
-                gathered_body = rg.body_pool_idx[src_idx_safe]
-                gathered_body_valid = rg.body_atom_valid[src_idx_safe]
-                gathered_head = rg.head_pool_idx[src_idx_safe]
-                gathered_firing_valid = rg.firing_valid[src_idx_safe]
-            else:
-                gathered_body = torch.empty((new_N, M_max), dtype=rg.body_pool_idx.dtype, device=device).fill_(pad_atom_id)
-                gathered_body_valid = torch.zeros((new_N, M_max), dtype=torch.bool, device=device)
-                gathered_head = torch.empty((new_N,), dtype=rg.head_pool_idx.dtype, device=device).fill_(pad_atom_id)
-                gathered_firing_valid = torch.zeros((new_N,), dtype=torch.bool, device=device)
-            valid_2d = valid.unsqueeze(-1)
-            body_pool_idx = torch.where(valid_2d, gathered_body, pad_atom_id)
-            body_atom_valid = gathered_body_valid & valid_2d
-            head_pool_idx = torch.where(valid, gathered_head, pad_atom_id)
-            firing_valid = gathered_firing_valid & valid
-        rule_idx = torch.repeat_interleave(torch.arange(num_rules, device=device, dtype=torch.long), G)
-        rule_offsets = torch.arange(num_rules + 1, device=device, dtype=torch.long) * G
-    else:
-        body_pool_idx = rg.body_pool_idx
-        body_atom_valid = rg.body_atom_valid
-        head_pool_idx = rg.head_pool_idx
-        rule_idx = rg.rule_idx
-        rule_offsets = rg.rule_offsets
-        firing_valid = rg.firing_valid
-
-    if pad_atom_table_to is not None and pad_atom_table_to > atom_table.size(0):
-        extra = pad_atom_table_to - atom_table.size(0)
-        pad_rows = torch.zeros(extra, 3, dtype=atom_table.dtype, device=device)
-        atom_table = torch.cat([atom_table, pad_rows], dim=0)
-
-    return RuleGroundings(
-        atom_table=atom_table.contiguous(),
-        body_pool_idx=body_pool_idx, body_atom_valid=body_atom_valid,
-        head_pool_idx=head_pool_idx, rule_idx=rule_idx, rule_offsets=rule_offsets,
-        firing_valid=firing_valid, num_atoms=int(atom_table.size(0)),
-        num_rules=num_rules, M_max=M_max, query_pool_idx=rg.query_pool_idx)
-
-
-__all__ = ["capture_step", "finalize", "populate_query_pool_idx",
-           "pad_rule_groundings", "next_pow2"]
+__all__ = ["capture_step", "finalize"]

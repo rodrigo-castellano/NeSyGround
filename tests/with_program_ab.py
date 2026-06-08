@@ -26,11 +26,14 @@ from pathlib import Path
 
 import torch
 
+from grounder.api.config import Backward, PBC
 from grounder.data import kb as kb_mod
 from grounder.data.dataset import KGDataset
 from grounder.data.kb import KB
-from grounder.grounder.backward import BackwardGrounder
+from grounder.api.backward import BackwardGrounder
+from grounder.core import GroundRequest, OutputSpec, Tier
 
+_ALL_TIERS = OutputSpec(frozenset({Tier.PROOF_STATE, Tier.FIRINGS, Tier.TREES}))
 _RULES_FILE = {"family": "rules_old.txt"}
 
 
@@ -44,7 +47,7 @@ def _fp(out) -> str:
     head_idx = rg.head_pool_idx.to("cpu", torch.int64)
     body_idx = rg.body_pool_idx.to("cpu", torch.int64)
     bvalid = rg.body_atom_valid.to("cpu", torch.bool)
-    ridx = rg.rule_idx.to("cpu", torch.int64)
+    rule_idx = rg.rule_idx.to("cpu", torch.int64)
     fvalid = (rg.firing_valid.to("cpu", torch.bool)
               if getattr(rg, "firing_valid", None) is not None
               else torch.ones(head_idx.shape[0], dtype=torch.bool))
@@ -55,7 +58,7 @@ def _fp(out) -> str:
         head = tuple(at[head_idx[f]].tolist())
         body = sorted(tuple(at[body_idx[f, j]].tolist())
                       for j in range(body_idx.shape[1]) if bool(bvalid[f, j]))
-        rows.append((int(ridx[f]), head, tuple(body)))
+        rows.append((int(rule_idx[f]), head, tuple(body)))
     rows.sort()
     h = hashlib.sha256()
     for row in rows:
@@ -64,14 +67,14 @@ def _fp(out) -> str:
 
 
 def _ground(kb, queries) -> str:
-    g = BackwardGrounder(kb, resolution="pbc", w=1, depth=2, u=0,
-                         flat_intermediate=True, max_groundings_per_query=64,
-                         max_total_groundings=4096, max_states=256, prune_facts=True,
-                         bump_s_to_k=False, init_state_shape="minimal",
-                         collect_evidence=True, collect_rule_groundings=True)
+    config = Backward(
+        PBC(depth=2, width=1, u=0, flat_intermediate=True, max_groundings_per_rule=64),
+        max_groundings_per_query=4096, max_states=256, prune_facts=True,
+        bump_s_to_k=False, init_state_shape="minimal")
+    g = BackwardGrounder(kb, config)
     qmask = torch.ones(queries.shape[0], dtype=torch.bool, device=queries.device)
     with torch.no_grad():
-        return _fp(g(queries, qmask))
+        return _fp(g.ground(GroundRequest(queries=queries, query_mask=qmask, output_spec=_ALL_TIERS)))
 
 
 def _facts_set(kb) -> set:

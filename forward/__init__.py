@@ -8,11 +8,12 @@ ported verbatim with repointed imports and gated by ``tests/fc_fingerprint.py``)
   methods.py    — ForwardMethod seam (AXIS 3): SpmmMethod/StagedMethod + FORWARD_METHODS
   fc.py         — run_forward_chaining (per-rule router) + FCDynamic (staged/leapfrog triejoin)
   spmm/         — semi-naive sparse-matmul FC (the default ``method='spmm'``)
-  grounder.py   — ForwardGrounder (the consumer-facing FC grounder)
+
+The consumer-facing ``ForwardGrounder`` shell lives in ``grounder.api.forward``
+(sibling of ``grounder.api.backward``); the engine here is its impl.
 """
 from grounder.forward.api import Closure
 from grounder.forward.fc import FCDynamic, run_forward_chaining
-from grounder.forward.grounder import ForwardGrounder
 from grounder.forward.methods import (
     FORWARD_METHODS, ForwardMethod, SpmmMethod, StagedMethod,
 )
@@ -21,7 +22,7 @@ from grounder.forward.spmm import (
 )
 
 __all__ = [
-    "Closure", "ForwardGrounder", "run_forward_chaining", "FCDynamic",
+    "Closure", "run_forward_chaining", "FCDynamic",
     "run_forward_chaining_spmm", "classify_rule", "SpMMOp",
     "ForwardMethod", "SpmmMethod", "StagedMethod", "FORWARD_METHODS",
 ]

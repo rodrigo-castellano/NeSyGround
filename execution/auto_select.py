@@ -14,15 +14,23 @@ from __future__ import annotations
 from grounder.execution.capability import (
     CapabilityRow, Cell, COMPILED_STEP, EAGER, validate,
 )
-from grounder.errors import StrategyError
-from grounder.types import Layout
+from grounder.base.errors import StrategyError
+from grounder.base.types import Layout
 
 # fan-out (K_f) at/below which flat-eager is preferred for PBC; above it, flat's
 # data-dependent survivor set risks the per-query OOM cliff -> bounded compiled-dense.
 FANOUT_FLAT_MAX = 256
 
+# TODO: re-key the BC flat/dense choice on the DOMINATING dense intermediate
+# `K_r * Y_r * M` (× K_v^V for the cartesian case) — the candidate block dense
+# materializes and flat avoids — not on K_f alone. Keep K_f<=FANOUT_FLAT_MAX as a
+# co-condition: flat iff (K_f <= FANOUT_FLAT_MAX and K_r*Y_r*M <= DOM_FLAT_MAX),
+# else bounded compiled-dense. DOM_FLAT_MAX still TBD (speed-study the flat→dense
+# crossover, or derive from the chunk-policy per-state budget). The K_r/Y_r/M/B
+# params are passed for exactly this and are otherwise currently unused.
 
-def auto_select(row: CapabilityRow, *, K_f: int, K_r: int, G_r: int,
+
+def auto_select(row: CapabilityRow, *, K_f: int, K_r: int, Y_r: int,
                 M: int, B: int) -> Cell:
     """Return a declared cell best for this static budget."""
     sparse = Cell(Layout.SPARSE, EAGER)

@@ -9,10 +9,9 @@ step-output tuple and the nested ``BackwardResult`` tree.
 from __future__ import annotations
 
 import dataclasses
-from typing import Any, Tuple, TypeVar
+from typing import Any, TypeVar
 
 import torch
-from torch import Tensor
 
 T = TypeVar("T")
 
@@ -40,17 +39,4 @@ def detach_from_pool(obj: T) -> T:
     return obj
 
 
-def pad_chunk(queries: Tensor, mask: Tensor, to: int) -> Tuple[Tensor, Tensor]:
-    """Pad a short final chunk up to ``to`` rows (padded rows have mask=False) so a
-    captured CUDA graph always sees the same static batch shape."""
-    n = queries.shape[0]
-    if n == to:
-        return queries, mask
-    q = queries.new_zeros((to,) + tuple(queries.shape[1:]))
-    m = torch.zeros(to, dtype=torch.bool, device=mask.device)
-    q[:n] = queries
-    m[:n] = mask
-    return q, m
-
-
-__all__ = ["mark_step_begin", "detach_from_pool", "pad_chunk"]
+__all__ = ["mark_step_begin", "detach_from_pool"]

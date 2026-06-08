@@ -9,8 +9,8 @@ body slot can read from a different mat dict (e.g. ``delta_mats`` vs
 ``old_mats``), so the iteration strategy can pick which combination of
 old / delta sources to fire per step. See ``strategies.py``.
 
-A backwards-compatible 2-source ``apply_spmm_rule(all_mats, base_mats)``
-wrapper is also provided.
+A 2-source ``apply_spmm_rule(all_mats, base_mats)`` convenience wrapper
+is also provided.
 """
 from __future__ import annotations
 
@@ -320,10 +320,10 @@ def apply_spmm_rule(
     base_mats_T: Optional[Dict[int, Tensor]] = None,
     all_mats_T: Optional[Dict[int, Tensor]] = None,
 ) -> Optional[Tensor]:
-    """Legacy 2-source signature: body0 from ``base_mats``, body1+ from ``all_mats``.
+    """2-source signature: body0 from ``base_mats``, body1+ from ``all_mats``.
 
-    Provided for backward compatibility with code that pre-dates the
-    per-slot interface. New code should call ``apply_spmm_rule_slots``.
+    A convenience wrapper over the per-slot ``apply_spmm_rule_slots`` for the
+    common case where body0 reads one mat dict and the rest read another.
     """
     n_slots = slots_for_op(desc.op)
     if n_slots == 0:

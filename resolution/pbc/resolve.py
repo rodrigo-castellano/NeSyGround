@@ -20,16 +20,16 @@ from grounder.execution.capability import Cell, EAGER, COMPILED_STEP, COMPILED_D
 from grounder.resolution.pbc import candidates as C
 from grounder.resolution.pbc.candidates import cluster
 from grounder.resolution.pbc.width import apply_filters_dense, apply_filters_flat, depth_gate
-from grounder.types import FlatResolvedChildren, Layout, ResolvedChildren
+from grounder.base.types import FlatResolvedChildren, Layout, ResolvedChildren
 
 
 class StepInputs(NamedTuple):
     """One proof step's request (per-step tensors + scalars/flags)."""
-    queries: Tensor          # [B, S, 3]
-    remaining: Tensor        # [B, S, G, 3]
-    grounding_body: Tensor   # [B, S, G_body, 3]
-    state_valid: Tensor      # [B, S]
-    active_mask: Tensor      # [B, S]
+    queries: Tensor          # [B, G, 3]
+    remaining: Tensor        # [B, G, L, 3]
+    grounding_body: Tensor   # [B, G, G_body, 3]
+    goal_valid: Tensor      # [B, G]
+    active_mask: Tensor      # [B, G]
     padding_idx: int
     d: object                # int (eager) | 0-dim tensor (compiled)
     depth: int
@@ -63,7 +63,7 @@ class _DenseWork(NamedTuple):
 
 class _DenseCand(NamedTuple):
     source: Tensor; check_arg: Tensor; body_preds: Tensor
-    cmask: Tensor; G_r: int; num_body_q: Tensor
+    cmask: Tensor; Y_r: int; num_body_q: Tensor
 
 
 class DenseMaterializer:
@@ -72,7 +72,7 @@ class DenseMaterializer:
     def prepare(self, inp: StepInputs, plan) -> _DenseWork:
         B, S, _ = inp.queries.shape
         q = inp.queries.reshape(B * S, 3)
-        q_valid = (inp.active_mask & inp.state_valid).reshape(B * S)
+        q_valid = (inp.active_mask & inp.goal_valid).reshape(B * S)
         return _DenseWork(q, q[:, 0], q_valid, B, S)
 
     def enumerate(self, work: _DenseWork, cl, plan, fact_index) -> _DenseCand:
@@ -81,31 +81,31 @@ class DenseMaterializer:
         qs, qo = work.q[:, 1], work.q[:, 2]
         body_preds_q = t.body_preds[ai]
         num_body_q = t.num_body_atoms[ai]
-        G_r = plan.E if plan.cartesian_product else min(plan.G_r, fact_index._max_facts_per_query)
+        Y_r = plan.E if plan.cartesian_product else min(plan.Y_r, fact_index._max_facts_per_query)
 
         if plan.V >= 2 and not plan.cartesian_product:           # ≥2 free vars: cartesian
             dep_src, dep_bpreds = t.arg_source_dep[ai], t.body_preds_dep[ai]
-            source, cmask, G_r = C.enumerate_cartesian_dense(
+            source, cmask, Y_r = C.enumerate_cartesian_dense(
                 N, K_r, qs, qo, t.fv_enum_pred[ai], t.fv_enum_bound_src[ai],
                 t.fv_enum_direction[ai], t.fv_enum_valid[ai], cl.has_free_q, cl.active_mask,
-                fact_index, K_v=plan.K_v, V=plan.V, G_cap=G_r, fv_any_valid=plan.fv_any_valid,
+                fact_index, K_v=plan.K_v, V=plan.V, G_cap=Y_r, fv_any_valid=plan.fv_any_valid,
                 check_arg_source_q=dep_src, body_preds_q=dep_bpreds, num_body_q=num_body_q, M=plan.M)
-            return _DenseCand(source, dep_src, dep_bpreds, cmask, G_r, num_body_q)
+            return _DenseCand(source, dep_src, dep_bpreds, cmask, Y_r, num_body_q)
 
         cands, cmask = C.enumerate_single_dense(                  # ≤1 free var: single lookup
-            N, K_r, G_r, qs, qo, t.enum_pred[ai], t.enum_bound[ai], t.enum_dir[ai],
+            N, K_r, Y_r, qs, qo, t.enum_pred[ai], t.enum_bound[ai], t.enum_dir[ai],
             fact_index, cartesian_product=plan.cartesian_product, E=plan.E)
-        G_r = cands.size(2)
+        Y_r = cands.size(2)
         cmask = cmask & cl.has_free_q.unsqueeze(2)
         cmask[:, :, 0] = cmask[:, :, 0] | (~cl.has_free_q & cl.active_mask)
-        source = torch.stack([qs.view(N, 1, 1).expand(-1, K_r, G_r),
-                              qo.view(N, 1, 1).expand(-1, K_r, G_r), cands], dim=3)
-        return _DenseCand(source, t.check_arg_source[ai], body_preds_q, cmask, G_r, num_body_q)
+        source = torch.stack([qs.view(N, 1, 1).expand(-1, K_r, Y_r),
+                              qo.view(N, 1, 1).expand(-1, K_r, Y_r), cands], dim=3)
+        return _DenseCand(source, t.check_arg_source[ai], body_preds_q, cmask, Y_r, num_body_q)
 
     def fill(self, cand: _DenseCand, cl, plan, fact_index, work: _DenseWork):
         N, K_r, M, dev = work.q.size(0), cl.K_r, plan.M, work.q.device
         body = C.fill_body_dense(cand.source, cand.check_arg, cand.body_preds)
-        exists = fact_index.exists(body.reshape(-1, 3)).view(N, K_r, cand.G_r, M)
+        exists = fact_index.exists(body.reshape(-1, 3)).view(N, K_r, cand.Y_r, M)
         atom_idx = torch.arange(M, device=dev).view(1, 1, 1, M)
         body_active = atom_idx < cand.num_body_q.view(N, K_r, 1, 1)
         body = body.masked_fill(~body_active.unsqueeze(-1), fact_index._padding_idx)
@@ -113,7 +113,7 @@ class DenseMaterializer:
 
     def width(self, body, exists, body_active, cand: _DenseCand, cl, work, w_d, hpm_d, inp):
         return apply_filters_dense(body, exists, body_active, cl.active_mask, cand.cmask,
-                                   work.q, cand.G_r, w_d, hpm_d, is_last=inp.is_last)
+                                   work.q, cand.Y_r, w_d, hpm_d, is_last=inp.is_last)
 
     def emit(self, body, mask, cand: _DenseCand, cl, work: _DenseWork, inp: StepInputs, plan):
         B, S, K_r, M, dev = work.B, work.S, cl.K_r, plan.M, work.q.device
@@ -122,20 +122,20 @@ class DenseMaterializer:
         K_total = K_r * G_use
         body_flat = body.reshape(N, K_total, M, 3)
         success_flat = mask.reshape(N, K_total)
-        ridx_flat = cl.active_idx.unsqueeze(2).expand(-1, -1, G_use).reshape(N, K_total)
+        rule_idx_flat = cl.active_idx.unsqueeze(2).expand(-1, -1, G_use).reshape(N, K_total)
 
         K = plan.K
         if K_total > K:
             _, top = success_flat.to(torch.int8).topk(K, dim=1, largest=True, sorted=False)
             body_flat = body_flat.gather(1, top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, M, 3))
             success_flat = success_flat.gather(1, top)
-            ridx_flat = ridx_flat.gather(1, top)
+            rule_idx_flat = rule_idx_flat.gather(1, top)
         else:
             K = K_total
 
         body_flat = body_flat.reshape(B, S, K, M, 3)
         success_flat = success_flat.reshape(B, S, K)
-        ridx_flat = ridx_flat.reshape(B, S, K)
+        rule_idx_flat = rule_idx_flat.reshape(B, S, K)
 
         rule_goals = torch.full((B, S, K, G, 3), pad, dtype=torch.long, device=dev)
         rule_goals[:, :, :, :M, :] = body_flat
@@ -145,15 +145,15 @@ class DenseMaterializer:
                 inp.remaining[:, :, 1:1 + n_rem, :].unsqueeze(2).expand(-1, -1, K, -1, -1)
 
         G_body = inp.grounding_body.shape[2]
-        rule_gbody = (inp.grounding_body.unsqueeze(2).expand(-1, -1, K, -1, -1) if inp.collect_evidence
+        rule_grounding_body = (inp.grounding_body.unsqueeze(2).expand(-1, -1, K, -1, -1) if inp.collect_evidence
                       else torch.zeros(B, S, K, G_body, 3, dtype=torch.long, device=dev))
         z_goals = torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev)
-        z_gbody = torch.zeros(B, S, 0, G_body, 3, dtype=torch.long, device=dev)
+        z_grounding_body = torch.zeros(B, S, 0, G_body, 3, dtype=torch.long, device=dev)
         z_succ = torch.zeros(B, S, 0, dtype=torch.bool, device=dev)
         z_subs = torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev)
         rule_subs = torch.full((B, S, K, 2, 2), pad, dtype=torch.long, device=dev)
-        return ResolvedChildren(Layout.DENSE, z_goals, z_gbody, z_succ,
-                                rule_goals, rule_gbody, success_flat, ridx_flat, z_subs, rule_subs)
+        return ResolvedChildren(Layout.DENSE, z_goals, z_grounding_body, z_succ,
+                                rule_goals, rule_grounding_body, success_flat, rule_idx_flat, z_subs, rule_subs)
 
     def empty(self, inp, plan):   # dense is fixed-shape; never reached
         raise RuntimeError("DenseMaterializer.empty is unreachable")
@@ -176,7 +176,7 @@ class FlatMaterializer:
     def prepare(self, inp: StepInputs, plan) -> Optional[_FlatWork]:
         B, S, _ = inp.queries.shape
         flat_q_full = inp.queries.reshape(B * S, 3)
-        flat_valid = (inp.active_mask & inp.state_valid).reshape(B * S)
+        flat_valid = (inp.active_mask & inp.goal_valid).reshape(B * S)
         active_pos = torch.nonzero(flat_valid, as_tuple=False).squeeze(1)
         if active_pos.size(0) == 0:
             return None
@@ -254,12 +254,12 @@ class FlatMaterializer:
         n_rem = min(G - M, G - 1)
         if n_rem > 0:
             flat_goals[:, M:M + n_rem, :] = inp.remaining[b_idx, s_idx, 1:1 + n_rem, :]
-        flat_gbody = torch.zeros(T_surv, G_body, 3, dtype=torch.long, device=dev)
+        flat_grounding_body = torch.zeros(T_surv, G_body, 3, dtype=torch.long, device=dev)
         flat_subs = torch.full((T_surv, 2, 2), pad, dtype=torch.long, device=dev)
         flat_is_fact = torch.zeros(T_surv, dtype=torch.bool, device=dev)
-        flat_top_ridx = torch.zeros(T_surv, dtype=torch.long, device=dev)
-        return FlatResolvedChildren(Layout.FLAT, flat_goals, flat_gbody, surv_rule,
-                                    b_idx, s_idx, flat_subs, flat_is_fact, flat_top_ridx,
+        flat_top_rule_idx = torch.zeros(T_surv, dtype=torch.long, device=dev)
+        return FlatResolvedChildren(Layout.FLAT, flat_goals, flat_grounding_body, surv_rule,
+                                    b_idx, s_idx, flat_subs, flat_is_fact, flat_top_rule_idx,
                                     B, S, True)
 
     def empty(self, inp: StepInputs, plan) -> FlatResolvedChildren:
@@ -306,7 +306,7 @@ class JoinMaterializer(FlatMaterializer):
         prune_w = w_d if isinstance(w_d, int) else None
         flat_source, n_idx, r_idx = C.enumerate_join_flat(
             N, cl.K_r, qs, qo, t.fv_enum_pred[ai], t.fv_enum_bound_src[ai],
-            t.fv_enum_direction[ai], t.fv_enum_valid[ai], cl.has_free_q, cl.active_mask,
+            t.fv_enum_direction[ai], t.fv_enum_valid[ai], cl.active_mask,
             fact_index, V=plan.V, fv_any_valid=plan.fv_any_valid,
             arg_source_dep_q=t.arg_source_dep[ai], body_preds_dep_q=t.body_preds_dep[ai],
             num_body_q=t.num_body_atoms[ai], ready_after_q=ready_after,
@@ -341,8 +341,8 @@ def resolve_step_join(inp: StepInputs, plan, fact_index, materializer: JoinMater
 
 class PbcResolver:
     """RESOLVERS["pbc"] — picks the dense/flat materializer (pbc-internal) + drives
-    resolve_step (byte-identical to today's step.py:resolve pbc branch). The
-    ResolveRequest fact_hook/rule_hook fields are INERT for pbc (ignored)."""
+    resolve_step. The ResolveRequest fact_hook/rule_hook fields are INERT for pbc
+    (ignored)."""
     name = "pbc"
 
     def declared_cells(self) -> frozenset:
@@ -355,7 +355,7 @@ class PbcResolver:
         mat = (FlatMaterializer() if (plan.flat_intermediate and pbc.V >= 1)
                else DenseMaterializer())
         inp = StepInputs(
-            req.queries, req.remaining, fr.grounding_body, req.state_valid,
+            req.queries, req.remaining, fr.grounding_body, req.goal_valid,
             req.active_mask, padding_idx=kb.padding_idx, d=dsel.d, depth=plan.depth,
             is_last=None, width=plan.width, w_last_depth=plan.w_last_depth,
             collect_evidence=plan.collect_evidence, dedup_goals=False)
@@ -378,7 +378,7 @@ class JoinResolver:
         plan, fr, kb, dsel = req.plan, req.frontier, req.plan.kb, req.depth_selector
         pbc = plan.pbc
         inp = StepInputs(
-            req.queries, req.remaining, fr.grounding_body, req.state_valid,
+            req.queries, req.remaining, fr.grounding_body, req.goal_valid,
             req.active_mask, padding_idx=kb.padding_idx, d=dsel.d, depth=plan.depth,
             is_last=None, width=plan.width, w_last_depth=plan.w_last_depth,
             collect_evidence=plan.collect_evidence, dedup_goals=False)

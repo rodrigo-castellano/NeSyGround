@@ -28,7 +28,7 @@ from grounder.nesy.scoring import PartialScorer
 class KGEScorer(nn.Module):
     """Score groundings by KGE min-conjunction, select top-k.
 
-    GroundingHook: applied after grounding in BCGrounder.forward().
+    GroundingHook: applied after grounding in BackwardGrounder.ground().
 
     kge_model interface:
         kge_model.score_atoms(preds, subjs, objs) -> Tensor of scalar scores.
@@ -89,7 +89,7 @@ class KGEScorer(nn.Module):
 class KGEFactFilter(nn.Module):
     """Score matched fact triples with KGE, keep top-k.
 
-    ResolutionFactHook: applied inside resolve_sld/rtf after mgu_resolve_facts.
+    ResolutionFactHook: applied inside resolve_sld/rtf after resolve_facts.
 
     Re-looks up fact candidates via fact_index to obtain ground triples,
     scores them with model.score, and zeros out low-scoring entries
@@ -120,9 +120,9 @@ class KGEFactFilter(nn.Module):
 
     def filter_facts(
         self,
-        fact_goals: Tensor,      # [B, S, K_f, G, 3]
-        fact_success: Tensor,    # [B, S, K_f]
-        queries: Tensor,         # [B, S, 3]
+        fact_goals: Tensor,      # [B, G, K_f, L, 3]
+        fact_success: Tensor,    # [B, G, K_f]
+        queries: Tensor,         # [B, G, 3]
     ) -> Tensor:
         B, S, K_f = fact_success.shape
         if K_f == 0 or self._top_k >= K_f:
@@ -165,7 +165,7 @@ class KGEFactFilter(nn.Module):
 class KGERuleFilter(nn.Module):
     """Score rule children's first body atom with KGE, keep top-k.
 
-    ResolutionRuleHook: applied inside resolve_sld/rtf after mgu_resolve_rules.
+    ResolutionRuleHook: applied inside resolve_sld/rtf after resolve_rules.
 
     For each rule child, scores the first body atom (rule_goals[:,:,:,0,:]).
     Only ground atoms (all args <= constant_no) are scored; non-ground atoms
@@ -173,7 +173,7 @@ class KGERuleFilter(nn.Module):
 
     Args:
         kge_model:    nn.Module with score_atoms().
-        top_k:        max rule candidates to keep per (batch, state).
+        top_k:        max rule candidates to keep per (batch, goal).
         constant_no:  highest constant index (for ground detection).
         padding_idx:  padding value.
     """
@@ -193,9 +193,9 @@ class KGERuleFilter(nn.Module):
 
     def filter_rules(
         self,
-        rule_goals: Tensor,      # [B, S, K_r, G, 3]
-        rule_success: Tensor,    # [B, S, K_r]
-        queries: Tensor,         # [B, S, 3]
+        rule_goals: Tensor,      # [B, G, K_r, L, 3]
+        rule_success: Tensor,    # [B, G, K_r]
+        queries: Tensor,         # [B, G, 3]
     ) -> Tensor:
         B, S, K_r = rule_success.shape
         if K_r == 0 or self._top_k >= K_r:
@@ -206,7 +206,7 @@ class KGERuleFilter(nn.Module):
         c_no = self._constant_no
 
         # First body atom of each rule child
-        first_atoms = rule_goals[:, :, :, 0, :]  # [B, S, K_r, 3]
+        first_atoms = rule_goals[:, :, :, 0, :]  # [B, G, K_r, 3]
         p = first_atoms[..., 0]   # pred
         a1 = first_atoms[..., 1]  # subj
         a2 = first_atoms[..., 2]  # obj

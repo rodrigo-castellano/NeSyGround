@@ -25,7 +25,7 @@ from pathlib import Path
 import torch
 
 from grounder.data.dataset import KGDataset
-from grounder.forward.grounder import ForwardGrounder
+from grounder.api.forward import ForwardGrounder
 
 _HERE = Path(__file__).resolve().parent
 _BASELINE = (_HERE / "baselines" / "fc_fingerprint.json")
@@ -58,7 +58,7 @@ def _cell_key(dataset, method, cfg) -> str:
 
 
 def _old_closure_facts(hashes: torch.Tensor, n_provable: int, E: int) -> torch.Tensor:
-    """The VERBATIM pre-Step-2 decode (frozen reference for the Closure.facts() A/B)."""
+    """The frozen reference hash decode for the Closure.facts() A/B."""
     if n_provable == 0:
         return torch.empty(0, 3, dtype=torch.long, device=hashes.device)
     E2 = E * E
@@ -75,10 +75,10 @@ def compute_fingerprint(dataset, method, cfg, *, data_root) -> dict:
 
     g = ForwardGrounder(kb, method=method, depth=cfg["depth"])
     with torch.no_grad():
-        hashes, n_provable = g.closure_hashes()
-        closure = g.ground()                     # Step 2: ground() -> Closure
+        closure = g.ground()                     # the single verb -> Closure
+        hashes, n_provable = closure.hashes, int(closure.n_provable)
 
-    # Closure.facts() must decode EXACTLY as the old closure_facts() did.
+    # Closure.facts() must decode EXACTLY as the reference decode does.
     new_facts = closure.facts()
     old_facts = _old_closure_facts(hashes, n_provable, int(g._num_entities))
     assert new_facts.shape == old_facts.shape and torch.equal(new_facts, old_facts), (

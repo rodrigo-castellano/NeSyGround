@@ -1,14 +1,14 @@
-"""AXIS 1 — the Resolver seam contract (replaces backward/step.py:resolve() if/elif).
+"""AXIS 1 — the Resolver seam contract.
 
 A ``Resolver`` is the backward RESOLVE-step strategy ``{sld, rtf, pbc}``: given one
 proof step's request it produces the children (``ResolvedChildren`` dense or
-``FlatResolvedChildren`` flat). ``ResolveRequest`` generalizes the old per-family
-kwarg sets (and pbc's ``StepInputs``) into ONE honest superset carried to the seam.
+``FlatResolvedChildren`` flat). ``ResolveRequest`` is the honest superset of the
+per-family kwarg sets (and pbc's ``StepInputs``) carried to the seam.
 
-The hook asymmetry is REAL, not a rename: sld/rtf take ``fact_hook``/``rule_hook``
-(step.py:83,92) but pbc's resolve_step takes none. The unified ``ResolveRequest``
-carries the hooks Optional + INERT for pbc today (the PbcResolver ignores them).
-The dense/flat materializer choice stays pbc-internal (PbcResolver picks it).
+The hook asymmetry is REAL: sld/rtf take ``fact_hook``/``rule_hook`` but pbc's
+resolve_step takes none. The unified ``ResolveRequest`` carries the hooks Optional
++ INERT for pbc (the PbcResolver ignores them). The dense/flat materializer choice
+stays pbc-internal (PbcResolver picks it).
 """
 from __future__ import annotations
 
@@ -36,13 +36,13 @@ class ResolveRequest(NamedTuple):
 
     Carries the per-step tensors, the run-level plan (binding tables, KB, knobs)
     and a ``DepthSelector`` (NOT a bare int, so the compiled path stays expressible).
-    ``fact_hook``/``rule_hook`` are Optional: wired for sld/rtf, INERT for pbc today.
+    ``fact_hook``/``rule_hook`` are Optional: wired for sld/rtf, INERT for pbc.
     """
     plan: object                                # RunPlan (binding tables, KB, knobs)
-    queries: Tensor                             # [B, S, 3]
-    remaining: Tensor                           # [B, S, G, 3]
-    state_valid: Tensor                         # [B, S]
-    active_mask: Tensor                         # [B, S]
+    queries: Tensor                             # [B, G, 3]
+    remaining: Tensor                           # [B, G, L, 3]
+    goal_valid: Tensor                         # [B, G]
+    active_mask: Tensor                         # [B, G]
     frontier: object                            # Frontier (next_var/top_rule_idx/grounding_body/...)
     depth_selector: "DepthSelector"             # d / is_last duality (compiled path expressible)
     excluded_queries: Optional[Tensor] = None

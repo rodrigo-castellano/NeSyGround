@@ -22,9 +22,12 @@ from pathlib import Path
 
 import torch
 
+from grounder.api.config import Backward, PBC
 from grounder.data.dataset import KGDataset
-from grounder.grounder.backward import BackwardGrounder
+from grounder.api.backward import BackwardGrounder
+from grounder.core import GroundRequest, OutputSpec, Tier
 
+_ALL_TIERS = OutputSpec(frozenset({Tier.PROOF_STATE, Tier.FIRINGS, Tier.TREES}))
 _DATA_ROOT = Path.home() / "repos/data-swarm/main"
 _RULES_FILE = {"family": "rules_old.txt"}
 _MAX_QUERIES = 50
@@ -47,12 +50,12 @@ _PEAK_CELL = ("countries_s3", 1, 3, 0)
 
 
 def _build(kb, materialization, w, d, u):
-    return BackwardGrounder(
-        kb, resolution="pbc", materialization=materialization, w=w, depth=d, u=u,
-        flat_intermediate=True, max_groundings_per_query=64,
-        max_total_groundings=4096, max_states=256, prune_facts=True,
-        bump_s_to_k=False, init_state_shape="minimal",
-        collect_evidence=True, collect_rule_groundings=True)
+    config = Backward(
+        PBC(depth=d, width=w, u=u, materialization=materialization,
+            flat_intermediate=True, max_groundings_per_rule=64),
+        max_groundings_per_query=4096, max_states=256, prune_facts=True,
+        bump_s_to_k=False, init_state_shape="minimal")
+    return BackwardGrounder(kb, config)
 
 
 def _grounding_set(out) -> set:
@@ -65,7 +68,7 @@ def _grounding_set(out) -> set:
     head_idx = rg.head_pool_idx.to("cpu", torch.int64)
     body_idx = rg.body_pool_idx.to("cpu", torch.int64)
     bvalid = rg.body_atom_valid.to("cpu", torch.bool)
-    ridx = rg.rule_idx.to("cpu", torch.int64)
+    rule_idx = rg.rule_idx.to("cpu", torch.int64)
     fvalid = (rg.firing_valid.to("cpu", torch.bool)
               if getattr(rg, "firing_valid", None) is not None
               else torch.ones(head_idx.shape[0], dtype=torch.bool))
@@ -73,7 +76,7 @@ def _grounding_set(out) -> set:
     for f in range(head_idx.shape[0]):
         if not bool(fvalid[f]):
             continue
-        r = int(ridx[f])
+        r = int(rule_idx[f])
         head = tuple(at[head_idx[f]].tolist())
         body = tuple(sorted(tuple(at[body_idx[f, j]].tolist())
                             for j in range(body_idx.shape[1]) if bool(bvalid[f, j])))
@@ -93,7 +96,7 @@ def _load(dataset):
 def _run_set(kb, q, m, materialization, w, d, u) -> set:
     g = _build(kb, materialization, w, d, u)
     with torch.no_grad():
-        out = g(q, m)
+        out = g.ground(GroundRequest(queries=q, query_mask=m, output_spec=_ALL_TIERS))
     return _grounding_set(out)
 
 
@@ -111,7 +114,7 @@ def _peak_rows(kb, q, m, materialization, w, d, u) -> int:
     try:
         g = _build(kb, materialization, w, d, u)
         with torch.no_grad():
-            g(q, m)
+            g.ground(GroundRequest(queries=q, query_mask=m, output_spec=_ALL_TIERS))
     finally:
         R.FlatMaterializer.fill = orig
     return peak["v"]

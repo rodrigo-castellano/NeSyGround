@@ -1,8 +1,6 @@
-"""CONTRACTS for the data layer (pure / tiny-tensor; no dataset or old-index dep).
+"""CONTRACTS for the data layer (pure / tiny-tensor; no dataset dependency).
 
-Byte-identity vs the OLD index is proven by build-time A/B scripts + the
-fingerprint (the old code is deleted at promotion, so it can't be a permanent
-test). These contracts pin the design invariants that DON'T depend on old code:
+These contracts pin the data-layer design invariants:
 
 - the fact-index registry is exactly {arg_key, inverted, block_sparse};
 - ``create`` rejects an unknown type;
@@ -66,7 +64,7 @@ def test_exists_membership() -> None:
 def test_encoding_boundary() -> None:
     # constants 1..3, vars 4.., pad=9 -> E=4
     enc = Encoding.from_constant_no(constant_no=3, pad=9)
-    assert enc.E == 4 and enc.var_base() == 4
+    assert enc.E == 4
     ids = torch.tensor([1, 3, 4, 5, 9])
     assert enc.is_const(ids).tolist() == [True, True, False, False, False]
     assert enc.is_var(ids).tolist() == [False, False, True, True, False]  # pad is neither

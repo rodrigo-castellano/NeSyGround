@@ -1108,7 +1108,7 @@ class FCDynamic(nn.Module):
         if n_provable > 0:
             # ``provable_hashes`` is in compact predicate space —
             # decompact to original space before returning so callers
-            # (e.g. BCGrounder.fp_global_hashes membership tests)
+            # (e.g. closure-membership tests via ``check_in_fp_global``)
             # see the same predicate ids the rest of the codebase
             # uses.
             decompact = self._decompact_hashes(provable_hashes, E, E2)
