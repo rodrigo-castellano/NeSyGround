@@ -20,10 +20,15 @@ from __future__ import annotations
 from typing import Any, Dict
 
 DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    # paper datasets — auto chunking + the consumer's per-cell test batch size is
-    # verified safe (no OOM) and non-regressing vs the old grounder.
-    "family":       {},
-    "wn18rr":       {},
+    # family/wn18rr: one grounder-chunk (chunk_size=0). The consumer (eval_scores)
+    # already bounds each run_bc batch (candidate pool capped to N_full atoms), so
+    # the grounder's auto memory-budget needlessly RE-chunks it — that double
+    # chunking is the measured ~1.2x exhaustive-eval regression vs old. One pass
+    # matches old. Output-invariant (fingerprint batch-invariance) -> MRR-safe.
+    "family":       {"chunk_size": 0},
+    "wn18rr":       {"chunk_size": 0},
+    # smaller / high-fanout datasets keep auto (countries_s3 d3 needs the budget
+    # chunker to bound its Cartesian peak; one pass would OOM).
     "countries_s2": {},
     "countries_s3": {},
     "ablation_d2":  {},
