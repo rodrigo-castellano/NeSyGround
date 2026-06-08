@@ -30,15 +30,16 @@ DATASET_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "ablation_d3":  {},
     "nations":      {},
     "umls":         {},
-    # large / high-fanout — use the join materialization (L3, set-equality
-    # equivalent to cartesian, ~10x lower enumeration peak) + a small chunk.
-    # Measured (GPU 24GB, depth, w=1, keep-all): yago310 d2 join chunk=16 fits
-    # at 11.7GB (1283 firings/50q, 15ms/q). fb15k237 d3 is memory-bound by a few
-    # very-high-fanout queries — light queries fit at chunk=2 but heavy ones can
-    # still exceed 24GB even with join; chunk=2 is the safe floor (deeper memory
-    # work / output streaming is the real fix for fb15k d3 keep-ALL).
-    "fb15k237":     {"chunk_size": 2, "materialization": "join"},
-    "yago310":      {"chunk_size": 16, "materialization": "join"},
+    # large / high-fanout — resolution-agnostic chunk only (materialization is a
+    # PBC-only knob and would ConfigError under SLD, so it is NOT pinned here; the
+    # scale experiment chooses resolution + materialization). Measured GPU 24GB,
+    # w=1, keep-all (chunk bounds the per-chunk enumeration peak):
+    #   fb15k237 d3: SLD chunk=16 -> 7.7GB, 57534 firings/200q, 9ms/q (~3min full)
+    #     — the recommended scale path; PBC cartesian/join enum OOMs (~3GB/query,
+    #     a few very-high-fanout queries exceed 24GB).
+    #   yago310 d2: SLD chunk=16 -> 11.2GB (1450/50q); PBC join chunk=16 -> 11.7GB.
+    "fb15k237":     {"chunk_size": 16},
+    "yago310":      {"chunk_size": 16},
 }
 
 
