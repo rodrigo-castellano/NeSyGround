@@ -198,8 +198,14 @@ def populate_query_pool_idx(
 
     pool_h = _h(pool)
     query_h = _h(queries)
-    in_pool = (query_h.unsqueeze(1) == pool_h.unsqueeze(0)).any(dim=1) \
-        if pool.numel() else torch.zeros_like(query_h, dtype=torch.bool)
+    # Membership via searchsorted on sorted pool hashes (perfect hash → exact),
+    # not an O(Q*P) [Q,P] pairwise that OOMs at exhaustive-eval scale.
+    if pool.numel():
+        pool_sorted, _ = torch.sort(pool_h)
+        ins = torch.searchsorted(pool_sorted, query_h).clamp(max=pool_sorted.numel() - 1)
+        in_pool = pool_sorted[ins] == query_h
+    else:
+        in_pool = torch.zeros_like(query_h, dtype=torch.bool)
 
     novel = queries[~in_pool]
     novel_h = _h(novel)
