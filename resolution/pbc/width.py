@@ -52,9 +52,9 @@ def head_pred_all_ok(body_pred_vals: Tensor, exists: Tensor,
 
 def apply_filters_dense(body_atoms: Tensor, exists: Tensor, body_active: Tensor,
                        active_mask: Tensor, cand_mask: Tensor, queries: Tensor,
-                       G_r: int, width, head_pred_mask: Optional[Tensor],
+                       Y_r: int, width, head_pred_mask: Optional[Tensor],
                        *, is_last: Optional[Tensor] = None) -> Tensor:
-    """Dense width + query-exclusion + head-pred prune → ``[B,K_r,G_r]`` mask.
+    """Dense width + query-exclusion + head-pred prune → ``[B,K_r,Y_r]`` mask.
 
     ``width``: int (eager) | 0-dim Tensor (compiled) | None (∞).
     ``head_pred_mask=None`` disables the unprovable-unknown prune (last step,
@@ -63,7 +63,7 @@ def apply_filters_dense(body_atoms: Tensor, exists: Tensor, body_active: Tensor,
     """
     B, K_r = active_mask.shape
     M = body_atoms.shape[3]
-    body_active_exp = body_active.expand(-1, -1, G_r, -1)
+    body_active_exp = body_active.expand(-1, -1, Y_r, -1)
 
     if width is None:
         mask = active_mask.unsqueeze(2) & cand_mask
@@ -71,7 +71,7 @@ def apply_filters_dense(body_atoms: Tensor, exists: Tensor, body_active: Tensor,
         num_unknown = (body_active_exp & ~exists).sum(dim=-1)
         mask = (num_unknown <= width) & active_mask.unsqueeze(2) & cand_mask
 
-    query_exp = queries.view(B, 1, 1, 1, 3).expand(-1, K_r, G_r, M, -1)
+    query_exp = queries.view(B, 1, 1, 1, 3).expand(-1, K_r, Y_r, M, -1)
     has_query_atom = ((body_atoms == query_exp).all(dim=-1) & body_active_exp).any(dim=-1)
     mask = mask & ~has_query_atom
 

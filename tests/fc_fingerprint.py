@@ -25,7 +25,7 @@ from pathlib import Path
 import torch
 
 from grounder.data.dataset import KGDataset
-from grounder.forward.grounder import ForwardGrounder
+from grounder.api.forward import ForwardGrounder
 
 _HERE = Path(__file__).resolve().parent
 _BASELINE = (_HERE / "baselines" / "fc_fingerprint.json")
@@ -41,6 +41,10 @@ _MATRIX = [
     ("countries_s2", "staged", {"depth": 10}),
     ("countries_s2", "spmm", {"depth": 3}),
     ("countries_s2", "staged", {"depth": 3}),
+    # leapfrog (worst-case-optimal join) must match the staged closure exactly.
+    ("family", "staged", {"depth": 10, "join_algo": "leapfrog"}),
+    ("countries_s2", "staged", {"depth": 10, "join_algo": "leapfrog"}),
+    ("countries_s2", "staged", {"depth": 3, "join_algo": "leapfrog"}),
 ]
 
 
@@ -54,11 +58,13 @@ def _canonical_fingerprint(hashes, n_provable) -> dict:
 
 
 def _cell_key(dataset, method, cfg) -> str:
-    return f"{dataset}|{method}|d{cfg['depth']}"
+    ja = cfg.get("join_algo")
+    suffix = f"|{ja}" if ja and ja != "staged" else ""
+    return f"{dataset}|{method}|d{cfg['depth']}{suffix}"
 
 
 def _old_closure_facts(hashes: torch.Tensor, n_provable: int, E: int) -> torch.Tensor:
-    """The VERBATIM pre-Step-2 decode (frozen reference for the Closure.facts() A/B)."""
+    """The frozen reference hash decode for the Closure.facts() A/B."""
     if n_provable == 0:
         return torch.empty(0, 3, dtype=torch.long, device=hashes.device)
     E2 = E * E
@@ -73,12 +79,13 @@ def compute_fingerprint(dataset, method, cfg, *, data_root) -> dict:
     ds = KGDataset(str(ds_path), device="cpu", rules_file=rules_file)
     kb = ds.build_kb(max_facts_per_query=4096, fact_index_type="block_sparse")
 
-    g = ForwardGrounder(kb, method=method, depth=cfg["depth"])
+    g = ForwardGrounder(kb, method=method, depth=cfg["depth"],
+                        join_algo=cfg.get("join_algo", "staged"))
     with torch.no_grad():
-        hashes, n_provable = g.closure_hashes()
-        closure = g.ground()                     # Step 2: ground() -> Closure
+        closure = g.ground()                     # the single verb -> Closure
+        hashes, n_provable = closure.hashes, int(closure.n_provable)
 
-    # Closure.facts() must decode EXACTLY as the old closure_facts() did.
+    # Closure.facts() must decode EXACTLY as the reference decode does.
     new_facts = closure.facts()
     old_facts = _old_closure_facts(hashes, n_provable, int(g._num_entities))
     assert new_facts.shape == old_facts.shape and torch.equal(new_facts, old_facts), (

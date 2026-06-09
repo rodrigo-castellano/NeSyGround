@@ -275,12 +275,12 @@ def test_kge_step_filter() -> None:
         rule_idx = torch.zeros(B, tG, dtype=torch.long)
 
         with torch.no_grad():
-            old_body, old_mask, old_ridx = old_sf.on_step(body, mask, rule_idx, d=0)
-            new_body, new_mask, new_ridx = new_sf.on_step(body, mask, rule_idx, d=0)
+            old_body, old_mask, old_rule_idx = old_sf.on_step(body, mask, rule_idx, d=0)
+            new_body, new_mask, new_rule_idx = new_sf.on_step(body, mask, rule_idx, d=0)
 
         _check(f"KGEStepFilter[{mode}]:body", _close(old_body, new_body))
         _check(f"KGEStepFilter[{mode}]:mask", _close(old_mask, new_mask))
-        _check(f"KGEStepFilter[{mode}]:rule_idx", _close(old_ridx, new_ridx))
+        _check(f"KGEStepFilter[{mode}]:rule_idx", _close(old_rule_idx, new_rule_idx))
 
 
 # ── TEST 5: PartialScorer numeric parity ────────────────────────────────────

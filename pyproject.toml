@@ -23,22 +23,27 @@ build-backend = "setuptools.build_meta"
 # `from grounder.forward.grounder import ForwardGrounder` after a normal
 # `pip install`.
 [tool.setuptools]
+# ``grounder`` maps to the repo root ("."), so root modules (core.py) are
+# auto-included as ``grounder.core``. The redesign layout is api/base/vocab +
+# core.py (no core/ or grounder/ dirs — those were the pre-redesign layout).
 packages = [
     "grounder",
+    "grounder.api",
+    "grounder.base",
+    "grounder.vocab",
     "grounder.backward",
     "grounder.forward",
     "grounder.forward.spmm",
+    "grounder.forward.staged",
     "grounder.resolution",
     "grounder.resolution.pbc",
     "grounder.data",
     "grounder.data.fact_index",
     "grounder.data.rule_index",
-    "grounder.core",
     "grounder.execution",
     "grounder.transform",
     "grounder.filters",
     "grounder.nesy",
-    "grounder.grounder",
     "grounder.memo",
     "grounder.contracts",
     "grounder.analysis",
@@ -46,20 +51,22 @@ packages = [
 
 [tool.setuptools.package-dir]
 "grounder" = "."
+"grounder.api" = "api"
+"grounder.base" = "base"
+"grounder.vocab" = "vocab"
 "grounder.backward" = "backward"
 "grounder.forward" = "forward"
 "grounder.forward.spmm" = "forward/spmm"
+"grounder.forward.staged" = "forward/staged"
 "grounder.resolution" = "resolution"
 "grounder.resolution.pbc" = "resolution/pbc"
 "grounder.data" = "data"
 "grounder.data.fact_index" = "data/fact_index"
 "grounder.data.rule_index" = "data/rule_index"
-"grounder.core" = "core"
 "grounder.execution" = "execution"
 "grounder.transform" = "transform"
 "grounder.filters" = "filters"
 "grounder.nesy" = "nesy"
-"grounder.grounder" = "grounder"
 "grounder.memo" = "memo"
 "grounder.contracts" = "contracts"
 "grounder.analysis" = "analysis"

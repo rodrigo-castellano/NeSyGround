@@ -8,8 +8,8 @@ no data-dependent branching). Classification goes through ``Encoding``.
   resolve_rules — segment lookup → standardize-apart (per state/rule var
                   namespace) → unify head → substitute [body, remaining].
 
-Bit-exact (fingerprint-locked): standardize-apart base ``next_var + state*V``,
-template_start ``E``; rule_goals = body ``[:Bmax]`` then remaining.
+Bit-exact (fingerprint-locked): standardize-apart base ``next_var + goal*V``,
+template_start ``E``; rule child goals = body ``[:Bmax]`` then remaining.
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from grounder.resolution.primitives import apply_substitutions, unify_one_to_one
 def empty_rule_results(B: int, S: int, G: int, M_g: int, pad: int, dev
                        ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """The 5 empty rule tensors for the ``num_rules == 0`` fast path:
-    ``(rule_goals, rule_gbody, rule_success, sub_rule_idx, rule_subs)``."""
+    ``(rule_goals, rule_grounding_body, rule_success, sub_rule_idx, rule_subs)``."""
     return (torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev),
             torch.zeros(B, S, 0, M_g, 3, dtype=torch.long, device=dev),
             torch.zeros(B, S, 0, dtype=torch.bool, device=dev),
@@ -35,45 +35,45 @@ def empty_rule_results(B: int, S: int, G: int, M_g: int, pad: int, dev
 
 
 def resolve_facts(
-    goals: Tensor,                 # [B, S, 3]
-    remaining: Tensor,             # [B, S, G, 3]
+    goals: Tensor,                 # [B, G, 3]
+    remaining: Tensor,             # [B, G, L, 3]
     fact_index,
     facts_idx: Tensor,             # [F, 3]
     enc: Encoding,
     K_f: int,
-    state_valid: Tensor,           # [B, S]
-    active_mask: Tensor,           # [B, S]
+    goal_valid: Tensor,           # [B, G]
+    active_mask: Tensor,           # [B, G]
     excluded_queries: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Resolve goal atoms against facts via MGU. Dispatches on index type.
 
-    Returns ``(fact_goals[B,S,K_f,G,3], fact_gbody[B,S,K_f,M_g,3],
-    fact_success[B,S,K_f], fact_subs[B,S,K_f,2,2])``.
+    Returns ``(fact_child_goals[B,G,K_f,L,3], fact_grounding_body[B,G,K_f,M_g,3],
+    fact_success[B,G,K_f], fact_subs[B,G,K_f,2,2])``.
     """
     if isinstance(fact_index, ArgKeyFactIndex):
         return _resolve_facts_argkey(goals, remaining, fact_index, facts_idx, enc,
-                                     K_f, state_valid, active_mask, excluded_queries)
+                                     K_f, goal_valid, active_mask, excluded_queries)
     return _resolve_facts_enumerate(goals, remaining, fact_index, enc,
-                                    state_valid, active_mask, excluded_queries)
+                                    goal_valid, active_mask, excluded_queries)
 
 
 def resolve_rules(
-    goals: Tensor,                 # [B, S, 3]
-    remaining: Tensor,             # [B, S, G, 3]
+    goals: Tensor,                 # [B, G, 3]
+    remaining: Tensor,             # [B, G, L, 3]
     rule_index,
     enc: Encoding,
     K_r: int,
     max_vars_per_rule: int,
     num_rules: int,
-    state_valid: Tensor,           # [B, S]
-    active_mask: Tensor,           # [B, S]
-    next_var_indices: Tensor,      # [B]
+    goal_valid: Tensor,           # [B, G]
+    active_mask: Tensor,           # [B, G]
+    next_var: Tensor,      # [B]
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, int, Tensor]:
     """Resolve goals against rule heads via MGU + standardization-apart.
 
-    Returns ``(rule_goals[B,S,K_r,G,3], rule_gbody[B,S,K_r,M_g,3],
-    rule_success[B,S,K_r], sub_rule_idx[B,S,K_r], sub_lens[B,S,K_r], Bmax,
-    rule_subs[B,S,K_r,2,2])``. rule_goals = body at ``[:Bmax]``, remaining after.
+    Returns ``(rule_child_goals[B,G,K_r,L,3], rule_grounding_body[B,G,K_r,M_g,3],
+    rule_success[B,G,K_r], sub_rule_idx[B,G,K_r], sub_lens[B,G,K_r], Bmax,
+    rule_subs[B,G,K_r,2,2])``. rule child goals = body at ``[:Bmax]``, remaining after.
     """
     B, S, _ = goals.shape
     G = remaining.shape[2]
@@ -96,7 +96,7 @@ def resolve_rules(
     N_r = B * S * K_r
 
     # ── standardization apart: each (state, rule) gets a unique var namespace ──
-    nv_exp = next_var_indices.view(B, 1, 1).expand(B, S, K_r)
+    nv_exp = next_var.view(B, 1, 1).expand(B, S, K_r)
     state_offsets = torch.arange(S, device=dev).view(1, S, 1).expand(1, S, K_r) * V
     rule_var_base = (nv_exp + state_offsets).reshape(N_r)
     template_start = E
@@ -117,17 +117,16 @@ def resolve_rules(
     flat_q = goals.unsqueeze(2).expand(B, S, K_r, 3).reshape(N_r, 3)
     ok_flat, subs_flat = unify_one_to_one(flat_q, std_heads, enc)
     rule_success = (ok_flat.view(B, S, K_r) & sub_rule_mask
-                    & state_valid.unsqueeze(-1) & active_mask.unsqueeze(-1))
+                    & goal_valid.unsqueeze(-1) & active_mask.unsqueeze(-1))
     rule_subs = subs_flat.view(B, S, K_r, 2, 2)
 
     # ── apply subs to [body, remaining] ──
-    subs_apply = subs_flat
     rem_exp = remaining.unsqueeze(2).expand(B, S, K_r, G, 3).reshape(N_r, G, 3)
-    combined = apply_substitutions(torch.cat([std_bodies, rem_exp], dim=1), subs_apply, enc)
+    combined = apply_substitutions(torch.cat([std_bodies, rem_exp], dim=1), subs_flat, enc)
     rule_body_subst = combined[:, :Bmax, :].view(B, S, K_r, Bmax, 3)
     rule_remaining = combined[:, Bmax:, :].view(B, S, K_r, G, 3)
 
-    rule_gbody_out = torch.zeros(B, S, K_r, M_g, 3, dtype=torch.long, device=dev)
+    rule_grounding_body_out = torch.zeros(B, S, K_r, M_g, 3, dtype=torch.long, device=dev)
 
     # ── mask body atoms beyond each rule's length ──
     sub_lens_v = sub_lens_flat.view(B, S, K_r)
@@ -144,11 +143,11 @@ def resolve_rules(
     if n_rem > 0:
         rule_goals[:, :, :, Bmax:Bmax + n_rem, :] = rule_remaining[:, :, :, :n_rem, :]
 
-    return rule_goals, rule_gbody_out, rule_success, sub_rule_idx, sub_lens_v, Bmax, rule_subs
+    return rule_goals, rule_grounding_body_out, rule_success, sub_rule_idx, sub_lens_v, Bmax, rule_subs
 
 
 def _resolve_facts_argkey(goals, remaining, fact_index, facts_idx, enc, K_f,
-                          state_valid, active_mask, excluded_queries):
+                          goal_valid, active_mask, excluded_queries):
     """ArgKey fact resolution: targeted_lookup → unify → substitute remaining."""
     B, S, _ = goals.shape
     G = remaining.shape[2]
@@ -157,7 +156,7 @@ def _resolve_facts_argkey(goals, remaining, fact_index, facts_idx, enc, K_f,
     pad = enc.pad
     N = B * S
     flat_q = goals.reshape(N, 3)
-    flat_active = (active_mask & state_valid).reshape(N)
+    flat_active = (active_mask & goal_valid).reshape(N)
 
     fact_item_idx, fact_valid = fact_index.targeted_lookup(flat_q, K_f)
     F = facts_idx.shape[0]
@@ -174,18 +173,17 @@ def _resolve_facts_argkey(goals, remaining, fact_index, facts_idx, enc, K_f,
         match_excl = (fact_atoms == excl_flat).all(dim=-1)
         success = success & ~match_excl
 
-    subs_apply = subs.reshape(N * K_f, 2, 2)
     rem_exp = remaining.reshape(N, G, 3).unsqueeze(1).expand(-1, K_f, -1, -1).reshape(N * K_f, G, 3)
-    fact_goals = apply_substitutions(rem_exp, subs_apply, enc).view(B, S, K_f, G, 3)
-    fact_gbody = torch.zeros(B, S, K_f, max(M_g, 1), 3, dtype=torch.long, device=dev)
+    fact_goals = apply_substitutions(rem_exp, subs_flat, enc).view(B, S, K_f, G, 3)
+    fact_grounding_body = torch.zeros(B, S, K_f, max(M_g, 1), 3, dtype=torch.long, device=dev)
 
     pad_t = torch.tensor(pad, dtype=torch.long, device=dev)
     fact_goals = torch.where(success.view(B, S, K_f, 1, 1), fact_goals, pad_t)
-    return fact_goals, fact_gbody, success.view(B, S, K_f), subs.view(B, S, K_f, 2, 2)
+    return fact_goals, fact_grounding_body, success.view(B, S, K_f), subs.view(B, S, K_f, 2, 2)
 
 
 def _resolve_facts_enumerate(goals, remaining, fact_index, enc,
-                             state_valid, active_mask, excluded_queries):
+                             goal_valid, active_mask, excluded_queries):
     """Enumerate fact resolution (Inverted/BlockSparse): build free-var subs."""
     B, S, _ = goals.shape
     G = remaining.shape[2]
@@ -198,7 +196,7 @@ def _resolve_facts_enumerate(goals, remaining, fact_index, enc,
     arg1_ground = arg1 <= c_no
     has_ground = arg0_ground | arg1_ground
     both_ground = arg0_ground & arg1_ground
-    is_active = state_valid & active_mask
+    is_active = goal_valid & active_mask
 
     use_arg0 = arg0_ground
     direction = torch.where(use_arg0, torch.zeros_like(arg0), torch.ones_like(arg0))
@@ -224,13 +222,13 @@ def _resolve_facts_enumerate(goals, remaining, fact_index, enc,
                               cands == other_arg.unsqueeze(2).expand(B, S, K_f),
                               torch.ones(B, S, K_f, dtype=torch.bool, device=dev))
     fact_success = (cand_mask & has_ground.unsqueeze(-1)
-                    & state_valid.unsqueeze(-1) & active_mask.unsqueeze(-1) & both_filter)
+                    & goal_valid.unsqueeze(-1) & active_mask.unsqueeze(-1) & both_filter)
 
     rem_exp = remaining.unsqueeze(2).expand(B, S, K_f, G, 3).reshape(N_f, G, 3)
     fact_goals = apply_substitutions(rem_exp, subs, enc).view(B, S, K_f, G, 3)
-    fact_gbody = torch.zeros(B, S, K_f, max(M_g, 1), 3, dtype=torch.long, device=dev)
+    fact_grounding_body = torch.zeros(B, S, K_f, max(M_g, 1), 3, dtype=torch.long, device=dev)
 
-    return fact_goals, fact_gbody, fact_success, subs.view(B, S, K_f, 2, 2)
+    return fact_goals, fact_grounding_body, fact_success, subs.view(B, S, K_f, 2, 2)
 
 
 def init_mgu(
@@ -240,24 +238,24 @@ def init_mgu(
     rule_index,
     max_total_groundings: int,
     *,
-    K_MAX: int,                          # required — caller (shell) owns the default
+    max_children: int,                   # the children cap K (shell owns the default)
     K_f_min_budget: int = 10,            # internal guard: min fact slots; not user config
-    max_derived_per_state: Optional[int] = None,
     max_groundings_per_rule: Optional[int] = None,
 ) -> dict:
-    """Compute MGU shape params (K, K_f, max_vars_per_rule, C) for sld/rtf.
+    """Compute MGU shape params (K, K_f, max_vars_per_rule, Y_q) for sld/rtf.
 
     S is NOT returned — the shell (BackwardGrounder.__init__) is the single owner."""
     import warnings
     K_uncapped = K_f * K_r if resolution == "rtf" else K_f + K_r
-    K = min(K_uncapped, K_MAX)
-    if max_derived_per_state is not None:
-        K = int(max_derived_per_state)
+    K = min(K_uncapped, max_children)
 
     if resolution == "sld":
-        K_f_budget = max(K - K_r, K_f_min_budget)
-        if K_r > K - K_f_min_budget:
-            raise ValueError(f"K_r={K_r} leaves fewer than {K_f_min_budget} fact slots in K={K}.")
+        # require room for min(K_f_min_budget, available facts) — never more fact slots
+        # than the KB actually has facts (so small KBs don't trip the guard).
+        min_facts = min(K_f_min_budget, K_f)
+        K_f_budget = max(K - K_r, min_facts)
+        if K_r > K - min_facts:
+            raise ValueError(f"K_r={K_r} leaves fewer than {min_facts} fact slots in K={K}.")
         if K_f > K_f_budget:
             warnings.warn(f"[init_mgu] K_f capped {K_f}->{K_f_budget} (K_r={K_r}, K={K}).", stacklevel=2)
             K_f = K_f_budget
@@ -266,10 +264,10 @@ def init_mgu(
 
     max_vars_per_rule = (int(rule_index.rule_lens_sorted.max().item()) + 2
                          if rule_index.rule_lens_sorted.numel() > 0 else 3)
-    C = (min(max_total_groundings, rule_index.max_rule_pairs * max(max_groundings_per_rule, 1))
-         if max_groundings_per_rule is not None else max_total_groundings)
+    Y_q = (min(max_total_groundings, rule_index.max_rule_pairs * max(max_groundings_per_rule, 1))
+           if max_groundings_per_rule is not None else max_total_groundings)
     return {"K": K, "K_f": K_f, "max_vars_per_rule": max_vars_per_rule,
-            "C": C, "max_fact_pairs_body": K_f}
+            "Y_q": Y_q, "max_fact_pairs_body": K_f}
 
 
 __all__ = ["resolve_facts", "resolve_rules", "empty_rule_results", "init_mgu"]

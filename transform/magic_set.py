@@ -34,19 +34,9 @@ from typing import List, Optional, Tuple
 import torch
 from torch import Tensor
 
-from grounder.core.request import GroundRequest
+from grounder.core import GroundRequest
 from grounder.data.kb import KB
 from grounder.data.rule_index import compile_rules
-
-
-def _real_num_predicates(kb: KB) -> int:
-    """Max predicate id across facts + rule heads + (non-pad) bodies, +1."""
-    pad = kb.padding_idx
-    ids = [kb.fact_index.facts_idx[:, 0], kb.rules_heads_idx[:, 0]]
-    body_preds = kb.rules_bodies_idx[..., 0].reshape(-1)
-    ids.append(body_preds[body_preds != pad])
-    allp = torch.cat([t for t in ids if t.numel() > 0])
-    return int(allp.max().item()) + 1
 
 
 class MagicSetTransform:
@@ -63,7 +53,7 @@ class MagicSetTransform:
 
         # Two fresh predicate ids beyond the base program's real range: the adorned
         # head ``query_pred^<adn>`` and its magic (demand) predicate ``magic^<adn>``.
-        base_P = _real_num_predicates(base_kb)
+        base_P = base_kb.real_num_predicates()
         self.adorned_pred = base_P              # query_pred^<adn>
         self.magic_pred = base_P + 1            # magic_query_pred^<adn>  (unary -> (mp,c,c))
 

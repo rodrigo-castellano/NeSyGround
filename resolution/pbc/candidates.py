@@ -1,7 +1,7 @@
 """PBC candidate generation: enumerate free-var bindings + fill body atoms.
 
 No MGU — bindings are pre-compiled (PbcRuleIndex). Two materializations:
-  ``*_dense`` — padded [B,K_r,G_r,M,3], static shape for compile/CUDA-graph
+  ``*_dense`` — padded [B,K_r,Y_r,M,3], static shape for compile/CUDA-graph
   ``*_flat``  — compact [T,...] via nonzero, eager zero-waste
 ``_gather_body_atoms`` / ``_cartesian_expand_one_fv`` are the shared inner ops.
 """
@@ -80,12 +80,12 @@ def _gather_body_atoms(source_m: Tensor, check_arg_m: Tensor,
 
 def fill_body_dense(source: Tensor, check_arg_source_q: Tensor,
                     body_preds_q: Tensor) -> Tensor:
-    """Dense fill: ``source [B,K_r,G_r,W]`` → ``[B,K_r,G_r,M,3]``."""
-    G_r = source.size(2)
+    """Dense fill: ``source [B,K_r,Y_r,W]`` → ``[B,K_r,Y_r,M,3]``."""
+    Y_r = source.size(2)
     M = body_preds_q.size(2)
     source_m = source.unsqueeze(3).expand(-1, -1, -1, M, -1)
-    check_m = check_arg_source_q.unsqueeze(2).expand(-1, -1, G_r, -1, -1)
-    preds_m = body_preds_q.unsqueeze(2).expand(-1, -1, G_r, -1)
+    check_m = check_arg_source_q.unsqueeze(2).expand(-1, -1, Y_r, -1, -1)
+    preds_m = body_preds_q.unsqueeze(2).expand(-1, -1, Y_r, -1)
     return _gather_body_atoms(source_m, check_m, preds_m)
 
 
@@ -99,7 +99,7 @@ def fill_body_flat(flat_source: Tensor, check_arg_source_flat: Tensor,
 
 # ── enumeration ──
 
-def enumerate_single_dense(B: int, K_r: int, G_r: int, query_subjs: Tensor,
+def enumerate_single_dense(B: int, K_r: int, Y_r: int, query_subjs: Tensor,
                     query_objs: Tensor, enum_pred_q: Tensor, enum_bound_q: Tensor,
                     enum_dir_q: Tensor, fact_index, cartesian_product: bool = False,
                     E: int = 0) -> Tuple[Tensor, Tensor]:
@@ -117,7 +117,7 @@ def enumerate_single_dense(B: int, K_r: int, G_r: int, query_subjs: Tensor,
     enum_bound_vals = source.gather(1, enum_bound_q)          # [B, K_r]
     candidates, cand_mask = fact_index.enumerate(
         enum_pred_q.reshape(-1), enum_bound_vals.reshape(-1), enum_dir_q.reshape(-1))
-    G_actual = min(G_r, candidates.size(1))
+    G_actual = min(Y_r, candidates.size(1))
     return (candidates[:, :G_actual].reshape(B, K_r, G_actual),
             cand_mask[:, :G_actual].reshape(B, K_r, G_actual))
 
@@ -257,7 +257,7 @@ def _determined_unknown_count(flat_source, ready_now, arg_src_dep, bpreds_dep,
 
 
 def enumerate_join_flat(B, K_r, query_subjs, query_objs, fv_pred_q, fv_bound_src_q,
-                        fv_dir_q, fv_valid_q, has_free_q, active_mask, fact_index,
+                        fv_dir_q, fv_valid_q, active_mask, fact_index,
                         V, fv_any_valid, arg_source_dep_q, body_preds_dep_q,
                         num_body_q, ready_after_q, width, w_is_capped):
     """L3 join: incremental free-var expansion with a width BRANCH PRUNER.
@@ -271,8 +271,7 @@ def enumerate_join_flat(B, K_r, query_subjs, query_objs, fv_pred_q, fv_bound_src
     """
     dev = query_subjs.device
     # seed: every (active query, valid rule slot) — flat row indices into [B*K_r].
-    seed_mask = active_mask & (has_free_q | ~has_free_q)   # all valid slots
-    seed = torch.nonzero(seed_mask, as_tuple=False)        # [T0, 2] (b, r)
+    seed = torch.nonzero(active_mask, as_tuple=False)      # [T0, 2] (b, r)
     n_idx, r_idx = seed[:, 0], seed[:, 1]
     if n_idx.numel() == 0:
         return (torch.empty(0, 2, dtype=torch.long, device=dev),

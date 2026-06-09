@@ -15,10 +15,17 @@ The old between-depth ``step_hook`` (KGEStepFilter) has no redesign analog — K
 filtering is now a ctor ``fact_hook``/``rule_hook`` applied at resolution time, not
 a step filter applied between depths. ``run_bfs`` raises if a ``step_hook`` is set
 rather than silently returning unfiltered numbers.
+
+Redesign adaptation: the grounder's single runtime verb is ``ground(request)``
+returning a ``BackwardResult`` (frozen). Provability per depth is read from the
+TREES tier (``result.completed_tree_firings.count``), so each call requests
+``OutputSpec({PROOF_STATE, TREES})``. Depth is truncated by rebuilding the grounder
+over the same KB with a depth-``d`` resolution (depth lives ON the resolution).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
@@ -26,7 +33,8 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from torch import Tensor
 
-from grounder.grounder.backward import BackwardGrounder
+from grounder.api.backward import BackwardGrounder
+from grounder.core import GroundRequest, OutputSpec, Tier
 
 
 @dataclass
@@ -52,14 +60,18 @@ class BatchBFSStats:
 
 
 def _truncate(grounder: BackwardGrounder, depth: int) -> BackwardGrounder:
-    """Rebuild a plain BackwardGrounder over the same KB with ``depth`` and
-    evidence on (needed for per-query provability). ``_ctor_kwargs`` is captured
-    by the base ctor for every grounder, so fact/rule hooks + standardization are
-    preserved; only Python-level subclass method overrides are dropped (no
-    run_bfs caller relies on those — RLGrounder is depth-1 RL-only)."""
-    kwargs = dict(getattr(grounder, "_ctor_kwargs", {}))
-    kwargs.update(depth=depth, collect_evidence=True)
-    return BackwardGrounder(grounder.kb, **kwargs)
+    """Rebuild a BackwardGrounder over the same KB with the resolution truncated to
+    ``depth``. ``grounder._build`` holds the snapshotted ctor inputs (config, layout,
+    compile, chunk_size); depth lives ON the resolution, so we ``replace`` the
+    resolution's depth and rebuild with the otherwise-identical config. Fact/rule
+    hooks + standardization are preserved (they live on the config). The TREES tier
+    (needed for per-query provability) is requested per call via OutputSpec, not at
+    ctor time, so no collect_evidence ctor kwarg is needed."""
+    build = dict(grounder._build)
+    config = build["config"]
+    new_resolution = dataclasses.replace(config.resolution, depth=depth)
+    build["config"] = dataclasses.replace(config, resolution=new_resolution)
+    return BackwardGrounder(grounder.kb, **build)
 
 
 @torch.no_grad()
@@ -95,10 +107,13 @@ def run_bfs(
     depths = torch.full((N,), -1, dtype=torch.long, device=dev)
     t0 = time.time()
 
+    # The TREES tier carries per-query proof counts (completed_tree_firings.count).
+    spec = OutputSpec(frozenset({Tier.PROOF_STATE, Tier.TREES}))
+
     # One grounder per truncated depth (shared KB), reusing the passed grounder
-    # at d==D when it already carries evidence.
+    # at d==D (its resolution depth already equals D).
     per_depth = {
-        d: (grounder if (d == D and grounder.collect_evidence) else _truncate(grounder, d))
+        d: (grounder if d == D else _truncate(grounder, d))
         for d in range(1, D + 1)
     }
 
@@ -107,17 +122,20 @@ def run_bfs(
         bq = queries_idx[batch_start:batch_end]
         B = bq.shape[0]
         qmask = torch.ones(B, dtype=torch.bool, device=dev)
-        init_kw: dict = {}
-        if excluded_queries is not None:
-            init_kw["excluded_queries"] = excluded_queries[batch_start:batch_end]
+        excl = (excluded_queries[batch_start:batch_end]
+                if excluded_queries is not None else None)
         batch_depths = torch.full((B,), -1, dtype=torch.long, device=dev)
 
         for d in range(1, D + 1):
             if bool((batch_depths >= 0).all()):
                 break
-            out = per_depth[d](bq, qmask, **init_kw)
-            ev = out.evidence
-            proved = (ev.count > 0) if ev is not None else torch.zeros(B, dtype=torch.bool, device=dev)
+            request = GroundRequest(
+                queries=bq, query_mask=qmask, output_spec=spec,
+                excluded_queries=excl)
+            out = per_depth[d].ground(request)
+            ctf = out.completed_tree_firings
+            proved = (ctf.count > 0) if ctf is not None else torch.zeros(
+                B, dtype=torch.bool, device=dev)
             newly = proved & (batch_depths < 0)
             batch_depths[newly] = d
 

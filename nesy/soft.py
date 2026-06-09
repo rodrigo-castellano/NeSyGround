@@ -1,4 +1,4 @@
-"""Soft provability scorer — PostResolutionHook.
+"""Soft provability scorer — GroundingHook.
 
 Known atoms (facts or provable) -> score 1.0.
 Unknown atoms -> sigmoid(KGE score) or learned MLP.
@@ -18,7 +18,7 @@ from torch import Tensor
 
 from grounder.data.rule_index import compile_rules
 from grounder.filters import check_in_fp_global
-from grounder.forward.fc import run_forward_chaining
+from grounder.forward.router import run_forward_chaining
 
 
 class ProvabilityMLP(nn.Module):

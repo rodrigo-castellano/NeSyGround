@@ -18,7 +18,7 @@ import pytest
 import torch
 
 from grounder.data.kb import KB
-from grounder.errors import ConfigError, StrategyError
+from grounder.base.errors import ConfigError, StrategyError
 from grounder.execution.auto_select import auto_select
 from grounder.execution.capability import (
     COMPILED_DYNAMIC, COMPILED_STEP, EAGER, OUTER_REDUCE_OVERHEAD,
@@ -26,12 +26,12 @@ from grounder.execution.capability import (
 )
 from grounder.execution.cudagraph import detach_from_pool
 from grounder.execution.depth import DepthSelector
-from grounder.config import FCConfig, PBCConfig, RTFConfig, SLDConfig
-from grounder.factory import create_grounder, make_bcwd, make_grounder
-from grounder.glossary import COMPILE_BACKENDS, INTEGRATIONS
-from grounder.grounder.backward import BackwardGrounder
+from grounder.api.config import Backward, Forward, PBC, RTF, SLD
+from grounder.api.factory import make_grounder
+from grounder.vocab.glossary import COMPILE_BACKENDS, INTEGRATIONS
+from grounder.api.backward import BackwardGrounder
 from grounder.backward.plan import RunPlan
-from grounder.types import Layout, ProofState
+from grounder.base.types import GoalState, Layout
 
 _BUILD = Path(__file__).parent.parent
 _LIB_PY = [p for p in _BUILD.rglob("*.py")
@@ -76,7 +76,7 @@ def test_no_isinstance_on_tensor() -> None:
 
 
 def test_layout_values_match_vocab() -> None:
-    from grounder.glossary import LAYOUTS
+    from grounder.vocab.glossary import LAYOUTS
     assert {m.value for m in Layout} == set(LAYOUTS)
 
 
@@ -109,12 +109,12 @@ def test_compiled_dynamic_preset_legal_dense_only() -> None:
 
 def test_detach_from_pool_deep_clones() -> None:
     t = torch.zeros(2, 2)
-    ps = ProofState(proof_goals=t, state_valid=t, top_rule_idx=t)
+    ps = GoalState(goal_atoms=t, goal_valid=t, top_rule_idx=t)
     cloned = detach_from_pool((t, [t], {"a": t}, ps))
     assert cloned[0] is not t and torch.equal(cloned[0], t)
     assert cloned[1][0] is not t
     assert cloned[2]["a"] is not t
-    assert isinstance(cloned[3], ProofState) and cloned[3].proof_goals is not t
+    assert isinstance(cloned[3], GoalState) and cloned[3].goal_atoms is not t
 
 
 def test_strategy_validate_rejects_illegal_and_undeclared() -> None:
@@ -134,13 +134,13 @@ def test_strategy_validate_rejects_illegal_and_undeclared() -> None:
 def test_auto_select_returns_declared_cell() -> None:
     pbc = CapabilityRow(frozenset({Cell(Layout.FLAT, EAGER),
                                    Cell(Layout.DENSE, COMPILED_STEP)}))
-    assert auto_select(pbc, K_f=28, K_r=16, G_r=64, M=2, B=4).layout is Layout.FLAT
-    assert auto_select(pbc, K_f=3612, K_r=59, G_r=64, M=2, B=4) == Cell(Layout.DENSE, COMPILED_STEP)
+    assert auto_select(pbc, K_f=28, K_r=16, Y_r=64, M=2, B=4).layout is Layout.FLAT
+    assert auto_select(pbc, K_f=3612, K_r=59, Y_r=64, M=2, B=4) == Cell(Layout.DENSE, COMPILED_STEP)
     fwd = CapabilityRow(frozenset({Cell(Layout.SPARSE, EAGER)}))
-    assert auto_select(fwd, K_f=999, K_r=1, G_r=1, M=1, B=1).layout is Layout.SPARSE
+    assert auto_select(fwd, K_f=999, K_r=1, Y_r=1, M=1, B=1).layout is Layout.SPARSE
     sld = CapabilityRow(frozenset({Cell(Layout.DENSE, EAGER),
                                    Cell(Layout.DENSE, OUTER_REDUCE_OVERHEAD)}))
-    assert auto_select(sld, K_f=28, K_r=16, G_r=64, M=2, B=4) == Cell(Layout.DENSE, EAGER)
+    assert auto_select(sld, K_f=28, K_r=16, Y_r=64, M=2, B=4) == Cell(Layout.DENSE, EAGER)
 
 
 def _pbc_grounder(**knobs) -> BackwardGrounder:
@@ -150,7 +150,10 @@ def _pbc_grounder(**knobs) -> BackwardGrounder:
     L = torch.tensor([2])
     kb = KB(facts, H, B, L, constant_no=3, predicate_no=12,
             padding_idx=9, device=torch.device("cpu"))
-    return BackwardGrounder(kb, resolution="pbc", depth=2, **knobs)
+    # flat_intermediate=False exercises the auto-DENSE exec path these snapshot
+    # assertions target (the PBC config default is flat-intermediate=True).
+    return BackwardGrounder(kb, Backward(PBC(depth=2, width=1, flat_intermediate=False)),
+                            **knobs)
 
 
 def test_explicit_knobs_select_declared_cell() -> None:
@@ -177,8 +180,8 @@ def test_explicit_flat_compiled_rejected() -> None:
 
 
 def test_snapshot_lockstep_default_and_layout_knobs() -> None:
-    # Default ctor (knobs unset) -> auto path, byte-identical to today: eager FLAT cell,
-    # legacy flat_intermediate stays False, one chunk for the whole query batch.
+    # Default ctor (knobs unset) -> auto path: eager FLAT cell, flat_intermediate
+    # stays False (as configured), one chunk for the whole query batch.
     default = RunPlan.snapshot(_pbc_grounder())
     assert default.strategy.cell.compile.eager  # auto-downgraded to eager
     assert default.strategy.cell == Cell(Layout.FLAT, EAGER)
@@ -227,48 +230,43 @@ def _bc_kb() -> KB:
 
 def _bc_fingerprint(g: BackwardGrounder) -> tuple:
     """The resolved knobs that define a backward grounder's behavior."""
-    return (g.resolution, g.filter_mode, g.depth, g.width, g._w_last_depth,
-            g._all_anchors, g._flat_intermediate, g._collect_rule_groundings,
-            g.S, g.C, g.max_goals)
+    return (g.resolution, g.filter_mode, g.depth, g.width, g.w_last_depth,
+            g._all_anchors, g._flat_intermediate,
+            g.S, g.Y_q, g.max_goals)
 
 
 def test_make_grounder_dispatches_on_config_type() -> None:
     kb = _bc_kb()
-    sld = make_grounder(kb, SLDConfig(depth=2, max_total_groundings=4096),
-                        max_derived_per_state=64)
-    rtf = make_grounder(kb, RTFConfig(depth=2, max_total_groundings=4096),
-                        max_derived_per_state=64)
+    sld = make_grounder(kb, Backward(SLD(depth=2), max_groundings_per_query=4096,
+                                     max_children=64))
+    rtf = make_grounder(kb, Backward(RTF(depth=2), max_groundings_per_query=4096,
+                                     max_children=64))
     assert isinstance(sld, BackwardGrounder) and sld.resolution == "sld"
     assert rtf.resolution == "rtf"
-    assert make_grounder(kb, PBCConfig(depth=2, w=1, max_total_groundings=64)).resolution == "pbc"
-    from grounder.forward.grounder import ForwardGrounder
-    assert isinstance(make_grounder(kb, FCConfig(depth=3)), ForwardGrounder)
+    assert make_grounder(kb, Backward(PBC(depth=2, width=1))).resolution == "pbc"
+    from grounder.api.forward import ForwardGrounder
+    assert isinstance(make_grounder(kb, Forward(depth=3)), ForwardGrounder)
 
 
 def test_make_grounder_pbc_forces_invariants() -> None:
-    # PBC forces all_anchors + (u=0) fp_batch filter — today's defaults, via config.
-    g = make_grounder(_bc_kb(), PBCConfig(depth=2, w=1, max_total_groundings=64))
+    # PBC forces all_anchors + (u=0) fp_batch filter — the defaults, via config.
+    g = make_grounder(_bc_kb(), Backward(PBC(depth=2, width=1)))
     assert g._all_anchors is True
     assert g.filter_mode == "fp_batch"
-    # u>0 -> none filter, derived by the ctor (config.filter() not forced).
-    g_u = make_grounder(_bc_kb(), PBCConfig(depth=2, w=1, u=1, max_total_groundings=64))
+    # u>0 -> none filter, derived by the ctor.
+    g_u = make_grounder(_bc_kb(), Backward(PBC(depth=2, width=1, u=1)))
     assert g_u.filter_mode == "none"
 
 
 def test_construction_paths_equivalent() -> None:
-    """type-string create_grounder, make_bcwd, and direct PBCConfig produce the
+    """make_grounder and the direct config-driven BackwardGrounder ctor produce the
     same resolved backward grounder (the BC/FC fork collapsed to one factory)."""
-    raw = dict(facts_idx=torch.tensor([[1, 1, 2], [1, 2, 3]]),
-               rule_heads=torch.tensor([[2, 4, 5]]),
-               rule_bodies=torch.tensor([[[1, 4, 6], [1, 6, 5]]]),
-               rule_lens=torch.tensor([2]), constant_no=3, predicate_no=12,
-               padding_idx=9, device=torch.device("cpu"))
-    via_str = create_grounder("bc12", **raw)
-    via_bcwd = make_bcwd(_bc_kb(), w=1, d=2, u=0)
-    via_cfg = make_grounder(_bc_kb(), PBCConfig(depth=2, w=1, u=0, flat_intermediate=True,
-                                                max_groundings_per_query=32,
-                                                max_total_groundings=64))
-    assert _bc_fingerprint(via_str) == _bc_fingerprint(via_bcwd) == _bc_fingerprint(via_cfg)
+    cfg = Backward(PBC(depth=2, width=1, u=0, flat_intermediate=True,
+                       max_groundings_per_rule=32),
+                   max_groundings_per_query=64)
+    via_factory = make_grounder(_bc_kb(), cfg)
+    via_ctor = BackwardGrounder(_bc_kb(), cfg)
+    assert _bc_fingerprint(via_factory) == _bc_fingerprint(via_ctor)
 
 
 def test_make_grounder_rejects_unknown_config() -> None:

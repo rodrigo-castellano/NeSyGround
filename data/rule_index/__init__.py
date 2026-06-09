@@ -18,7 +18,7 @@ from grounder.data.rule_index.pattern import (
     BINDING_FREE_VAR_OFFSET, BINDING_HEAD_VAR0, BINDING_HEAD_VAR1,
     PatternVariant, RulePattern, compile_rules,
 )
-from grounder.data.rule_index.pbc import BindingTables, PbcRuleIndex
+from grounder.data.rule_index.pbc import PbcRuleIndex
 from grounder.data.rule_index.sld import SldRuleIndex
 
 Resolution = Literal["sld", "rtf", "pbc"]
@@ -59,7 +59,7 @@ def create(
 
 __all__ = [
     "create", "Resolution",
-    "RuleIndex", "SldRuleIndex", "PbcRuleIndex", "BindingTables",
+    "RuleIndex", "SldRuleIndex", "PbcRuleIndex",
     "RulePattern", "PatternVariant", "compile_rules", "build_csr_offsets",
     "BINDING_HEAD_VAR0", "BINDING_HEAD_VAR1", "BINDING_FREE_VAR_OFFSET",
 ]

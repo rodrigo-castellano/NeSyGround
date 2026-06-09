@@ -1,4 +1,4 @@
-"""Flat-vs-dense A/B oracle — gates the Phase B flat SLD/RTF path against dense.
+"""Flat-vs-dense A/B oracle — gates the flat SLD/RTF path against dense.
 
 For {(family, rules_old, d3), (countries_s2, rules.txt, d2)} x {sld, rtf} builds
 TWO BackwardGrounders identical except the layout knob (dense vs flat) and asserts
@@ -16,9 +16,11 @@ from pathlib import Path
 
 import torch
 
+from grounder.api.config import Backward, RTF, SLD
 from grounder.data.dataset import KGDataset
-from grounder.grounder.backward import BackwardGrounder
-from grounder.tests.fingerprint_new import _canonical_fingerprint
+from grounder.api.backward import BackwardGrounder
+from grounder.tests.fingerprint_new import _ALL_TIERS, _canonical_fingerprint
+from grounder.core import GroundRequest
 
 _DATA_ROOT = Path.home() / "repos/data-swarm/main"
 _RULES_FILE = {"family": "rules_old.txt"}
@@ -34,11 +36,10 @@ _MATRIX = [
 
 
 def _build(kb, resolution, depth, layout):
-    return BackwardGrounder(
-        kb, resolution=resolution, filter="none", depth=depth,
-        max_total_groundings=4096, max_derived_per_state=64, max_states=256,
-        prune_facts=True, collect_evidence=True, collect_rule_groundings=True,
-        layout=layout, compile="off")
+    res = SLD(depth=depth) if resolution == "sld" else RTF(depth=depth)
+    config = Backward(res, filter="none", max_groundings_per_query=4096,
+                      max_children=64, max_states=256, prune_facts=True)
+    return BackwardGrounder(kb, config, layout=layout, compile="off")
 
 
 def _run(dataset, resolution, depth, layout):
@@ -50,9 +51,9 @@ def _run(dataset, resolution, depth, layout):
     qmask = torch.ones(queries.shape[0], dtype=torch.bool, device=queries.device)
     g = _build(kb, resolution, depth, layout)
     with torch.no_grad():
-        out = g(queries, qmask)
+        out = g.ground(GroundRequest(queries=queries, query_mask=qmask, output_spec=_ALL_TIERS))
     fp = _canonical_fingerprint(out)
-    ev = getattr(out, "evidence", None)
+    ev = getattr(out, "completed_tree_firings", None)
     count = ev.count.clone() if (ev is not None and ev.count is not None) else None
     return fp, count
 

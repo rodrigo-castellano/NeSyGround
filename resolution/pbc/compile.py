@@ -1,7 +1,7 @@
 """PBC compile — build-time setup: binding tables + shape budgets → PbcPlan.
 
 ``init_enum`` builds the ``PbcRuleIndex`` (binding analysis), the head-predicate
-mask, the per-fv "any rule uses this slot" list, and the K/G_r/K_v/C budgets; the
+mask, the per-fv "any rule uses this slot" list, and the K/Y_r/K_v/Y_q budgets; the
 shell registers the buffers + stores the scalars. ``build_plan`` then bundles a
 grounder's (registered, on-device) buffers + budgets into one frozen ``PbcPlan``
 so the resolve pipeline takes ONE object instead of ~25 loose tensors.
@@ -48,9 +48,9 @@ class PbcPlan:
     M: int                       # max body atoms
     V: int                       # max free vars
     E: int                       # entity count (cartesian_product space)
-    G_r: int                     # groundings per rule
+    Y_r: int                     # groundings per rule
     K: int                       # children-per-state cap
-    C: int                       # collected-groundings budget
+    Y_q: int                     # collected-groundings budget
     K_v: int                     # candidates per free var
     fv_any_valid: tuple          # per fv-slot: any rule uses it
     cartesian_product: bool      # all-entities ablation
@@ -66,17 +66,17 @@ def build_plan(grounder) -> PbcPlan:
         grounder.fv_enum_direction, grounder.fv_enum_valid,
         grounder.arg_source_dep, grounder.body_preds_dep)
     return PbcPlan(
-        tables=t, M=grounder.kb.M, V=grounder.V, E=grounder._E, G_r=grounder.G_r,
-        K=grounder.K, C=grounder.C, K_v=grounder.K_v,
+        tables=t, M=grounder.kb.M, V=grounder.V, E=grounder._E, Y_r=grounder.Y_r,
+        K=grounder.K, Y_q=grounder.Y_q, K_v=grounder.K_v,
         fv_any_valid=tuple(grounder._fv_any_valid),
-        cartesian_product=grounder._enum_cartesian)
+        cartesian_product=grounder._cartesian_product)
 
 
 def init_enum(
     rule_index, fact_index, facts_idx: Tensor, constant_no: int,
     num_rules: int, M: int, *,
     width: Optional[int], max_groundings_per_query: int, max_total_groundings: int,
-    device: torch.device,
+    device: torch.device, max_children: Optional[int] = None,
     cartesian_product: bool = False, all_anchors: bool = True,
     flat_intermediate: bool = False,
 ) -> Dict:
@@ -131,18 +131,19 @@ def init_enum(
     V = enum_ri.max_free_vars
     K_f = getattr(fact_index, "_max_facts_per_query", max_groundings_per_query)
     if cartesian_product:
-        G_r = E
+        Y_r = E
         K_v = E
     else:
-        G_r = max_groundings_per_query
-        K_v = min(K_f, G_r)
-    K = min(K_r * G_r, max_total_groundings)
-    C = min(max_total_groundings, K_r * G_r)   # distinct concept from K; equal by pbc formula
+        Y_r = max_groundings_per_query
+        K_v = min(K_f, Y_r)
+    children_cap = max_children if max_children is not None else max_total_groundings
+    K = min(K_r * Y_r, children_cap)           # children per state (capped by max_children)
+    Y_q = min(max_total_groundings, K_r * Y_r) # collected-groundings budget; ==K when max_children unset
 
     return {
         "buffers": buffers, "enum_rule_index": enum_ri,
-        "P": P, "E": E, "K_r": K_r, "K": K, "C": C,
-        "any_dual": False, "G_r": G_r, "cartesian_product": cartesian_product,
+        "P": P, "E": E, "K_r": K_r, "K": K, "Y_q": Y_q,
+        "Y_r": Y_r, "cartesian_product": cartesian_product,
         "V": V, "K_v": K_v, "fv_any_valid": fv_any_valid,
         "flat_intermediate": flat_intermediate,
     }

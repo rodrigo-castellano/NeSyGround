@@ -1,4 +1,4 @@
-"""Backward — the backward proof-search loop (port of OLD ``bc/``).
+"""Backward — the backward proof-search loop.
 
     run_backward = init_frontier → for d in range(depth): step → finalize
 

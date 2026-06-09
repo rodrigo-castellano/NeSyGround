@@ -20,8 +20,8 @@ class StrategyError(GrounderError):
 
 
 class CapMissError(GrounderError):
-    """G_r cap exceeded while PBCConfig.strict_cap is set. Default mode
-    flags+clamps instead of raising; this is opt-in strict mode only."""
+    """Y_r cap exceeded under opt-in strict mode. Default mode flags+clamps
+    instead of raising; this is opt-in strict mode only."""
 
 
 class ShapeContractError(GrounderError):

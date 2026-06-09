@@ -22,7 +22,7 @@ BIT-EXACT RECIPES (fingerprint-enforced):
 """
 from __future__ import annotations
 
-from typing import List, NamedTuple, Optional
+from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -32,22 +32,6 @@ from grounder.data.rule_index.base import RuleIndex, build_csr_offsets
 from grounder.data.rule_index.pattern import (
     BINDING_FREE_VAR_OFFSET, PatternVariant, RulePattern,
 )
-
-
-class BindingTables(NamedTuple):
-    """The pbc binding bundle the resolver/dedup read (all dep-ordered)."""
-    head_preds: Tensor          # [Rp]
-    body_preds: Tensor          # [Rp, M] dependency order
-    num_body_atoms: Tensor      # [Rp]
-    has_free: Tensor            # [Rp]
-    arg_source: Tensor          # [Rp, M, 2] dependency order
-    fv_enum_pred: Tensor        # [Rp, Fv]
-    fv_enum_bound_src: Tensor   # [Rp, Fv] dep-pos remapped
-    fv_enum_direction: Tensor   # [Rp, Fv]
-    fv_enum_valid: Tensor       # [Rp, Fv]
-    arg_source_dep: Tensor      # [Rp, M, 2] ORIGINAL body order, dep-pos fv ids
-    body_preds_dep: Tensor      # [Rp, M] ORIGINAL body order
-    variant_to_orig: Tensor     # [Rp] -> original (sorted) rule index
 
 
 class PbcRuleIndex(RuleIndex):
@@ -200,13 +184,5 @@ class PbcRuleIndex(RuleIndex):
         self.register_buffer("pred_rule_indices", pred_rule_indices)
         self.register_buffer("pred_rule_mask", pred_rule_mask)
 
-    def binding_tables(self) -> BindingTables:
-        """The binding bundle (the resolver/dedup never touch RulePattern)."""
-        return BindingTables(
-            self.head_preds, self.body_preds, self.num_body_atoms, self.has_free,
-            self.arg_source, self.fv_enum_pred, self.fv_enum_bound_src,
-            self.fv_enum_direction, self.fv_enum_valid,
-            self.arg_source_dep, self.body_preds_dep, self.variant_to_orig)
 
-
-__all__ = ["PbcRuleIndex", "BindingTables"]
+__all__ = ["PbcRuleIndex"]

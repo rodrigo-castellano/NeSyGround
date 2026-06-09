@@ -181,6 +181,15 @@ class KB(nn.Module):
         """The (sorted) fact triples, via the fact index."""
         return self.fact_index.facts_idx
 
+    def real_num_predicates(self) -> int:
+        """Max predicate id across facts + rule heads + (non-pad) rule bodies, +1 —
+        the TRUE range, ignoring the loader's inflated ``predicate_no`` padding."""
+        ids = [self.fact_index.facts_idx[:, 0], self.rules_heads_idx[:, 0]]
+        body_preds = self.rules_bodies_idx[..., 0].reshape(-1)
+        ids.append(body_preds[body_preds != self.padding_idx])
+        allp = torch.cat([t for t in ids if t.numel() > 0])
+        return int(allp.max().item()) + 1
+
     def _rule_signature(self, heads: Tensor, bodies: Tensor, lens: Tensor) -> str:
         index_predicate_no = max(self.predicate_no, self.padding_idx)
         return _rule_program_signature(

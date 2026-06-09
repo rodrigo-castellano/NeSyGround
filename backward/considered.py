@@ -1,16 +1,12 @@
-"""Per-step "considered" rule-application accumulator (PRIMARY for RuleGroundings).
+"""Per-step rule-application accumulator (PRIMARY for RuleGroundings).
 
-Ported from OLD ``bc/considered.py``. Captures every rule application the BFS
-proposes at each step, BEFORE pack/prune drops dead candidates. Firings are
-run-scoped (``RunState.firings``); ``capture_step`` appends one ``FiringSet``
-emission per step (query_idx lifted by chunk offset; finalize IGNORES it so the
-global concat+single finalize stays order-invariant). ``capture_step`` runs AFTER
-resolve, BEFORE pack. Bodies stored in canonical rule order. ``finalize`` builds
-the NEW ``RuleGroundings`` via injective-int64 atom dedup + (orig_rule, head,
-body) row dedup + binding-consistency filter + CSR sort.
-
-(Tabling / subgoal memo are default-OFF and not ported — they are not on the
-fingerprint path.)
+``capture_step`` runs AFTER resolve, BEFORE pack: it appends one ``FiringSet``
+emission of every rule application the BFS proposed (bodies in canonical rule
+order), capturing candidates before pack/prune drop them. Firings are run-scoped;
+query_idx is lifted by the chunk offset but finalize IGNORES it, so the global
+concat + single finalize is order-invariant. ``finalize`` builds the
+``RuleGroundings`` by: injective-int64 atom dedup → (orig_rule, head, body) row
+dedup → binding-consistency filter → CSR sort.
 """
 from __future__ import annotations
 
@@ -21,7 +17,7 @@ import torch
 from torch import Tensor
 
 from grounder.backward.state import FiringSet
-from grounder.types import FlatResolvedChildren, RuleGroundings
+from grounder.base.types import FlatResolvedChildren, RuleGroundings
 
 
 def _extract_considered_rows(plan, resolved, fr):
@@ -31,25 +27,23 @@ def _extract_considered_rows(plan, resolved, fr):
 
     if isinstance(resolved, FlatResolvedChildren):
         rule_idx = resolved.flat_rule_idx
-        body = resolved.flat_goals[:, :M, :]
+        body = resolved.flat_child_goals[:, :M, :]
         b_idx = resolved.flat_batch_idx
         s_idx = resolved.flat_state_idx
     else:
-        ridx = resolved.sub_rule_idx                  # [B, S, K_r]
-        success = resolved.rule_success               # [B, S, K_r]
-        goals = resolved.rule_goals[..., :M, :]       # [B, S, K_r, M, 3]
-        B, S, K_r = ridx.shape
-        dev = ridx.device
-        rule_idx = ridx.reshape(-1)
+        rule_idx = resolved.sub_rule_idx                  # [B, G, K_r]
+        success = resolved.rule_success               # [B, G, K_r]
+        goals = resolved.rule_child_goals[..., :M, :]  # [B, G, K_r, M, 3]
+        B, S, K_r = rule_idx.shape
+        dev = rule_idx.device
+        rule_idx = rule_idx.reshape(-1)
         body = goals.reshape(-1, M, 3)
         rule_idx = torch.where(success.reshape(-1), rule_idx,
                                torch.full_like(rule_idx, -1))
-        bi = (torch.arange(B, device=dev).view(B, 1, 1)
-              .expand(B, S, K_r).reshape(-1))
-        si = (torch.arange(S, device=dev).view(1, S, 1)
-              .expand(B, S, K_r).reshape(-1))
-        b_idx = bi
-        s_idx = si
+        b_idx = (torch.arange(B, device=dev).view(B, 1, 1)
+                 .expand(B, S, K_r).reshape(-1))
+        s_idx = (torch.arange(S, device=dev).view(1, S, 1)
+                 .expand(B, S, K_r).reshape(-1))
 
     rule_idx = rule_idx.long()
     active_atom = body[..., 0] != pad
@@ -60,7 +54,7 @@ def _extract_considered_rows(plan, resolved, fr):
     if v2o is not None:
         rule_idx = v2o[rule_idx.clamp(min=0)]
 
-    sel = fr.selected_goal  # always set when capture_step runs
+    sel = fr.selected_atom  # always set when capture_step runs
     head = sel[b_idx.long(), s_idx.long()]
 
     return (rule_idx[valid], head[valid], body[valid], b_idx[valid].long())
@@ -240,6 +234,9 @@ def pad_rule_groundings(
 ) -> RuleGroundings:
     """Pad each rule's firing slice to ``pad_per_rule_to`` rows and ``atom_table``
     to ``pad_atom_table_to`` rows (``run_bc(pad_outputs=True)``).
+
+    Re-added in the redesign (REDESIGN.md says pad_outputs was "eliminated") because
+    torch-ns's countries_s3 BC12/BC13 baseline cells need fixed-shape output.
 
     Gives the downstream compiled reasoner a fixed-shape input on cells whose
     flat-path output would otherwise oscillate per batch (countries_s3+BC13,

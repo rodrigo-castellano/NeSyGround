@@ -1,14 +1,14 @@
 """Backward proof-search driver — ``run_backward``.
 
-Ported from OLD ``bc/forward.py:forward_one_batch``, now chunk-aware: snapshots the
-grounder into a frozen ``RunPlan`` ONCE, then drives ``plan.strategy.iter_chunks``.
-Each chunk gets a rebatched ``plan.for_chunk(B_i)`` + its own ``Frontier`` (+ private
-``_Collected``) and depth loop; firings accumulate into the run-scoped ``RunState``
-(query_idx lifted by the global chunk offset at capture), trees fold in one
-``ProofTrees`` piece per chunk via ``with_chunk``. ``strategy.merge`` then stitches
-the per-chunk proof-state parts + threaded RunState via ``merge_finalize``.
-The per-step fn routes through the ONE compile seam (``strategy.wrap_step``);
-identity on eager cells, so default ChunkPolicy=one-chunk stays byte-identical.
+Chunk-aware: snapshots the grounder into a frozen ``RunPlan`` ONCE, then drives
+``plan.strategy.iter_chunks``. Each chunk gets a rebatched ``plan.for_chunk(B_i)``
++ its own ``Frontier`` (+ private ``_Collected``) and depth loop; firings
+accumulate into the run-scoped ``RunState`` (query_idx lifted by the global chunk
+offset at capture), trees fold in one ``ProofTrees`` piece per chunk via
+``with_chunk``. ``strategy.merge`` then stitches the per-chunk proof-state parts +
+threaded RunState via ``merge_finalize``. The per-step fn routes through the ONE
+compile seam (``strategy.wrap_step``); identity on eager cells, so the default
+ChunkPolicy=one-chunk runs the whole batch in a single pass.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from grounder.backward.finalize import build_proof_state, merge_finalize
 from grounder.backward.step import step
 from grounder.backward.plan import RunPlan
 from grounder.backward.state import ProofTrees, RunState
-from grounder.types import BackwardResult
+from grounder.core import BackwardResult
 
 
 def run_backward(grounder, queries: Tensor, query_mask: Tensor,
@@ -32,11 +32,9 @@ def run_backward(grounder, queries: Tensor, query_mask: Tensor,
     run = RunState.init(plan.output_spec)
 
     parts = []
-    for cq, cm, csh, _offset in plan.strategy.iter_chunks(
-            queries, query_mask, plan.shapes):
+    for cq, cm in plan.strategy.iter_chunks(queries, query_mask):
         cplan = plan.for_chunk(cq.shape[0])
-        fr, coll = init_frontier(cplan, cq, cm,
-                                 excluded_queries=excluded_queries, **init_kwargs)
+        fr, coll = init_frontier(cplan, cq, cm, **init_kwargs)
         step_fn = _make_step(cplan, excluded_queries)  # single compile seam (eager=identity)
         for d in range(cplan.depth):
             dsel = cplan.strategy.depth_selector(d, cplan.depth)
@@ -44,7 +42,7 @@ def run_backward(grounder, queries: Tensor, query_mask: Tensor,
         parts.append(build_proof_state(cplan, fr))
         run = emit_trees(run, coll, cq.shape[0])  # one ProofTrees piece + advance offset
 
-    return plan.strategy.merge(parts, run, plan.shapes, merge_finalize(plan))
+    return plan.strategy.merge(parts, run, merge_finalize(plan))
 
 
 def _make_step(plan, excluded_queries):
@@ -61,8 +59,8 @@ def emit_trees(run: RunState, coll, n_chunk: int) -> RunState:
     if run.trees is None or coll is None:
         return run.with_chunk(n_chunk=n_chunk)
     piece = ProofTrees.from_chunk(
-        coll.collected_body, coll.collected_ridx, coll.collected_head,
-        coll.collected_bcount, coll.collected_mask)
+        coll.collected_body, coll.collected_rule_idx, coll.collected_head,
+        coll.collected_body_count, coll.collected_mask)
     return run.with_chunk(trees=piece, n_chunk=n_chunk)
 
 

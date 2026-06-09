@@ -1,12 +1,12 @@
 """Prune known ground facts from proof goals (search-time filter).
 
-Ported from OLD ``filters/search/prune_facts.py``. Removes atoms from candidate
-states that are already known facts in the fact index (compressed-depth semantics
-when ``prune_facts=True``). Used by the engine postprocess step.
+Removes atoms from candidate states that are already known facts in the fact index
+(compressed-depth semantics when ``prune_facts=True``). Used by the engine
+postprocess step.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Optional
 
 import torch
 from torch import Tensor
@@ -16,15 +16,13 @@ from grounder.data.fact_index import fact_contains
 
 def prune_ground_facts(
     candidates: Tensor,         # [..., M, 3]
-    valid_mask: Tensor,         # [...]
     fact_hashes: Tensor,        # [F]
     pack_base: int,
     constant_no: int,
     padding_idx: int,
-    true_pred_idx: Optional[int] = None,
     excluded_queries: Optional[Tensor] = None,
-) -> Tuple[Tensor, Tensor, Tensor]:
-    """Remove known ground facts from candidates (fixed shape, vectorized)."""
+) -> Tensor:
+    """Remove known ground facts from candidates → pruned states (fixed shape)."""
     B, K, M, _ = candidates.shape
     pad = padding_idx
 
@@ -46,18 +44,10 @@ def prune_ground_facts(
         is_excluded_atom = (candidates == excl_exp).all(dim=-1) & ground_atoms
         is_fact = is_fact & ~is_excluded_atom
 
-    if true_pred_idx is not None:
-        is_true_pred = (preds == true_pred_idx)
-        is_fact = is_fact | is_true_pred
-
     keep_atom = valid_atom & ~is_fact
-    pruned_counts = keep_atom.sum(dim=-1)
-    is_proof = (pruned_counts == 0) & valid_mask
-
     pad_t = torch.tensor(pad, dtype=candidates.dtype, device=candidates.device)
     pruned_states = torch.where(keep_atom.unsqueeze(-1), candidates, pad_t)
-
-    return pruned_states, pruned_counts, is_proof
+    return pruned_states
 
 
 __all__ = ["prune_ground_facts"]

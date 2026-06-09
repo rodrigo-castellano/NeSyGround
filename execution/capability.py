@@ -17,8 +17,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import FrozenSet, Optional
 
-from grounder.errors import StrategyError
-from grounder.types import Layout
+from grounder.base.errors import StrategyError
+from grounder.base.types import Layout
 
 
 class Integration(StrEnum):

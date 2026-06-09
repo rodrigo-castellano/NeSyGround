@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Protocol, Tuple, runtime_checkable
 
-from grounder.core.request import GroundRequest
+from grounder.core import GroundRequest
 from grounder.data.kb import KB
 
 

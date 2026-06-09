@@ -35,9 +35,5 @@ class Encoding:
     def is_var(self, ids: Tensor) -> Tensor:          # [...] -> [...] bool
         return (ids >= self.E) & (ids != self.pad)
 
-    def var_base(self) -> int:
-        """First variable id ``E``."""
-        return self.E
-
 
 __all__ = ["Encoding"]

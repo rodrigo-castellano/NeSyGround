@@ -1,10 +1,10 @@
 """Per-depth proof step — SELECT → RESOLVE → PACK → POSTPROCESS(+sync).
 
-Ported from OLD ``bc/step.py`` (eager path only — the fingerprint runs CPU/eager).
-RESOLVE dispatches via the ``RESOLVERS`` registry keyed on ``plan.resolution``
-(sld/rtf/pbc) — a pure lookup returning the same tuples the old if/elif did. The
-considered ``capture_step`` runs AFTER resolve and BEFORE pack. Working state is a
-frozen ``Frontier`` (+ private ``_Collected``); each phase returns a functional update.
+Eager path (the fingerprint runs CPU/eager). RESOLVE dispatches via the
+``RESOLVERS`` registry keyed on ``plan.resolution`` (sld/rtf/pbc) — a pure lookup.
+The ``capture_step`` accumulator runs AFTER resolve and BEFORE pack. Working state
+is a frozen ``Frontier`` (+ private ``_Collected``); each phase returns a
+functional update.
 """
 from __future__ import annotations
 
@@ -19,23 +19,23 @@ from grounder.backward.pack import compact_atoms, pack_states, pack_states_flat
 from grounder.backward.postprocess import collect_groundings
 from grounder.backward.sync import sync_accumulated
 from grounder.filters.prune_facts import prune_ground_facts
-from grounder.grounder.registry import RESOLVERS
+from grounder.api.registry import RESOLVERS
 from grounder.resolution.api import ResolveRequest
 from grounder.backward.state import Frontier
-from grounder.types import FlatResolvedChildren
+from grounder.base.types import FlatResolvedChildren
 
 
-def capture_selected_goal(plan, fr: Frontier) -> Frontier:
-    """Snapshot the goal resolved at this depth (= head atom) for per-depth heads."""
+def capture_selected_atom(plan, fr: Frontier) -> Frontier:
+    """Snapshot the atom resolved at this depth (= head atom) for per-depth heads."""
     if plan.collect_evidence or plan.collect_rule_groundings:
-        return fr.replace(selected_goal=fr.proof_goals[:, :, 0, :].clone())
+        return fr.replace(selected_atom=fr.goal_atoms[:, :, 0, :].clone())
     return fr
 
 
 def step(plan, fr: Frontier, coll: Optional[_Collected], run, dsel,
          excluded_queries: Optional[Tensor] = None):
     """One proof step: SELECT → RESOLVE → PACK → POSTPROCESS."""
-    fr = capture_selected_goal(plan, fr)
+    fr = capture_selected_atom(plan, fr)
 
     goal_queries, remaining, active_mask = select(plan, fr)
 
@@ -51,12 +51,12 @@ def step(plan, fr: Frontier, coll: Optional[_Collected], run, dsel,
 
 
 def select(plan, fr: Frontier) -> Tuple[Tensor, Tensor, Tensor]:
-    """Extract first goal from each proof state."""
-    proof_goals = fr.proof_goals
-    active_mask = proof_goals[:, :, 0, 0] != plan.kb.padding_idx
-    queries = proof_goals[:, :, 0, :]
+    """Extract first atom from each goal."""
+    goal_atoms = fr.goal_atoms
+    active_mask = goal_atoms[:, :, 0, 0] != plan.kb.padding_idx
+    queries = goal_atoms[:, :, 0, :]
     queries = queries * active_mask.unsqueeze(-1).to(queries.dtype)
-    remaining = proof_goals.clone()
+    remaining = goal_atoms.clone()
     remaining[:, :, 0, :] = plan.kb.padding_idx
     return queries, remaining, active_mask
 
@@ -65,11 +65,11 @@ def resolve(plan, queries, remaining, fr: Frontier, active_mask, dsel,
             excluded_queries):
     """Dispatch via the Resolver registry → ResolvedChildren / FlatResolvedChildren.
 
-    Pure lookup: RESOLVERS[plan.resolution].resolve(req) returns the IDENTICAL
-    tuples the old if/elif did. Hooks ride the request (inert for pbc)."""
+    Pure lookup: RESOLVERS[plan.resolution].resolve(req) returns the resolved
+    children tuples. Hooks ride the request (inert for pbc)."""
     req = ResolveRequest(
         plan=plan, queries=queries, remaining=remaining,
-        state_valid=fr.state_valid, active_mask=active_mask, frontier=fr,
+        goal_valid=fr.goal_valid, active_mask=active_mask, frontier=fr,
         depth_selector=dsel, excluded_queries=excluded_queries,
         fact_hook=plan.fact_hook, rule_hook=plan.rule_hook)
     return RESOLVERS[plan.resolution].resolve(req)
@@ -93,22 +93,22 @@ def pack(plan, resolved, fr: Frontier) -> Tuple[Frontier, dict]:
             collect_evidence=plan.collect_evidence, M_rule=plan.kb.M)
 
     # next_var advances by the FIXED dense width on the sld/rtf flat path so the
-    # unbound-var labels match dense (enum-flat keeps the dynamic S_out advance).
+    # unbound-var labels match dense (enum-flat keeps the dynamic G_out advance).
     S_adv = plan.S if (isinstance(resolved, FlatResolvedChildren)
-                       and not subs_noop) else packed.proof_goals.shape[1]
+                       and not subs_noop) else packed.goal_atoms.shape[1]
     fr = fr.replace(
         grounding_body=packed.grounding_body,
-        proof_goals=packed.proof_goals,
-        top_rule_idx=packed.top_ridx,
-        state_valid=packed.state_valid,
+        goal_atoms=packed.goal_atoms,
+        top_rule_idx=packed.top_rule_idx,
+        goal_valid=packed.goal_valid,
         next_var=fr.next_var + S_adv * plan.max_vars_per_rule)
 
     sync = {
         "parent_map": packed.parent_map,
         "winning_subs": packed.winning_subs,
         "has_new_body": packed.has_new_body,
-        "parent_bcount": packed.body_count,
-        "current_ridx": packed.current_ridx,
+        "parent_body_count": packed.body_count,
+        "current_rule_idx": packed.current_rule_idx,
         "subs_noop": subs_noop,
     }
     return fr, sync
@@ -117,31 +117,31 @@ def pack(plan, resolved, fr: Frontier) -> Tuple[Frontier, dict]:
 def postprocess_goals(plan, fr: Frontier, excluded_queries) -> Frontier:
     """Optionally prune ground facts, then compact atoms."""
     if plan.prune_facts:
-        proof_goals, _, _ = prune_ground_facts(
-            fr.proof_goals, fr.state_valid,
+        goal_atoms = prune_ground_facts(
+            fr.goal_atoms,
             plan.kb.fact_index.fact_hashes, plan.kb.fact_index.pack_base,
             plan.kb.constant_no, plan.kb.padding_idx,
             excluded_queries=excluded_queries)
-        return fr.replace(proof_goals=compact_atoms(proof_goals, plan.kb.padding_idx))
-    return fr.replace(proof_goals=compact_atoms(fr.proof_goals, plan.kb.padding_idx))
+        return fr.replace(goal_atoms=compact_atoms(goal_atoms, plan.kb.padding_idx))
+    return fr.replace(goal_atoms=compact_atoms(fr.goal_atoms, plan.kb.padding_idx))
 
 
 def collect_groundings_step(plan, fr: Frontier, coll: _Collected) -> Tuple[Frontier, _Collected]:
     """Collect completed groundings into output buffer (coll non-None here)."""
     deactivate = (plan.collect_mode != "grounded")
     cb, cm, cr, sv, c_bc, c_hd = collect_groundings(
-        fr.accumulated_body, fr.proof_goals, fr.state_valid,
-        fr.ridx_per_depth, coll.collected_body, coll.collected_mask,
-        coll.collected_ridx, plan.kb.constant_no, plan.kb.padding_idx,
-        plan.C, body_count=fr.body_count,
-        collected_bcount=coll.collected_bcount, collect_mode=plan.collect_mode,
+        fr.accumulated_body, fr.goal_atoms, fr.goal_valid,
+        fr.rule_idx_per_depth, coll.collected_body, coll.collected_mask,
+        coll.collected_rule_idx, plan.kb.constant_no, plan.kb.padding_idx,
+        plan.Y_q, body_count=fr.body_count,
+        collected_body_count=coll.collected_body_count, collect_mode=plan.collect_mode,
         deactivate=deactivate, head_per_depth=fr.head_per_depth,
         collected_head=coll.collected_head,
         variant_to_orig=plan.variant_to_orig)
-    fr = fr.replace(state_valid=sv)
+    fr = fr.replace(goal_valid=sv)
     coll = coll._replace(
-        collected_body=cb, collected_mask=cm, collected_ridx=cr,
-        collected_bcount=c_bc,
+        collected_body=cb, collected_mask=cm, collected_rule_idx=cr,
+        collected_body_count=c_bc,
         collected_head=(c_hd if c_hd is not None else coll.collected_head))
     return fr, coll
 
@@ -151,10 +151,8 @@ def postprocess(plan, fr: Frontier, coll: Optional[_Collected], sync, dsel,
     """Prune goals + sync accumulated + (last-step clear) + collect groundings."""
     fr = postprocess_goals(plan, fr, excluded_queries)
     fr = sync_accumulated(plan, fr, sync, dsel)
-    if plan.w_last_depth is not None and plan.w_last_depth > 0:
-        if dsel.is_last:
-            fr = fr.replace(proof_goals=torch.full_like(fr.proof_goals,
-                                                        plan.kb.padding_idx))
+    if plan.w_last_depth is not None and plan.w_last_depth > 0 and dsel.is_last:
+        fr = fr.replace(goal_atoms=torch.full_like(fr.goal_atoms, plan.kb.padding_idx))
     if plan.collect_evidence:
         fr, coll = collect_groundings_step(plan, fr, coll)
     return fr, coll

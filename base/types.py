@@ -4,8 +4,8 @@
 dispatches on the value, never ``isinstance``). ``subs_noop`` lives only where it
 is determined: post-pack ``SyncParams`` and constant-True on
 ``FlatResolvedChildren`` — never on dense ``ResolvedChildren`` (sld/rtf subs are
-real there). No ``D==0`` legacy flat layout; ``CompletedTreeFirings`` carries
-``Shapes`` so every consumer preserves D/M.
+real there). ``CompletedTreeFirings`` carries ``Shapes`` so every consumer
+preserves D/M.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import NamedTuple, Optional
 import torch
 from torch import Tensor
 
-from grounder.shapes import Shapes
+from grounder.vocab.shapes import Shapes
 
 
 class Layout(StrEnum):
@@ -27,12 +27,12 @@ class Layout(StrEnum):
 
 # ── Output views (frozen, consumer-facing) ──
 @dataclass(frozen=True)
-class ProofState:
-    """Final proof-search state — the 'groundings' output tier (DpRL)."""
+class GoalState:
+    """Final proof-search goals — the 'groundings' output tier (DpRL)."""
 
-    proof_goals: Tensor          # [B, S, G, 3]
-    state_valid: Tensor          # [B, S]
-    top_rule_idx: Tensor         # [B, S]
+    goal_atoms: Tensor           # [B, G, L, 3]
+    goal_valid: Tensor           # [B, G]
+    top_rule_idx: Tensor         # [B, G]
     next_var: Optional[Tensor] = None   # [B]
 
 
@@ -43,42 +43,34 @@ class CompletedTreeFirings:
     ``RuleGroundings``; this completed-tree view undercounts ~3x and is the
     chunk-merge fallback. Carries ``Shapes`` so consumers preserve D/M."""
 
-    body: Tensor                 # [B, C, D, M, 3]
-    grounding_valid: Tensor      # [B, C]  (which of the C groundings are real)
+    body: Tensor                 # [B, Y_q, D, M, 3]
+    grounding_valid: Tensor      # [B, Y_q]  (which of the Y_q groundings are real)
     count: Tensor                # [B]
-    rule_idx: Tensor             # [B, C, D]
-    body_count: Tensor           # [B, C, D]
-    head: Tensor                 # [B, C, D, 3]
+    rule_idx: Tensor             # [B, Y_q, D]
+    body_count: Tensor           # [B, Y_q, D]
+    head: Tensor                 # [B, Y_q, D, 3]
     shapes: Shapes
 
     @property
-    def body_flat(self) -> Tensor:          # [B, C, D*M, 3]
-        B, C, D, M, _ = self.body.shape
-        return self.body.reshape(B, C, D * M, 3)
+    def body_flat(self) -> Tensor:          # [B, Y_q, D*M, 3]
+        B, Y_q, D, M, _ = self.body.shape
+        return self.body.reshape(B, Y_q, D * M, 3)
 
     @property
-    def body_atom_mask_flat(self) -> Tensor:  # [B, C, D*M]
-        B, C, D = self.body_count.shape
+    def body_atom_mask_flat(self) -> Tensor:  # [B, Y_q, D*M]
+        B, Y_q, D = self.body_count.shape
         M = self.body.shape[3]
         slot = torch.arange(M, device=self.body.device).view(1, 1, 1, M)
-        mask = slot < self.body_count.unsqueeze(-1)        # [B,C,D,M]
-        return mask.reshape(B, C, D * M)
+        mask = slot < self.body_count.unsqueeze(-1)        # [B,Y_q,D,M]
+        return mask.reshape(B, Y_q, D * M)
 
     @property
-    def tree_top_rule_idx(self) -> Tensor:  # [B, C]  (depth-0 rule of each tree)
+    def tree_top_rule_idx(self) -> Tensor:  # [B, Y_q]  (depth-0 rule of each tree)
         return self.rule_idx[:, :, 0]
 
     @property
-    def top_rule_idx(self) -> Tensor:       # one-window alias of tree_top_rule_idx
-        return self.tree_top_rule_idx
-
-    @property
-    def body_count_total(self) -> Tensor:   # [B, C]
+    def body_count_total(self) -> Tensor:   # [B, Y_q]
         return self.body_count.sum(dim=-1)
-
-
-# one-window back-compat alias (consumers import ProofEvidence)
-ProofEvidence = CompletedTreeFirings
 
 
 @dataclass(frozen=True)
@@ -125,78 +117,37 @@ class RuleGroundings:
         return int(self.rule_offsets[r]), int(self.rule_offsets[r + 1])
 
 
-@dataclass(frozen=True)
-class BackwardResult:
-    """The backward proof bundle — each field present iff its OutputSpec tier was
-    requested. ``kind`` + ``as_rule_groundings`` are attached in ``core/result.py``."""
-
-    state: ProofState
-    completed_tree_firings: Optional[CompletedTreeFirings] = None
-    rule_groundings: Optional[RuleGroundings] = None
-
-    @property
-    def evidence(self) -> Optional[CompletedTreeFirings]:
-        """One-window alias of ``completed_tree_firings`` (consumer ``.evidence``)."""
-        return self.completed_tree_firings
-
-
-# one-window back-compat alias (consumers import GrounderOutput)
-GrounderOutput = BackwardResult
-
-
 # ── Internal pipeline NamedTuples (torch.compile-safe; engine step seams) ──
 class ResolvedChildren(NamedTuple):
     layout: Layout              # value tag; pack reads children.layout
-    fact_goals: Tensor          # [B, S, K_f, G, 3]
-    fact_grounding_body: Tensor # [B, S, K_f, M, 3]
-    fact_success: Tensor        # [B, S, K_f]
-    rule_goals: Tensor          # [B, S, K_r, G, 3]
-    rule_grounding_body: Tensor # [B, S, K_r, M, 3]
-    rule_success: Tensor        # [B, S, K_r]
-    sub_rule_idx: Tensor        # [B, S, K_r]
-    fact_subs: Tensor           # [B, S, K_f, 2, 2]
-    rule_subs: Tensor           # [B, S, K_r, 2, 2]
+    fact_child_goals: Tensor    # [B, G, K_f, L, 3]
+    fact_grounding_body: Tensor # [B, G, K_f, M, 3]
+    fact_success: Tensor        # [B, G, K_f]
+    rule_child_goals: Tensor    # [B, G, K_r, L, 3]
+    rule_grounding_body: Tensor # [B, G, K_r, M, 3]
+    rule_success: Tensor        # [B, G, K_r]
+    sub_rule_idx: Tensor        # [B, G, K_r]
+    fact_subs: Tensor           # [B, G, K_f, 2, 2]
+    rule_subs: Tensor           # [B, G, K_r, 2, 2]
     # NO subs_noop: for sld/rtf it is a POST-pack property.
 
 
 class FlatResolvedChildren(NamedTuple):
     layout: Layout              # == Layout.FLAT
-    flat_goals: Tensor          # [T, G, 3]
+    flat_child_goals: Tensor    # [T, L, 3]
     flat_grounding_body: Tensor # [T, A, 3]
     flat_rule_idx: Tensor       # [T]
     flat_batch_idx: Tensor      # [T]
     flat_state_idx: Tensor      # [T]
     flat_subs: Tensor           # [T, 2, 2]
     flat_is_fact: Tensor        # [T] bool  True for fact rows, False for rule rows
-    flat_top_ridx: Tensor       # [T] long  parent's top_rule_idx (first/inherited split)
+    flat_top_rule_idx: Tensor       # [T] long  parent's top_rule_idx (first/inherited split)
     B: int
-    S: int
+    G: int
     subs_noop: bool             # constant True for enum-flat (identity subs)
 
 
-class PackedStates(NamedTuple):
-    grounding_body: Tensor      # [B, S_out, M, 3]  (S_out padded to Shapes.S on dense)
-    proof_goals: Tensor         # [B, S_out, G, 3]
-    top_rule_idx: Tensor        # [B, S_out]
-    state_valid: Tensor         # [B, S_out]
-    body_count: Tensor          # [B, S_out]
-    has_new_body: Tensor        # [B, S_out]
-    current_rule_idx: Tensor    # [B, S_out]
-    selected_goal: Tensor       # [B, S_out, 3]
-
-
-class SyncParams(NamedTuple):
-    parent_map: Tensor          # [B, S_out]
-    winning_subs: Tensor        # [B, S_out, 2, 2]
-    has_new_body: Tensor        # [B, S_out]
-    parent_body_count: Tensor   # [B, S_out, D]
-    current_rule_idx: Tensor    # [B, S_out]
-    current_head: Tensor        # [B, S_out, 3]
-    subs_noop: bool             # determined HERE (post-pack)
-
-
 __all__ = [
-    "Layout", "ProofState", "CompletedTreeFirings", "ProofEvidence",
-    "RuleGroundings", "BackwardResult", "GrounderOutput",
-    "ResolvedChildren", "FlatResolvedChildren", "PackedStates", "SyncParams",
+    "Layout", "GoalState", "CompletedTreeFirings", "RuleGroundings",
+    "ResolvedChildren", "FlatResolvedChildren",
 ]

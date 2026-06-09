@@ -12,7 +12,7 @@ from typing import Callable
 import torch
 
 from grounder.execution.capability import CompileSpec, Integration
-from grounder.shapes import Shapes
+from grounder.vocab.shapes import Shapes
 
 
 def _bump_recompile_limit() -> None:

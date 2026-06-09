@@ -43,7 +43,7 @@ from torch import Tensor
 from grounder.forward.spmm.matrices import (
     csr_local_hashes, build_csr_from_local_hashes, build_csr_and_transpose,
 )
-from grounder.forward.spmm.ops import (
+from grounder.forward.spmm.classify import (
     SpMMOp, SpMMRuleDesc, slot_pred, slots_for_op,
 )
 from grounder.forward.spmm.state import ClosureState

@@ -1,34 +1,29 @@
-"""grounder (redesign, staged under ``_build``) — public API.
+"""grounder — public API.
 
-After promotion (``_build/*`` → package root) these are the top-level
-``grounder.*`` names consumers import. Today: ``grounder.*``.
+The top-level ``grounder.*`` names consumers import:
 
-    from grounder import make_grounder, BackwardGrounder, create_grounder, make_bcwd, KB
+    from grounder import make_grounder, BackwardGrounder, KB
+    from grounder import Backward, Forward, PBC, SLD, RTF
+    g = make_grounder(kb, Backward(PBC(depth=2, width=1)))
 """
-from grounder.config import FCConfig, PBCConfig, RTFConfig, SLDConfig
+from grounder.api.config import Backward, Forward, PBC, RTF, SLD
 from grounder.data import KB, KGDataset, Encoding
-from grounder.factory import (
-    create_grounder, make_bcwd, make_grounder, parse_grounder_type,
-)
-from grounder.grounder import BackwardGrounder
-from grounder.types import (
-    BackwardResult, CompletedTreeFirings, GrounderOutput, ProofEvidence,
-    ProofState, RuleGroundings,
-)
+from grounder.api.factory import make_grounder
+from grounder.api import BackwardGrounder
+from grounder.core import BackwardResult
+from grounder.base.types import CompletedTreeFirings, GoalState, RuleGroundings
 
 __all__ = [
-    "make_grounder", "create_grounder", "make_bcwd", "parse_grounder_type",
+    "make_grounder",
     "BackwardGrounder",
-    "SLDConfig", "RTFConfig", "PBCConfig", "FCConfig",
+    "Backward", "Forward", "PBC", "SLD", "RTF",
     "KB", "KGDataset", "Encoding",
-    "BackwardResult", "CompletedTreeFirings", "ProofState", "RuleGroundings",
-    # one-window back-compat aliases
-    "GrounderOutput", "ProofEvidence",
+    "BackwardResult", "CompletedTreeFirings", "GoalState", "RuleGroundings",
 ]
 
 
 def __getattr__(name):
     if name == "ForwardGrounder":
-        from grounder.forward.grounder import ForwardGrounder
+        from grounder.api.forward import ForwardGrounder
         return ForwardGrounder
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

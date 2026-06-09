@@ -20,8 +20,8 @@ from grounder.execution.capability import (
 from grounder.execution.chunk_policy import ChunkPolicy
 from grounder.execution.compiler import Compiler
 from grounder.execution.depth import DepthSelector
-from grounder.shapes import Shapes
-from grounder.types import Layout
+from grounder.vocab.shapes import Shapes
+from grounder.base.types import Layout
 
 # Conservative default budget for the dense/flat enumeration peak when no explicit
 # chunk_size is given. Deliberately small: the static estimate under-counts the
@@ -44,7 +44,7 @@ class ExecStrategy:
 
     @staticmethod
     def auto(row: CapabilityRow, *, shapes: Shapes) -> "ExecStrategy":
-        cell = auto_select(row, K_f=shapes.K_f, K_r=shapes.K_r, G_r=shapes.G_r,
+        cell = auto_select(row, K_f=shapes.K_f, K_r=shapes.K_r, Y_r=shapes.Y_r,
                            M=shapes.M, B=shapes.B)
         return ExecStrategy(cell, ExecStrategy.default_chunk(shapes))
 
@@ -56,10 +56,6 @@ class ExecStrategy:
     # ── policy ──
     def layout(self) -> Layout:
         return self.cell.layout
-
-    def clones_between_steps(self) -> bool:
-        """CUDA-graph paths must clone step outputs out of the private pool."""
-        return self.cell.compile.uses_cudagraphs()
 
     def depth_selector(self, d: int, depth: int,
                        device: Optional[Any] = None) -> DepthSelector:
@@ -82,17 +78,14 @@ class ExecStrategy:
         return batch_fn
 
     # ── chunk mechanics ──
-    def iter_chunks(self, queries: Tensor, mask: Tensor, shapes: Shapes
-                    ) -> Iterator[Tuple[Tensor, Tensor, Shapes, int]]:
-        """Yield (chunk_queries, chunk_mask, chunk_shapes, global_query_offset)."""
-        n = queries.shape[0]
-        offset = 0
-        for sl in self.chunk.slices(n):
-            cq, cm = queries[sl], mask[sl]
-            yield cq, cm, shapes.with_batch(cq.shape[0]), offset
-            offset += cq.shape[0]
+    def iter_chunks(self, queries: Tensor, mask: Tensor
+                    ) -> Iterator[Tuple[Tensor, Tensor]]:
+        """Yield (chunk_queries, chunk_mask) per chunk (the loop rebatches its plan
+        via ``for_chunk`` and tracks the query offset in ``RunState``)."""
+        for sl in self.chunk.slices(queries.shape[0]):
+            yield queries[sl], mask[sl]
 
-    def merge(self, parts: Sequence[Any], run_state: Any, shapes: Shapes,
+    def merge(self, parts: Sequence[Any], run_state: Any,
               finalize_fn: Callable[[Sequence[Any], Any], Any]) -> Any:
         """Stitch chunk parts + threaded RunState into the final output. Delegates
         the grounding-semantics build to the engine's ``finalize_fn`` (this module
