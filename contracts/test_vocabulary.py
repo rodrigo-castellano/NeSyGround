@@ -37,7 +37,10 @@ _OUTPUTSPEC_BACKCOMPAT = frozenset({"groundings", "firings", "trees"})
 # ``test_shape_symbols_match_vocab``); the ``config`` module's dataclass fields are
 # owned by KNOBS (enforced by ``test_config_fields_registered``). Both have their
 # own vocabulary, so they are NOT scanned against FIELDS.
-_SKIP_FIELD_CLASSES = frozenset({"Shapes"})
+# Shapes owns the SHAPES vocab; config owns KNOBS; the analysis BFS diagnostics
+# (BFSResult/BatchBFSStats) are a separate metric vocabulary (branching factors,
+# frontier sizes) — diagnostic outputs, not grounding-pipeline fields.
+_SKIP_FIELD_CLASSES = frozenset({"Shapes", "BFSResult", "BatchBFSStats"})
 
 
 def _iter_package_modules():

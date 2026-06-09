@@ -194,8 +194,22 @@ class BackwardGrounder(nn.Module):
         self.output_spec = spec
         self.collect_evidence = spec.trees             # Tier.TREES requested
         self._collect_rule_groundings = spec.firings   # Tier.FIRINGS requested
-        return run_backward(self, request.queries, request.query_mask,
-                            excluded_queries=request.excluded_queries)
+        result = run_backward(self, request.queries, request.query_mask,
+                              excluded_queries=request.excluded_queries)
+        if spec.firings:
+            # Pool-iter reasoners gather pool[query_pool_idx] regardless of
+            # provability, so every query atom needs a slot + query_pool_idx set.
+            from dataclasses import replace as _replace
+            from grounder.backward.considered import populate_query_pool_idx
+            from grounder.base.types import RuleGroundings
+            rg = result.rule_groundings
+            if rg is None:
+                rg = RuleGroundings.empty(
+                    num_rules=self.kb.num_rules, M=self.kb.M,
+                    device=request.queries.device)
+            rg = populate_query_pool_idx(rg, request.queries, self.kb.padding_idx)
+            result = _replace(result, rule_groundings=rg)
+        return result
 
     def producible_tiers(self) -> "frozenset[Tier]":
         """BC can fill all three backward tiers."""
