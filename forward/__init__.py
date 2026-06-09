@@ -8,7 +8,7 @@ ported verbatim with repointed imports and gated by ``tests/fc_fingerprint.py``)
   router.py     — run_forward_chaining (per-rule router over FORWARD_METHODS)
   methods.py    — ForwardMethod seam (AXIS 3): SpmmMethod/StagedMethod + FORWARD_METHODS
   spmm/         — semi-naive sparse-matmul FC (the default ``method='spmm'``)
-  staged/       — staged ragged trie-join FC (FCDynamic); leapfrog.py = worst-case-optimal join
+  staged/       — staged ragged trie-join FC (FCDynamic); leapfrog.py = variable-elimination join
 
 The consumer-facing ``ForwardGrounder`` shell lives in ``grounder.api.forward``
 (sibling of ``grounder.api.backward``); the engine here is its impl.

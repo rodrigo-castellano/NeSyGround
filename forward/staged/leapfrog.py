@@ -1,12 +1,9 @@
-"""Leapfrog Triejoin (worst-case-optimal join) for forward chaining.
+"""Variable-elimination join for forward chaining (the ``join_algo='leapfrog'`` path).
 
-Veldhuizen 2014 / Generic-Join. A variable-elimination join whose output is
-AGM-bounded: where 3+ atoms share a variable (triangle / transitive shapes) the
-intermediate never goes Cartesian, so peak memory tracks the *output* not the
-per-stage ``|partial| × fan-out`` product the staged ragged join materialises.
-This targets the FC transitive-closure memory blow-up (e.g. wn18rr).
-
-ONE join drives both phases via a per-atom source selector ``anchor_j``:
+Processes the rule's variables in greedy most-shared-first order: per variable,
+seed its candidates from a tight atom (bound/constant other-arg, else smallest
+domain), then apply the other atoms binding it as fact-membership filters. ONE
+join drives both phases via a per-atom source selector ``anchor_j``:
 
   * step 0 (full join)       — ``anchor_j=None``: every atom reads base ∪ provable.
   * step t>0 (semi-naive)    — ``anchor_j=k``: ordered atom ``k`` reads only the
@@ -14,8 +11,19 @@ ONE join drives both phases via a per-atom source selector ``anchor_j``:
     this once per body atom as the Δ-anchor; the union over anchors is the
     semi-naive ΔT_r, and ``_filter_new`` drops already-known heads.
 
+Status (honest): produces the byte-identical closure to the staged ragged join
+(gated by tests/fc_fingerprint.py) but currently has NO memory or speed advantage
+over it — it expand-then-filters (materialising the same intermediates), so peak
+memory measures identical to staged on every workload tried, incl. a dense 3-body
+triangle. The name is aspirational: a true worst-case-optimal Leapfrog Triejoin
+would replace the per-variable expand-then-filter with a multi-way sorted-list
+INTERSECTION (AGM-bounded, never materialising the cross-product) — that core is
+NOT implemented; this is the variable-elimination skeleton it would build on.
+Opt-in (default ``join_algo='staged'``); kept as that foundation + a correctness
+cross-check.
+
 Mixed into ``FCDynamic`` (it reads engine state: ``self._pred_facts``,
-``self._base_ps_off``, ``self._fact_hashes``, …). Selected by ``join_algo='leapfrog'``.
+``self._base_ps_off``, ``self._fact_hashes``, …).
 """
 from __future__ import annotations
 
@@ -32,7 +40,9 @@ from grounder.forward.staged.joins import (
 
 
 class LeapfrogMixin:
-    """Worst-case-optimal join for FCDynamic (full join + semi-naive anchored term)."""
+    """Variable-elimination join for FCDynamic (full join + semi-naive anchored term).
+
+    Correct + byte-identical to staged; no WCO benefit yet (see module docstring)."""
 
     def _apply_rule_lftj(
         self, cr: RulePattern, ordered_bps: list,
@@ -45,13 +55,13 @@ class LeapfrogMixin:
         delta_po_off: Optional[Tensor] = None, delta_po_vals: Optional[Tensor] = None,
         delta_hashes: Optional[Tensor] = None,
     ) -> Optional[Tensor]:
-        """Leapfrog Triejoin over the rule body.
+        """Variable-elimination join over the rule body.
 
-        Variable-elimination order: most-shared variable first (Generic-Join
-        heuristic). For each variable v: seed its candidate set from a tight atom
-        (one whose other arg is bound / a constant, else the smallest domain),
-        then apply every other atom binding v as a fact-membership filter — the
-        survivors are the AGM-bounded join.
+        Variable order: most-shared variable first. For each variable v: seed its
+        candidate set from a tight atom (one whose other arg is bound / a constant,
+        else the smallest domain), then apply every other atom binding v as a
+        fact-membership filter — the survivors are the join result. (Expand-then-
+        filter, so the same intermediates as staged; no WCO bound — see module doc.)
 
         Per-atom source: the ordered atom ``anchor_j`` reads only the delta Δ (as
         iterator + membership); every other atom reads base ∪ provable (I).

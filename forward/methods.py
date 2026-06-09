@@ -8,10 +8,10 @@ these: the spmm WHOLE-SET fast path is gated by ``SpmmMethod.supports(rules)``
 to ``StagedMethod``.
 
 The JoinAlgo sub-axis ``{staged, chunked, leapfrog}`` lives INSIDE
-``StagedMethod`` (the FCDynamic ``join_algo`` knob); ``leapfrog`` is the
-worst-case-optimal join in ``staged/leapfrog.py``. The spmm IterationStrategy
-stays a SUB-strategy inside SpmmMethod (the ``mode`` knob on
-``run_forward_chaining_spmm``).
+``StagedMethod`` (the FCDynamic ``join_algo`` knob); ``leapfrog`` is a
+variable-elimination join in ``staged/leapfrog.py`` (same closure as staged, no
+WCO benefit yet). The spmm IterationStrategy stays a SUB-strategy inside
+SpmmMethod (the ``mode`` knob on ``run_forward_chaining_spmm``).
 """
 from __future__ import annotations
 

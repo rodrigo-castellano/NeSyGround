@@ -67,9 +67,10 @@ class FCDynamic(LeapfrogMixin, _StagesMixin, nn.Module):
             ``join_chunk_size``. Bounds peak memory per stage at the
             cost of more Python iterations. Same closure as
             ``'staged'`` (verified by smoke tests).
-          * ``'leapfrog'`` — Leapfrog Triejoin (worst-case-optimal join,
-            ``staged/leapfrog.py``). Variable-elimination join with
-            AGM-bounded intermediate; same closure as ``'staged'``.
+          * ``'leapfrog'`` — variable-elimination join (``staged/leapfrog.py``).
+            Same closure as ``'staged'``; currently NO perf/memory advantage
+            (expand-then-filter; the worst-case-optimal intersection core is
+            not yet implemented). Opt-in.
 
         ``join_chunk_size`` (only used by ``'chunked'``): rows per
         chunk in the partial-bindings slicer. ``0`` means
