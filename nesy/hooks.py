@@ -55,6 +55,21 @@ class ResolutionRuleHook(Protocol):
 
 
 @runtime_checkable
+class GuidedScorer(Protocol):
+    """Atom plausibility prior for KGE-guided grounding (``PBC.guided_topk``).
+
+    Called by the guided join path on GROUND NON-FACT atoms only — facts score
+    exactly 1.0 via the fact index and variable atoms are neutral, both handled
+    grounder-side (see ``resolution.pbc.candidates.GuidedSelect``). Must be
+    deterministic and is invoked under ``no_grad``.
+    """
+
+    def score_atoms(self, atoms: Tensor) -> Tensor:   # [N, 3] (p, a0, a1) → [N]
+        """Probability in (0, 1] per ground atom."""
+        ...
+
+
+@runtime_checkable
 class StepHook(Protocol):
     """After each STEP — filters/reranks proof states."""
 
@@ -92,6 +107,7 @@ class GroundingHook(Protocol):
 __all__ = [
     "ResolutionFactHook",
     "ResolutionRuleHook",
+    "GuidedScorer",
     "StepHook",
     "GroundingHook",
 ]

@@ -59,6 +59,9 @@ class PBC:
     max_groundings_per_rule: int = 32      # Y_r cap (per rule, per query)
     cartesian_product: bool = False        # all-entities ablation
     materialization: str = "cartesian"     # pbc layout: "cartesian" | "join" (L3)
+    guided_topk: Optional[int] = None      # KGE-guided beam width (None = exhaustive);
+    #                                        forces the join path; needs Backward.guided_scorer
+    guided_tnorm: str = "min"              # state-score aggregation: "min" | "product"
 
     def __post_init__(self) -> None:
         if self.depth < 1:
@@ -66,6 +69,11 @@ class PBC:
         if self.materialization not in ("cartesian", "join"):
             raise ConfigError(
                 f"materialization must be cartesian|join, got {self.materialization!r}")
+        if self.guided_topk is not None and self.guided_topk < 1:
+            raise ConfigError(f"guided_topk must be >= 1, got {self.guided_topk}")
+        if self.guided_tnorm not in ("min", "product"):
+            raise ConfigError(
+                f"guided_tnorm must be min|product, got {self.guided_tnorm!r}")
 
 
 Resolution = Union[SLD, RTF, PBC]
@@ -95,6 +103,7 @@ class Backward:
     hooks: Optional[List] = None
     fact_hook: object = None
     rule_hook: object = None
+    guided_scorer: object = None                # nesy.hooks.GuidedScorer (PBC.guided_topk)
 
     @property
     def depth(self) -> int:

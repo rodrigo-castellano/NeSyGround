@@ -42,6 +42,9 @@ def _validate(config: Backward, layout: str, compile: str) -> None:
     res = config.resolution
     if getattr(res, "materialization", "cartesian") == "join" and not isinstance(res, PBC):
         raise ConfigError("materialization='join' requires resolution='pbc'")
+    if getattr(res, "guided_topk", None) is not None and config.guided_scorer is None:
+        raise ConfigError(
+            "guided_topk requires Backward.guided_scorer (nesy.hooks.GuidedScorer)")
     if layout not in _LAYOUT:
         raise ConfigError(f"layout must be auto|dense|flat, got {layout!r}")
     if compile not in _COMPILE:
@@ -73,7 +76,10 @@ class BackwardGrounder(nn.Module):
         flat_intermediate = pbc.flat_intermediate if pbc else False
         materialization = pbc.materialization if pbc else "cartesian"
 
-        # ── materialization routing: "join" → L3 JoinResolver (pbc tables, flat-eager) ──
+        # ── materialization routing: "join" → L3 JoinResolver (pbc tables, flat-eager);
+        #    guided beam (KGE prior) needs the join's incremental per-fv expansion ──
+        if pbc is not None and pbc.guided_topk is not None:
+            materialization = "join"
         self._dispatch_resolution = "join" if materialization == "join" else self.resolution
         if materialization == "join":
             flat_intermediate, layout = True, "flat"
@@ -88,6 +94,12 @@ class BackwardGrounder(nn.Module):
         # ── nesy hooks (resolution + step/grounding injection points) ──
         self.hooks = list(config.hooks) if config.hooks else []
         self.fact_hook, self.rule_hook = config.fact_hook, config.rule_hook
+
+        # ── guided beam (KGE prior; join path only) ──
+        self.guided_topk = pbc.guided_topk if pbc else None
+        self.guided_tnorm = pbc.guided_tnorm if pbc else "min"
+        self.guided_scorer = config.guided_scorer
+        self.guided_stats = None      # GuidedStats census counters (attach post-ctor)
 
         # ── collection / output (which tiers + soundness filter) ──
         self._collect_mode = "terminal"

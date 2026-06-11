@@ -55,6 +55,10 @@ class RunPlan:
     variant_to_orig: Optional[Tensor]    # REFERENCE, not clone
     fact_hook: object
     rule_hook: object
+    guided_topk: Optional[int]           # KGE-guided beam width (join path; None = off)
+    guided_tnorm: str
+    guided_scorer: object                # GuidedScorer (REFERENCE)
+    guided_stats: object                 # GuidedStats census counters (REFERENCE; mutable)
 
     @staticmethod
     def snapshot(grounder) -> "RunPlan":
@@ -89,7 +93,11 @@ class RunPlan:
             standardize=grounder._standardize_fn is not None,
             standardize_fn=grounder._standardize_fn,
             variant_to_orig=getattr(grounder, "_variant_to_orig_t", None),
-            fact_hook=grounder.fact_hook, rule_hook=grounder.rule_hook)
+            fact_hook=grounder.fact_hook, rule_hook=grounder.rule_hook,
+            guided_topk=getattr(grounder, "guided_topk", None),
+            guided_tnorm=getattr(grounder, "guided_tnorm", "min"),
+            guided_scorer=getattr(grounder, "guided_scorer", None),
+            guided_stats=getattr(grounder, "guided_stats", None))
 
     @staticmethod
     def _resolve_strategy(grounder, shapes, is_pbc) -> ExecStrategy:

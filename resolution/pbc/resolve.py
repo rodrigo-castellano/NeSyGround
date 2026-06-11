@@ -359,13 +359,15 @@ class JoinMaterializer(FlatMaterializer):
     final ``apply_filters_flat`` (in .width) is untouched and the pruner removes
     only rows it too would reject, the survivor SET equals the flat path's.
 
-    ``set_prune_width(w_d)`` is called by ``resolve_step_join`` with the per-step
-    width (== the filter's, accounting for the last-step ``w_last_depth``)."""
+    ``set_step(w_d, d)`` is called by ``resolve_step_join`` with the per-step
+    width (== the filter's, accounting for the last-step ``w_last_depth``) and
+    the eager depth index ``d`` (join is eager-only)."""
 
     def __init__(self):
         self._prune_width = None   # int | 0-dim Tensor | None (set per step)
+        self._gsel = None          # GuidedSelect (GuidedMaterializer only)
 
-    def set_prune_width(self, w_d) -> None:
+    def set_step(self, w_d, d) -> None:
         self._prune_width = w_d
 
     def enumerate(self, work: _FlatWork, cl, plan, fact_index) -> Optional[_FlatCand]:
@@ -384,7 +386,7 @@ class JoinMaterializer(FlatMaterializer):
             fact_index, V=plan.V, fv_any_valid=plan.fv_any_valid,
             arg_source_dep_q=t.arg_source_dep[ai], body_preds_dep_q=t.body_preds_dep[ai],
             num_body_q=t.num_body_atoms[ai], ready_after_q=ready_after,
-            width=prune_w, w_is_capped=(prune_w is not None))
+            width=prune_w, w_is_capped=(prune_w is not None), guided=self._gsel)
         if flat_source.size(0) == 0:
             return None
         rule_global = ai[n_idx, r_idx]
@@ -393,12 +395,36 @@ class JoinMaterializer(FlatMaterializer):
                          t.num_body_atoms[rule_global])
 
 
+class GuidedMaterializer(JoinMaterializer):
+    """KGE-guided join (``PBC.guided_topk``) — the join loop + a per-state
+    binding beam + a per-query state beam, one scoring rule at both levels:
+    fact atoms 1.0 EXACTLY (index membership, never the KGE), ground unknowns
+    the consumer's ``GuidedScorer`` prior, variables/padding neutral. Rows whose
+    every determined atom is a fact are proof material and ride OUTSIDE the
+    budget — ``k`` rations speculation only, so found proofs are never evicted
+    and the proof set is monotone in depth. ``k=None`` + attached GuidedStats =
+    census mode: byte-identical survivors to Join, counters only."""
+
+    def __init__(self, k, tnorm, scorer, kb, stats=None):
+        super().__init__()
+        self._gsel = C.GuidedSelect(k, tnorm, scorer, kb.fact_index,
+                                    kb.constant_no, kb.padding_idx, stats)
+
+    def set_step(self, w_d, d) -> None:
+        super().set_step(w_d, d)
+        self._gsel.d = int(d)
+
+    def emit(self, body, mask, cand, cl, work: _FlatWork, inp: StepInputs, plan):
+        mask = self._gsel.state_beam(body, mask, cand, work, inp, plan.M)
+        return super().emit(body, mask, cand, cl, work, inp, plan)
+
+
 def resolve_step_join(inp: StepInputs, plan, fact_index, materializer: JoinMaterializer):
     """resolve_step for the join: identical pipeline, but feeds the per-step width
-    ``w_d`` to the materializer's in-join pruner before enumerate."""
+    ``w_d`` (+ eager depth) to the materializer's in-join pruner before enumerate."""
     w_d, hpm_d = depth_gate(inp.d, inp.depth, inp.width, inp.w_last_depth,
                             plan.tables.head_pred_mask, inp.is_last)
-    materializer.set_prune_width(w_d)
+    materializer.set_step(w_d, inp.d)
     work = materializer.prepare(inp, plan)
     if work is None:
         return materializer.empty(inp, plan)
@@ -455,13 +481,19 @@ class JoinResolver:
     def resolve(self, req):
         plan, fr, kb, dsel = req.plan, req.frontier, req.plan.kb, req.depth_selector
         pbc = plan.pbc
+        if plan.guided_topk is not None or plan.guided_stats is not None:
+            mat = GuidedMaterializer(plan.guided_topk, plan.guided_tnorm,
+                                     plan.guided_scorer, kb, plan.guided_stats)
+        else:
+            mat = JoinMaterializer()
         inp = StepInputs(
             req.queries, req.remaining, fr.grounding_body, req.goal_valid,
             req.active_mask, padding_idx=kb.padding_idx, d=dsel.d, depth=plan.depth,
             is_last=None, width=plan.width, w_last_depth=plan.w_last_depth,
             collect_evidence=plan.collect_evidence, dedup_goals=False)
-        return resolve_step_join(inp, pbc, kb.fact_index, JoinMaterializer())
+        return resolve_step_join(inp, pbc, kb.fact_index, mat)
 
 
 __all__ = ["StepInputs", "resolve_step", "resolve_step_join", "DenseMaterializer",
-           "FlatMaterializer", "JoinMaterializer", "PbcResolver", "JoinResolver"]
+           "FlatMaterializer", "JoinMaterializer", "GuidedMaterializer",
+           "PbcResolver", "JoinResolver"]
