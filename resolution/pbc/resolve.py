@@ -4,13 +4,14 @@ Fixed, shared pipeline:  depth_gate → prepare → cluster → enumerate → fi
 width → emit.  The dense and flat MATERIALIZERS implement the stages that differ
 by layout (chosen once per run — no hot-loop branching, each traces its own
 graph); ``cluster``/``depth_gate`` and the inner cores (`_gather_body_atoms`,
-`_cartesian_expand_one_fv`, the width reductions) are shared.
+the width reductions) are shared.
 
   DenseMaterializer — static padded [B,S,K,…]; compile/CUDA-graph; topk-caps to K.
   FlatMaterializer  — compact [T,…] via nonzero; eager, zero-waste; optional dedup_goals.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import NamedTuple, Optional
 
 import torch
@@ -103,55 +104,102 @@ class DenseMaterializer:
         return _DenseCand(source, t.check_arg_source[ai], body_preds_q, cmask, Y_r, num_body_q)
 
     def fill(self, cand: _DenseCand, cl, plan, fact_index, work: _DenseWork):
+        """Exists + query-exclusion per M-slice — the [N,K_r,Y_r,M,3] body tensor
+        is never materialized (emit re-gathers atoms for the K survivors only).
+        Returns ``(has_query_atom, exists, body_active)``; the first slot rides
+        the opaque ``body`` position of the resolve_step pipeline."""
         N, K_r, M, dev = work.q.size(0), cl.K_r, plan.M, work.q.device
-        body = C.fill_body_dense(cand.source, cand.check_arg, cand.body_preds)
-        exists = fact_index.exists(body.reshape(-1, 3)).view(N, K_r, cand.Y_r, M)
+        Y_r, W = cand.Y_r, cand.source.size(3)
+        q0 = work.q[:, 0].view(N, 1, 1)
+        q1 = work.q[:, 1].view(N, 1, 1)
+        q2 = work.q[:, 2].view(N, 1, 1)
         atom_idx = torch.arange(M, device=dev).view(1, 1, 1, M)
         body_active = atom_idx < cand.num_body_q.view(N, K_r, 1, 1)
-        body = body.masked_fill(~body_active.unsqueeze(-1), fact_index._padding_idx)
-        return body, exists, body_active
+        exists = torch.empty(N, K_r, Y_r, M, dtype=torch.bool, device=dev)
+        has_query_atom = torch.zeros(N, K_r, Y_r, dtype=torch.bool, device=dev)
+        for m in range(M):
+            i0 = (cand.check_arg[:, :, m, 0].clamp(max=W - 1)
+                  .view(N, K_r, 1, 1).expand(N, K_r, Y_r, 1))
+            i1 = (cand.check_arg[:, :, m, 1].clamp(max=W - 1)
+                  .view(N, K_r, 1, 1).expand(N, K_r, Y_r, 1))
+            arg0 = cand.source.gather(3, i0).squeeze(3)            # [N,K_r,Y_r]
+            arg1 = cand.source.gather(3, i1).squeeze(3)
+            preds = cand.body_preds[:, :, m].view(N, K_r, 1).expand(N, K_r, Y_r)
+            atom_m = torch.stack([preds, arg0, arg1], dim=-1)      # [N,K_r,Y_r,3]
+            exists[..., m] = fact_index.exists(atom_m.reshape(-1, 3)).view(N, K_r, Y_r)
+            # cycle exclusion: only ACTIVE slots count (matches the padded-body recipe).
+            has_query_atom |= ((preds == q0) & (arg0 == q1) & (arg1 == q2)
+                               & body_active[..., m])
+        return has_query_atom, exists, body_active
 
     def width(self, body, exists, body_active, cand: _DenseCand, cl, work, w_d, hpm_d, inp):
-        return apply_filters_dense(body, exists, body_active, cl.active_mask, cand.cmask,
-                                   work.q, cand.Y_r, w_d, hpm_d, is_last=inp.is_last)
+        # ``body`` carries fill's precomputed has_query_atom (see fill docstring).
+        return apply_filters_dense(body, exists, body_active, cand.body_preds,
+                                   cl.active_mask, cand.cmask, w_d, hpm_d,
+                                   is_last=inp.is_last)
 
     def emit(self, body, mask, cand: _DenseCand, cl, work: _DenseWork, inp: StepInputs, plan):
         B, S, K_r, M, dev = work.B, work.S, cl.K_r, plan.M, work.q.device
         N, G, pad = B * S, inp.remaining.shape[2], inp.padding_idx
-        G_use = body.size(2)
+        G_use = cand.Y_r
         K_total = K_r * G_use
-        body_flat = body.reshape(N, K_total, M, 3)
+        W = cand.source.size(3)
         success_flat = mask.reshape(N, K_total)
-        rule_idx_flat = cl.active_idx.unsqueeze(2).expand(-1, -1, G_use).reshape(N, K_total)
+        src1 = cand.source.reshape(N, K_total * W)         # view (source contiguous)
 
         K = plan.K
         if K_total > K:
             _, top = success_flat.to(torch.int8).topk(K, dim=1, largest=True, sorted=False)
-            body_flat = body_flat.gather(1, top.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, M, 3))
             success_flat = success_flat.gather(1, top)
-            rule_idx_flat = rule_idx_flat.gather(1, top)
+            r_slot = top // G_use
+            # expanded[:, j] == active_idx[:, j // G_use] — gather post-topk instead of
+            # materializing the [N, K_total] expand+reshape copy.
+            rule_idx_flat = cl.active_idx.gather(1, r_slot)
+            base = top * W
         else:
             K = K_total
+            rule_idx_flat = cl.active_idx.unsqueeze(2).expand(-1, -1, G_use).reshape(N, K_total)
+            r_slot = (C.arange_cached(K_total, dev) // G_use).view(1, K_total).expand(N, K_total)
+            base = (C.arange_cached(K_total, dev) * W).view(1, K_total).expand(N, K_total)
+        num_body_sel = cand.num_body_q.gather(1, r_slot)   # [N, K]
+        pad_t = torch.full((), pad, dtype=torch.long, device=dev)
 
-        body_flat = body_flat.reshape(B, S, K, M, 3)
         success_flat = success_flat.reshape(B, S, K)
         rule_idx_flat = rule_idx_flat.reshape(B, S, K)
 
-        rule_goals = torch.full((B, S, K, G, 3), pad, dtype=torch.long, device=dev)
-        rule_goals[:, :, :, :M, :] = body_flat
-        n_rem = min(G - M, G - 1)
-        if n_rem > 0:
-            rule_goals[:, :, :, M:M + n_rem, :] = \
-                inp.remaining[:, :, 1:1 + n_rem, :].unsqueeze(2).expand(-1, -1, K, -1, -1)
+        # body atoms materialize ONLY for the K emitted children, written straight
+        # into the output (== the old fill+masked_fill+topk-gather values).
+        # FUSED EMIT→PACK: only the BODY region of rule_child_goals is emitted
+        # ([B,S,K,M,3], NOT [B,S,K,G,3]); pack_states rebuilds the parent
+        # remaining-tail through a parents_s gather (see pack_states
+        # ``parent_goals``) — byte-identical outputs, one [B,S,K,…] tensor less.
+        # The pbc-dense rule_child_goals shape contract narrows
+        # [..,K_r,L,3] → [..,K_r,M,3] (noted in vocab.glossary + base.types).
+        G_emit = M
+        rule_goals = torch.full((B, S, K, G_emit, 3), pad, dtype=torch.long, device=dev)
+        rg = rule_goals.view(N, K, G_emit, 3)
+        for m in range(M):
+            act_m = num_body_sel > m                       # [N, K]
+            i0 = cand.check_arg[:, :, m, 0].clamp(max=W - 1).gather(1, r_slot)
+            i1 = cand.check_arg[:, :, m, 1].clamp(max=W - 1).gather(1, r_slot)
+            preds = cand.body_preds[:, :, m].gather(1, r_slot)
+            rg[:, :, m, 0] = torch.where(act_m, preds, pad_t)
+            rg[:, :, m, 1] = torch.where(act_m, src1.gather(1, base + i0), pad_t)
+            rg[:, :, m, 2] = torch.where(act_m, src1.gather(1, base + i1), pad_t)
 
         G_body = inp.grounding_body.shape[2]
+        # rule_grounding_body / rule_subs are DEAD at the only consumer (pack_states
+        # ignores *_grounding_body; pbc subs are constant pad) — zero-cost expand
+        # views keep the [B,S,K,…] field shapes without allocating.
         rule_grounding_body = (inp.grounding_body.unsqueeze(2).expand(-1, -1, K, -1, -1) if inp.collect_evidence
-                      else torch.zeros(B, S, K, G_body, 3, dtype=torch.long, device=dev))
+                      else torch.zeros(1, 1, 1, 1, 3, dtype=torch.long, device=dev)
+                                .expand(B, S, K, G_body, 3))
         z_goals = torch.full((B, S, 0, G, 3), pad, dtype=torch.long, device=dev)
         z_grounding_body = torch.zeros(B, S, 0, G_body, 3, dtype=torch.long, device=dev)
         z_succ = torch.zeros(B, S, 0, dtype=torch.bool, device=dev)
         z_subs = torch.full((B, S, 0, 2, 2), pad, dtype=torch.long, device=dev)
-        rule_subs = torch.full((B, S, K, 2, 2), pad, dtype=torch.long, device=dev)
+        rule_subs = (torch.full((1, 1, 1, 2, 2), pad, dtype=torch.long, device=dev)
+                     .expand(B, S, K, 2, 2))
         return ResolvedChildren(Layout.DENSE, z_goals, z_grounding_body, z_succ,
                                 rule_goals, rule_grounding_body, success_flat, rule_idx_flat, z_subs, rule_subs)
 
@@ -165,9 +213,20 @@ class _FlatWork(NamedTuple):
     flat_q: Tensor; q_preds: Tensor; q_valid: Tensor
     active_pos: Tensor; state_to_goal: Optional[Tensor]; B: int; S: int
 
-class _FlatCand(NamedTuple):
-    flat_source: Tensor; n_idx_eff: Tensor; r_idx: Tensor
-    rule_global_idx: Tensor; check_flat: Tensor; bpreds_flat: Tensor; nbody_flat: Tensor
+@dataclass(eq=False, slots=True)
+class _FlatCand:
+    """Mutable (unlike the dense NamedTuple) so ``fill`` can release the
+    fill-only tensors (``flat_source``/``check_flat``/``bpreds_flat`` — the
+    per-row gathers) the moment the body is built: the candidate object
+    outlives them through width+emit, and at production shapes the dead
+    fields are ~90 MB held across the fill-stage ``exists`` peak."""
+    flat_source: Optional[Tensor]
+    n_idx_eff: Tensor
+    r_idx: Tensor
+    rule_global_idx: Tensor
+    check_flat: Optional[Tensor]
+    bpreds_flat: Optional[Tensor]
+    nbody_flat: Tensor
 
 
 class FlatMaterializer:
@@ -205,10 +264,15 @@ class FlatMaterializer:
     def fill(self, cand: _FlatCand, cl, plan, fact_index, work: _FlatWork):
         M, dev = plan.M, work.flat_q.device
         body = C.fill_body_flat(cand.flat_source, cand.check_flat, cand.bpreds_flat)
+        # Fill-only inputs are dead from here on — release before the exists
+        # gather (the fill-stage transient peak) instead of after emit.
+        cand.flat_source = cand.check_flat = cand.bpreds_flat = None
         T = body.size(0)
         exists = fact_index.exists(body.reshape(-1, 3)).reshape(T, M)
         body_active = C.arange_cached(M, dev).unsqueeze(0) < cand.nbody_flat.unsqueeze(1)
-        body = body.masked_fill(~body_active.unsqueeze(-1), fact_index._padding_idx)
+        # In-place: body is the fresh fill_body_flat cat output (sole ref), so
+        # masking in place skips a second [T, M, 3] materialization.
+        body.masked_fill_(~body_active.unsqueeze(-1), fact_index._padding_idx)
         return body, exists, body_active
 
     def width(self, body, exists, body_active, cand: _FlatCand, cl, work, w_d, hpm_d, inp):
@@ -249,15 +313,25 @@ class FlatMaterializer:
         T_surv = surv_body.size(0)
         surv_n = work.active_pos[surv_n_eff]
         b_idx, s_idx = surv_n // S, surv_n % S
-        flat_goals = torch.full((T_surv, G, 3), pad, dtype=torch.long, device=dev)
-        flat_goals[:, :M, :] = surv_body
+        # same single-cat assembly as the dense emit (pad tail only if M == 0)
         n_rem = min(G - M, G - 1)
+        parts = [surv_body]
         if n_rem > 0:
-            flat_goals[:, M:M + n_rem, :] = inp.remaining[b_idx, s_idx, 1:1 + n_rem, :]
-        flat_grounding_body = torch.zeros(T_surv, G_body, 3, dtype=torch.long, device=dev)
-        flat_subs = torch.full((T_surv, 2, 2), pad, dtype=torch.long, device=dev)
-        flat_is_fact = torch.zeros(T_surv, dtype=torch.bool, device=dev)
-        flat_top_rule_idx = torch.zeros(T_surv, dtype=torch.long, device=dev)
+            parts.append(inp.remaining[b_idx, s_idx, 1:1 + n_rem, :])
+        tail = G - M - max(n_rem, 0)
+        if tail > 0:
+            parts.append(torch.full((T_surv, tail, 3), pad, dtype=torch.long, device=dev))
+        flat_goals = torch.cat(parts, dim=1) if len(parts) > 1 else surv_body
+        # Dead provenance on the enum path (subs_noop=True): pack_states_flat
+        # reads grounding_body/subs/is_fact/top ONLY on the sld/rtf
+        # (subs_noop=False) path and extract_rows never touches them — emit
+        # zero-stride expanded constants instead of [T, …] materializations.
+        flat_grounding_body = torch.zeros(1, G_body, 3, dtype=torch.long,
+                                          device=dev).expand(T_surv, -1, -1)
+        flat_subs = torch.full((1, 2, 2), pad, dtype=torch.long,
+                               device=dev).expand(T_surv, -1, -1)
+        flat_is_fact = torch.zeros(1, dtype=torch.bool, device=dev).expand(T_surv)
+        flat_top_rule_idx = torch.zeros(1, dtype=torch.long, device=dev).expand(T_surv)
         return FlatResolvedChildren(Layout.FLAT, flat_goals, flat_grounding_body, surv_rule,
                                     b_idx, s_idx, flat_subs, flat_is_fact, flat_top_rule_idx,
                                     B, S, True)
@@ -357,7 +431,11 @@ class PbcResolver:
         inp = StepInputs(
             req.queries, req.remaining, fr.grounding_body, req.goal_valid,
             req.active_mask, padding_idx=kb.padding_idx, d=dsel.d, depth=plan.depth,
-            is_last=None, width=plan.width, w_last_depth=plan.w_last_depth,
+            # The DepthSelector duality: eager → None (Python branch on int d
+            # in depth_gate); compiled → the 0-dim bool, so depth_gate takes
+            # its torch.where path instead of branching on a traced tensor.
+            is_last=(dsel.is_last if dsel.compiled else None),
+            width=plan.width, w_last_depth=plan.w_last_depth,
             collect_evidence=plan.collect_evidence, dedup_goals=False)
         return resolve_step(inp, pbc, kb.fact_index, mat)
 

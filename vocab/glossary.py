@@ -92,7 +92,7 @@ FIELDS: Mapping[str, str] = {
     # ── resolution children / pack / sync (engine seams) ──
     "fact_child_goals": "fact-child goals (atom-sets) [..,K_f,L,3]",
     "fact_grounding_body": "fact-child working body [..,K_f,M,3]",
-    "rule_child_goals": "rule-child goals (atom-sets) [..,K_r,L,3]",
+    "rule_child_goals": "rule-child goals (atom-sets) [..,K_r,L,3]; pbc-dense fused emit narrows to body-only [..,K_r,M,3] (pack_states rebuilds the parent tail)",
     "rule_grounding_body": "rule-child working body [..,K_r,M,3]",
     "flat_child_goals": "flat-path child goals (atom-sets) [T,L,3]",
     "flat_grounding_body": "flat-path working body [T,A,3]",

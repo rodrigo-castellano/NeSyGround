@@ -30,14 +30,17 @@ if TYPE_CHECKING:
 class Tier(StrEnum):
     """The BACKWARD output tiers."""
 
-    PROOF_STATE = "proof_state"   # always-on base (DpRL); GoalState
+    PROOF_STATE = "proof_state"   # default base (DpRL); GoalState — omit to skip final-frontier packing
     FIRINGS = "firings"           # RuleGroundings (torch-ns run_bc)
     TREES = "trees"               # completed-tree firings (probfol)
 
 
 @dataclass(frozen=True)
 class OutputSpec:
-    """Per-call BC request as a typed tier set; PROOF_STATE is the always-on base."""
+    """Per-call BC request as a typed tier set. PROOF_STATE is the DEFAULT base;
+    a FIRINGS-only spec legally omits it — the engine then skips the final
+    step's pack/postprocess and the GoalState build entirely (the firings are
+    captured at resolve time, before pack, so the output is unaffected)."""
 
     tiers: FrozenSet[Tier] = frozenset({Tier.PROOF_STATE})
 
@@ -84,7 +87,7 @@ class BackwardResult:
     """The backward proof bundle — each field present iff its OutputSpec tier was
     requested. Satisfies ``GroundResult`` (``kind`` + ``as_rule_groundings``)."""
 
-    goal_state: GoalState
+    goal_state: Optional[GoalState] = None
     completed_tree_firings: Optional[CompletedTreeFirings] = None
     rule_groundings: Optional[RuleGroundings] = None
     kind: ClassVar[str] = "backward"

@@ -14,7 +14,7 @@ import torch
 from torch import Tensor
 
 from grounder.backward.buffers import _Collected
-from grounder.backward.considered import capture_step
+from grounder.backward.considered import extract_rows
 from grounder.backward.pack import compact_atoms, pack_states, pack_states_flat
 from grounder.backward.postprocess import collect_groundings
 from grounder.backward.sync import sync_accumulated
@@ -26,15 +26,33 @@ from grounder.base.types import FlatResolvedChildren
 
 
 def capture_selected_atom(plan, fr: Frontier) -> Frontier:
-    """Snapshot the atom resolved at this depth (= head atom) for per-depth heads."""
+    """Snapshot the atom resolved at this depth (= head atom) for per-depth heads.
+
+    A view, not a clone: goal_atoms is never mutated in place (select writes
+    only its own clone on sld/rtf; pack/postprocess build fresh tensors) and
+    every consumer (extract_rows, sync_accumulated) copies via gather/indexing."""
     if plan.collect_evidence or plan.collect_rule_groundings:
-        return fr.replace(selected_atom=fr.goal_atoms[:, :, 0, :].clone())
+        return fr.replace(selected_atom=fr.goal_atoms[:, :, 0, :])
     return fr
 
 
-def step(plan, fr: Frontier, coll: Optional[_Collected], run, dsel,
-         excluded_queries: Optional[Tensor] = None):
-    """One proof step: SELECT → RESOLVE → PACK → POSTPROCESS."""
+def step_core(plan, fr: Frontier, coll: Optional[_Collected], dsel,
+              excluded_queries: Optional[Tensor] = None,
+              skip_tail: bool = False):
+    """Tensor-pure step body: SELECT → RESOLVE → (rows) → PACK → POSTPROCESS.
+
+    This is the COMPILE UNIT (``strategy.wrap_step`` wraps it): every op is a
+    tensor op, including the considered-rows extraction (fixed-shape sentinel
+    rows on the dense path). The Python-side ``RunState`` append happens in
+    the eager rim (``backward.loop``), outside any compiled graph.
+
+    ``skip_tail`` (a Python constant decided by the loop, never a tensor):
+    on the FINAL depth of a FIRINGS-only request the packed/postprocessed
+    frontier feeds nothing — no next step, no GoalState, no TREES collection —
+    so pack+postprocess are skipped. Firings are captured at resolve time,
+    before pack, so the rule_groundings output is byte-identical.
+    Returns ``(fr, coll, rows|None)``.
+    """
     fr = capture_selected_atom(plan, fr)
 
     goal_queries, remaining, active_mask = select(plan, fr)
@@ -42,11 +60,28 @@ def step(plan, fr: Frontier, coll: Optional[_Collected], run, dsel,
     resolved = resolve(plan, goal_queries, remaining, fr, active_mask, dsel,
                        excluded_queries)
 
-    if plan.collect_rule_groundings:
-        run = capture_step(plan, resolved, fr, run, run.chunk_query_offset)
+    rows = (extract_rows(plan, resolved, fr)
+            if plan.collect_rule_groundings else None)
+
+    if skip_tail:
+        return fr, coll, rows
 
     fr, sync = pack(plan, resolved, fr)
     fr, coll = postprocess(plan, fr, coll, sync, dsel, excluded_queries)
+    return fr, coll, rows
+
+
+def step(plan, fr: Frontier, coll: Optional[_Collected], run, dsel,
+         excluded_queries: Optional[Tensor] = None,
+         skip_tail: bool = False):
+    """One proof step (eager composition): core + the RunState firing append."""
+    fr, coll, rows = step_core(plan, fr, coll, dsel, excluded_queries, skip_tail)
+    if rows is not None:
+        from dataclasses import replace as _replace
+        from grounder.backward.state import FiringSet
+        emission = FiringSet.from_emission(
+            rows[0], rows[1], rows[2], rows[3] + run.chunk_query_offset)
+        run = _replace(run, firings=run.firings.extend(emission))
     return fr, coll, run
 
 
@@ -56,6 +91,12 @@ def select(plan, fr: Frontier) -> Tuple[Tensor, Tensor, Tensor]:
     active_mask = goal_atoms[:, :, 0, 0] != plan.kb.padding_idx
     queries = goal_atoms[:, :, 0, :]
     queries = queries * active_mask.unsqueeze(-1).to(queries.dtype)
+    if plan.pbc is not None:
+        # A PbcPlan is carried exactly by the pbc/join resolver family, whose
+        # materializers read only remaining[..., 1:, :] (+ its shape): slot 0
+        # is dead there, so skip the full-frontier clone + pad write.
+        # (sld/rtf substitute over the whole tensor incl. the padded slot 0.)
+        return queries, goal_atoms, active_mask
     remaining = goal_atoms.clone()
     remaining[:, :, 0, :] = plan.kb.padding_idx
     return queries, remaining, active_mask
@@ -90,7 +131,8 @@ def pack(plan, resolved, fr: Frontier) -> Tuple[Frontier, dict]:
         packed = pack_states(
             resolved, fr.top_rule_idx, fr.grounding_body,
             fr.body_count, plan.S, plan.kb.padding_idx,
-            collect_evidence=plan.collect_evidence, M_rule=plan.kb.M)
+            collect_evidence=plan.collect_evidence, M_rule=plan.kb.M,
+            parent_goals=fr.goal_atoms)
 
     # next_var advances by the FIXED dense width on the sld/rtf flat path so the
     # unbound-var labels match dense (enum-flat keeps the dynamic G_out advance).
@@ -115,14 +157,17 @@ def pack(plan, resolved, fr: Frontier) -> Tuple[Frontier, dict]:
 
 
 def postprocess_goals(plan, fr: Frontier, excluded_queries) -> Frontier:
-    """Optionally prune ground facts, then compact atoms."""
+    """Optionally prune ground facts, then compact atoms (fused: the prune
+    returns its keep mask and compact scatters straight from the original
+    goals — no intermediate hole-punched tensor)."""
     if plan.prune_facts:
-        goal_atoms = prune_ground_facts(
+        keep = prune_ground_facts(
             fr.goal_atoms,
             plan.kb.fact_index.fact_hashes, plan.kb.fact_index.pack_base,
             plan.kb.constant_no, plan.kb.padding_idx,
-            excluded_queries=excluded_queries)
-        return fr.replace(goal_atoms=compact_atoms(goal_atoms, plan.kb.padding_idx))
+            excluded_queries=excluded_queries, return_keep=True)
+        return fr.replace(goal_atoms=compact_atoms(
+            fr.goal_atoms, plan.kb.padding_idx, valid=keep))
     return fr.replace(goal_atoms=compact_atoms(fr.goal_atoms, plan.kb.padding_idx))
 
 

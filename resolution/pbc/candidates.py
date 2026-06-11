@@ -1,9 +1,12 @@
 """PBC candidate generation: enumerate free-var bindings + fill body atoms.
 
 No MGU — bindings are pre-compiled (PbcRuleIndex). Two materializations:
-  ``*_dense`` — padded [B,K_r,Y_r,M,3], static shape for compile/CUDA-graph
-  ``*_flat``  — compact [T,...] via nonzero, eager zero-waste
-``_gather_body_atoms`` / ``_cartesian_expand_one_fv`` are the shared inner ops.
+  ``*_dense`` — padded fixed-shape candidates for compile/CUDA-graph (the dense
+  body fill itself lives in ``resolve.DenseMaterializer`` — per-M-slice, no
+  [B,K_r,Y_r,M,3] tensor)
+  ``*_flat``  — compact [T,...] via nonzero, eager zero-waste (compacts early
+  and never materializes the [B,K_r,G] grid)
+``_gather_body_atoms`` is the flat path's inner op.
 """
 from __future__ import annotations
 
@@ -46,18 +49,29 @@ def arange_cached(n: int, device) -> Tensor:
     return t
 
 
-def cumcount_flat(keys: Tensor) -> Tensor:
+def cumcount_flat(keys: Tensor, assume_sorted: bool = False) -> Tensor:
     """0-based position within each group of equal keys (sort + cummax).
 
     [A,A,B,A,B,C] → [0,1,0,2,1,0]. Used by the flat pack for per-batch slots.
+    ``assume_sorted=True`` skips the stable argsort + scatter (the caller
+    guarantees ``keys`` is non-decreasing, so the sort is the identity) —
+    the pbc flat emit preserves the enumerate order ``(b, r, g)``, making
+    ``flat_batch_idx`` sorted by construction. SLD/RTF flat emits are NOT
+    sorted (facts-then-rules concat) and must use the default.
     """
     T = keys.size(0)
     if T == 0:
         return keys.new_empty(0, dtype=torch.long)
     dev = keys.device
+    running_idx = torch.arange(T, device=dev)
+    if assume_sorted:
+        ne = keys[1:] != keys[:-1]
+        group_change = torch.cat(
+            [torch.ones(1, dtype=torch.bool, device=dev), ne], dim=0)
+        group_starts = (running_idx * group_change).cummax(0).values
+        return running_idx - group_starts
     sort_perm = torch.argsort(keys, stable=True)
     sorted_keys = keys[sort_perm]
-    running_idx = torch.arange(T, device=dev)
     ne = sorted_keys[1:] != sorted_keys[:-1]
     group_change = torch.cat([torch.ones(1, dtype=torch.bool, device=dev), ne], dim=0)
     group_starts = (running_idx * group_change).cummax(0).values
@@ -71,22 +85,12 @@ def cumcount_flat(keys: Tensor) -> Tensor:
 def _gather_body_atoms(source_m: Tensor, check_arg_m: Tensor,
                        body_preds_m: Tensor) -> Tensor:
     """Shared gather (dense+flat): ``source_m [...,M,W]``, ``check_arg_m [...,M,2]``
-    (indexes W, clamped), ``body_preds_m [...,M]`` → ``[...,M,3]`` (pred,a0,a1)."""
+    (indexes W, clamped), ``body_preds_m [...,M]`` → ``[...,M,3]`` (pred,a0,a1).
+
+    Both args come from ONE 2-wide gather (not two single-column gathers)."""
     W = source_m.size(-1)
-    arg0 = source_m.gather(-1, check_arg_m[..., 0].clamp(max=W - 1).unsqueeze(-1)).squeeze(-1)
-    arg1 = source_m.gather(-1, check_arg_m[..., 1].clamp(max=W - 1).unsqueeze(-1)).squeeze(-1)
-    return torch.stack([body_preds_m, arg0, arg1], dim=-1)
-
-
-def fill_body_dense(source: Tensor, check_arg_source_q: Tensor,
-                    body_preds_q: Tensor) -> Tensor:
-    """Dense fill: ``source [B,K_r,Y_r,W]`` → ``[B,K_r,Y_r,M,3]``."""
-    Y_r = source.size(2)
-    M = body_preds_q.size(2)
-    source_m = source.unsqueeze(3).expand(-1, -1, -1, M, -1)
-    check_m = check_arg_source_q.unsqueeze(2).expand(-1, -1, Y_r, -1, -1)
-    preds_m = body_preds_q.unsqueeze(2).expand(-1, -1, Y_r, -1)
-    return _gather_body_atoms(source_m, check_m, preds_m)
+    args = source_m.gather(-1, check_arg_m.clamp(max=W - 1))         # [...,M,2]
+    return torch.cat([body_preds_m.unsqueeze(-1), args], dim=-1)
 
 
 def fill_body_flat(flat_source: Tensor, check_arg_source_flat: Tensor,
@@ -122,118 +126,174 @@ def enumerate_single_dense(B: int, K_r: int, Y_r: int, query_subjs: Tensor,
             cand_mask[:, :G_actual].reshape(B, K_r, G_actual))
 
 
-def _cartesian_expand_one_fv(B, K_r, query_subjs, query_objs, fact_index,
-                             ep, eb, ed, ev, all_cands, all_masks, G_current, k_cap):
-    """Shared inner step: enumerate one free var + interleaved Cartesian-expand.
-
-    ``k_cap`` caps K_use to K_v (dense) or None (flat, full K_f). Interleaved
-    layout lets a later topk pick diverse fv0 candidates before repeats.
-    """
-    qs_exp = query_subjs.view(B, 1, 1).expand(B, K_r, G_current)
-    qo_exp = query_objs.view(B, 1, 1).expand(B, K_r, G_current)
-    src = torch.stack([qs_exp, qo_exp] + all_cands, dim=3)    # [B,K_r,G_current,2+]
-    W_cur = src.size(3)
-    eb_idx = eb.clamp(max=W_cur - 1).view(B, K_r, 1, 1).expand(B, K_r, G_current, 1)
-    bound_vals = src.gather(3, eb_idx).squeeze(3)             # [B,K_r,G_current]
-
-    flat_pred = ep.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
-    flat_bound = bound_vals.reshape(-1)
-    flat_dir = ed.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
-    new_cands, new_mask = fact_index.enumerate(flat_pred, flat_bound, flat_dir)
-    K_fi = new_cands.size(1)
-    K_use = K_fi if k_cap is None else min(K_fi, k_cap)
-    new_cands = new_cands[:, :K_use].reshape(B, K_r, G_current, K_use)
-    new_mask = (new_mask[:, :K_use].reshape(B, K_r, G_current, K_use) & ev.view(B, K_r, 1, 1))
-
-    G_new = G_current * K_use
-    expanded_cands = [prev.unsqueeze(3).expand(B, K_r, G_current, K_use)
-                          .transpose(2, 3).reshape(B, K_r, G_new) for prev in all_cands]
-    expanded_masks = [prev.unsqueeze(3).expand(B, K_r, G_current, K_use)
-                          .transpose(2, 3).reshape(B, K_r, G_new) for prev in all_masks]
-    expanded_cands.append(new_cands.transpose(2, 3).reshape(B, K_r, G_new))
-    expanded_masks.append(new_mask.transpose(2, 3).reshape(B, K_r, G_new))
-    return expanded_cands, expanded_masks, G_new
-
-
 def enumerate_cartesian_dense(B, K_r, query_subjs, query_objs, fv_pred_q, fv_bound_q,
                               fv_dir_q, fv_valid_q, has_free_q, active_mask, fact_index,
                               K_v, V, G_cap=0, fv_any_valid=None,
                               check_arg_source_q=None, body_preds_q=None,
                               num_body_q=None, M=0) -> Tuple[Tensor, Tensor, int]:
     """Dense Cartesian enumerate of ≥2 free vars; topk-caps G to G_cap each step
-    (keeps a static shape). Returns ``(source[B,K_r,G,2+V], mask[B,K_r,G], G)``."""
+    (keeps a static shape). Returns ``(source[B,K_r,G,2+V], mask[B,K_r,G], G)``.
+
+    Memory shape (vs the former ``_cartesian_expand_one_fv`` list-of-columns
+    formulation): the per-fv mask list is folded into ONE running mask; the
+    bound column is selected virtually (no per-step ``[B,K_r,G,W]`` stack); and
+    at a capping step prior columns are gathered straight to G_cap via
+    interleave index arithmetic (``j = k*G_cur + g``) instead of first
+    expanding every column to ``G_cur*K_use``. Selection and survivors stay
+    byte-identical: the topk input mask equals the old per-column fold, and
+    ``expanded[j] == col[j % G_cur]``.
+    """
     dev = query_subjs.device
     if G_cap <= 0:
         G_cap = K_v
-    all_cands, all_masks, G_current = [], [], 1
+    cols: list = []                  # one entry per fv; None = skipped fv (all-zero col)
+    folded: Optional[Tensor] = None  # running AND of (mask_fi | ~valid_fi) at G_current
+    G_current = 1
+    zero = torch.zeros((), dtype=torch.long, device=dev)
 
     for fv_idx in range(V):
         if fv_any_valid is not None and not fv_any_valid[fv_idx]:
-            all_cands.append(torch.zeros(B, K_r, G_current, dtype=torch.long, device=dev))
-            all_masks.append(torch.ones(B, K_r, G_current, dtype=torch.bool, device=dev))
+            cols.append(None)        # mask term (ones | ~valid) is a no-op
             continue
-        all_cands, all_masks, G_current = _cartesian_expand_one_fv(
-            B, K_r, query_subjs, query_objs, fact_index,
-            fv_pred_q[:, :, fv_idx], fv_bound_q[:, :, fv_idx], fv_dir_q[:, :, fv_idx],
-            fv_valid_q[:, :, fv_idx], all_cands, all_masks, G_current, K_v)
-        if G_current > G_cap:
-            combined = torch.ones(B, K_r, G_current, dtype=torch.bool, device=dev)
-            for fi in range(len(all_masks)):
-                combined = combined & (all_masks[fi] | ~fv_valid_q[:, :, fi].unsqueeze(2))
-            _, top_idx = combined.to(torch.int8).topk(G_cap, dim=2, largest=True, sorted=False)
-            all_cands = [c.gather(2, top_idx) for c in all_cands]
-            all_masks = [m.to(torch.long).gather(2, top_idx).bool() for m in all_masks]
+        ep = fv_pred_q[:, :, fv_idx]
+        eb = fv_bound_q[:, :, fv_idx]
+        ed = fv_dir_q[:, :, fv_idx]
+        ev = fv_valid_q[:, :, fv_idx]
+
+        # bound value per cell: virtual select over [qs, qo, fv cols] (== the old
+        # stack+gather; eb selects exactly one column after the same clamp).
+        ebx = eb.clamp(max=2 + len(cols) - 1).unsqueeze(-1)     # [B,K_r,1]
+        bound = torch.where(ebx == 0, query_subjs.view(B, 1, 1),
+                            query_objs.view(B, 1, 1))
+        for i, c in enumerate(cols):
+            bound = torch.where(ebx == 2 + i, zero if c is None else c, bound)
+        bound = bound.expand(B, K_r, G_current)
+
+        flat_pred = ep.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
+        flat_dir = ed.view(B, K_r, 1).expand(B, K_r, G_current).reshape(-1)
+        new_cands, new_mask = fact_index.enumerate(flat_pred, bound.reshape(-1), flat_dir)
+        K_use = min(new_cands.size(1), K_v)
+        new_cands = new_cands[:, :K_use].reshape(B, K_r, G_current, K_use)
+        new_mask = (new_mask[:, :K_use].reshape(B, K_r, G_current, K_use)
+                    & ev.view(B, K_r, 1, 1))
+        term = new_mask | ~ev.view(B, K_r, 1, 1)                # (mask_t | ~valid_t)
+        folded4 = term if folded is None else (folded.unsqueeze(3) & term)
+        G_new = G_current * K_use
+
+        if G_new > G_cap:
+            # interleaved position j = k*G_current + g (new candidate k SLOWEST).
+            combined = folded4.transpose(2, 3).reshape(B, K_r, G_new)
+            cmb8 = combined.to(torch.int8)
+            _, top_idx = cmb8.topk(G_cap, dim=2, largest=True, sorted=False)
+            g_idx = top_idx % G_current
+            cols = [None if c is None else c.gather(2, g_idx) for c in cols]
+            cols.append(new_cands.reshape(B, K_r, G_current * K_use)
+                        .gather(2, g_idx * K_use + top_idx // G_current))
+            folded = cmb8.gather(2, top_idx).bool()
             G_current = G_cap
+        else:
+            cols = [None if c is None else
+                    c.unsqueeze(3).expand(B, K_r, G_current, K_use)
+                     .transpose(2, 3).reshape(B, K_r, G_new) for c in cols]
+            cols.append(new_cands.transpose(2, 3).reshape(B, K_r, G_new))
+            folded = folded4.transpose(2, 3).reshape(B, K_r, G_new)
+            G_current = G_new
 
     G_final = G_current
-    combined_mask = torch.ones(B, K_r, G_final, dtype=torch.bool, device=dev)
-    for fv_idx in range(V):
-        combined_mask = combined_mask & (all_masks[fv_idx] | ~fv_valid_q[:, :, fv_idx].unsqueeze(2))
-    combined_mask = combined_mask & has_free_q.unsqueeze(2)
+    if folded is None:
+        combined_mask = torch.ones(B, K_r, G_final, dtype=torch.bool, device=dev) \
+            & has_free_q.unsqueeze(2)
+    else:
+        combined_mask = folded & has_free_q.unsqueeze(2)
     combined_mask[:, :, 0] = combined_mask[:, :, 0] | (~has_free_q & active_mask)
 
-    qs_final = query_subjs.view(B, 1, 1).expand(B, K_r, G_final)
-    qo_final = query_objs.view(B, 1, 1).expand(B, K_r, G_final)
-    source = torch.stack([qs_final, qo_final] + all_cands, dim=3)
+    source = torch.empty(B, K_r, G_final, 2 + V, dtype=torch.long, device=dev)
+    source[..., 0] = query_subjs.view(B, 1, 1)
+    source[..., 1] = query_objs.view(B, 1, 1)
+    for i, c in enumerate(cols):
+        source[..., 2 + i] = zero if c is None else c
     return source, combined_mask, G_final
 
 
 def enumerate_cartesian_flat(B, K_r, query_subjs, query_objs, fv_pred_q, fv_bound_q,
                              fv_dir_q, fv_valid_q, has_free_q, active_mask, fact_index,
                              V, fv_any_valid=None) -> Tuple[Tensor, Tensor, Tensor]:
-    """Flat Cartesian enumerate (uncapped, full K_f) → compact rows via nonzero.
+    """Flat Cartesian enumerate, compact-early: only live rows hit the fact index.
+
+    Row contract is IDENTICAL (same rows, same order) to the dense formulation
+    — build [B,K_r,G] cands/masks via the interleaved Cartesian expansion
+    (see ``enumerate_cartesian_dense``) then ``nonzero(combined_mask)`` — but
+    rows are compacted BEFORE every
+    ``fact_index.enumerate`` call instead of once at the end:
+
+      * seed = nonzero(active_mask): inactive cells can never survive
+        (``combined &= active_mask``);
+      * per fv, keep only (row, slot) pairs that can still survive the final
+        mask: ``cmask`` slots when the rule uses the fv (term ``cmask | ~ev``),
+        ALL slots when it doesn't (dense term is all-ones there), and slot 0
+        only for no-free-var rules (the dense ``|=`` keeps exactly their g=0
+        cell). Each fv's mask term is fixed once its digit is chosen, so
+        dropping early never removes a final survivor.
+
+    The dense g index decomposes into digits ``g = Σ k_i · G_{i-1}`` (the
+    ``.transpose(2,3)`` interleave makes each new fv the MOST significant
+    digit); ``g_pos`` accumulates it per live row and a final argsort on the
+    unique composite (b, r, g) key restores exact ``nonzero`` row-major order.
 
     Returns ``(flat_source[T,2+V], b_idx[T], r_idx[T])`` for surviving cells.
     """
     dev = query_subjs.device
-    all_cands, all_masks, G_current = [], [], 1
+
+    def _empty() -> Tuple[Tensor, Tensor, Tensor]:
+        return (torch.empty(0, 2 + V, dtype=query_subjs.dtype, device=dev),
+                torch.empty(0, dtype=torch.long, device=dev),
+                torch.empty(0, dtype=torch.long, device=dev))
+
+    seed = torch.nonzero(active_mask, as_tuple=False)         # [T0, 2] (b, r)
+    b_idx, r_idx = seed[:, 0], seed[:, 1]
+    if b_idx.numel() == 0:
+        return _empty()
+
+    # single [T, W] source (one row-gather per fv, not one gather per column)
+    src = torch.stack([query_subjs[b_idx], query_objs[b_idx]], dim=1)
+    keep0 = ~has_free_q[b_idx, r_idx]   # no-free rows: only the g=0 chain survives
+    g_pos = torch.zeros(b_idx.size(0), dtype=torch.long, device=dev)
+    stride = 1                                                # = G before this fv
+    n_expanded = 0
+
     for fv_idx in range(V):
         if fv_any_valid is not None and not fv_any_valid[fv_idx]:
-            all_cands.append(torch.zeros(B, K_r, G_current, dtype=torch.long, device=dev))
-            all_masks.append(torch.ones(B, K_r, G_current, dtype=torch.bool, device=dev))
+            src = torch.cat([src, src.new_zeros(src.size(0), 1)], dim=1)
             continue
-        all_cands, all_masks, G_current = _cartesian_expand_one_fv(
-            B, K_r, query_subjs, query_objs, fact_index,
-            fv_pred_q[:, :, fv_idx], fv_bound_q[:, :, fv_idx], fv_dir_q[:, :, fv_idx],
-            fv_valid_q[:, :, fv_idx], all_cands, all_masks, G_current, None)
+        ep = fv_pred_q[b_idx, r_idx, fv_idx]
+        eb = fv_bound_q[b_idx, r_idx, fv_idx].clamp(max=src.size(1) - 1)
+        ed = fv_dir_q[b_idx, r_idx, fv_idx]
+        ev = fv_valid_q[b_idx, r_idx, fv_idx]
+        bound = src.gather(1, eb.unsqueeze(1)).squeeze(1)
+        cands, cmask = fact_index.enumerate(ep, bound, ed)    # [T, K_f]
+        K_f = cands.size(1)
+        live = cmask | ~ev.unsqueeze(1)                       # dense per-fv mask term
+        slot0 = arange_cached(K_f, dev) == 0
+        keep = torch.where(keep0.unsqueeze(1), slot0, live)
+        sel = torch.nonzero(keep, as_tuple=False)             # [T', 2] (row, slot)
+        row, slot = sel[:, 0], sel[:, 1]
+        if row.numel() == 0:
+            return _empty()
+        b_idx, r_idx, keep0 = b_idx[row], r_idx[row], keep0[row]
+        src = torch.cat([src[row], cands[row, slot].unsqueeze(1)], dim=1)
+        g_pos = g_pos[row] + slot * stride
+        stride *= K_f
+        n_expanded += 1
 
-    combined_mask: Optional[Tensor] = None
-    for fv_idx in range(V):
-        term = all_masks[fv_idx] | ~fv_valid_q[:, :, fv_idx].unsqueeze(2)
-        combined_mask = term if combined_mask is None else combined_mask & term
-    if combined_mask is None:
-        combined_mask = torch.ones(B, K_r, G_current, dtype=torch.bool, device=dev)
-    combined_mask = combined_mask & has_free_q.unsqueeze(2)
-    combined_mask[:, :, 0] = combined_mask[:, :, 0] | (~has_free_q & active_mask)
-    # Padded K_r slots must yield no candidates, else rule_idx-0 leaks spurious apps.
-    combined_mask = combined_mask & active_mask.unsqueeze(2)
-
-    valid_idx = torch.nonzero(combined_mask, as_tuple=False)  # [T, 3]
-    b_idx, r_idx, g_idx = valid_idx[:, 0], valid_idx[:, 1], valid_idx[:, 2]
-    flat_parts = [query_subjs[b_idx], query_objs[b_idx]]
-    for c in all_cands:
-        flat_parts.append(c[b_idx, r_idx, g_idx])
-    return torch.stack(flat_parts, dim=1), b_idx, r_idx
+    if n_expanded <= 1:
+        # Already in nonzero row-major order: each step's nonzero(keep) is
+        # lexicographic in (previous order, slot), so rows sit in
+        # (b, r, slot_1, …, slot_k) order; with k ≤ 1 expanded digits that
+        # EQUALS the (b, r, g) target — the composite keys are unique, so the
+        # argsort would be the identity. Skip the sort + 3 gathers.
+        return src, b_idx, r_idx
+    order = torch.argsort((b_idx * K_r + r_idx) * stride + g_pos)
+    return src[order], b_idx[order], r_idx[order]
 
 
 # ── L3 join enumeration (semantics-preserving width branch-pruning) ──
@@ -329,7 +389,7 @@ def enumerate_join_flat(B, K_r, query_subjs, query_objs, fv_pred_q, fv_bound_src
 
 __all__ = [
     "cluster", "ClusteredRules", "arange_cached", "cumcount_flat",
-    "fill_body_dense", "fill_body_flat",
+    "fill_body_flat",
     "enumerate_single_dense", "enumerate_cartesian_dense", "enumerate_cartesian_flat",
     "enumerate_join_flat",
 ]

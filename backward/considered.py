@@ -20,32 +20,49 @@ from grounder.backward.state import FiringSet
 from grounder.base.types import FlatResolvedChildren, RuleGroundings
 
 
-def _extract_considered_rows(plan, resolved, fr):
-    """``(resolved, fr) -> valid considered rows`` (body in canonical order)."""
+def extract_rows(plan, resolved, fr):
+    """``(resolved, fr) -> considered rows`` (body in canonical order).
+
+    FLAT resolved (eager-only): data-dependent ``[valid]`` compaction — the
+    returned rows are exactly the valid firings.
+    DENSE resolved: FIXED-SHAPE ``[B*G*K_r]`` rows with sentinels — invalid
+    rows carry ``rule_idx=-1`` and padding atoms, so the extraction is
+    tensor-pure (compilable under ``COMPILED_STEP``). ``finalize`` collapses
+    all sentinel rows into one dedup bucket and drops it
+    (``keep = u_rule < num_rules``); the padding atom adds at most one
+    ``atom_table`` row that no kept firing references.
+    """
     pad = plan.kb.padding_idx
     M = plan.kb.M
 
     if isinstance(resolved, FlatResolvedChildren):
-        rule_idx = resolved.flat_rule_idx
+        rule_idx = resolved.flat_rule_idx.long()
         body = resolved.flat_child_goals[:, :M, :]
         b_idx = resolved.flat_batch_idx
         s_idx = resolved.flat_state_idx
-    else:
-        rule_idx = resolved.sub_rule_idx                  # [B, G, K_r]
-        success = resolved.rule_success               # [B, G, K_r]
-        goals = resolved.rule_child_goals[..., :M, :]  # [B, G, K_r, M, 3]
-        B, S, K_r = rule_idx.shape
-        dev = rule_idx.device
-        rule_idx = rule_idx.reshape(-1)
-        body = goals.reshape(-1, M, 3)
-        rule_idx = torch.where(success.reshape(-1), rule_idx,
-                               torch.full_like(rule_idx, -1))
-        b_idx = (torch.arange(B, device=dev).view(B, 1, 1)
-                 .expand(B, S, K_r).reshape(-1))
-        s_idx = (torch.arange(S, device=dev).view(1, S, 1)
-                 .expand(B, S, K_r).reshape(-1))
+        active_atom = body[..., 0] != pad
+        has_body = active_atom.any(dim=-1)
+        valid = has_body & (rule_idx >= 0)
+        v2o = plan.variant_to_orig
+        if v2o is not None:
+            rule_idx = v2o[rule_idx.clamp(min=0)]
+        head = fr.selected_atom[b_idx.long(), s_idx.long()]
+        return (rule_idx[valid], head[valid], body[valid], b_idx[valid].long())
 
-    rule_idx = rule_idx.long()
+    rule_idx = resolved.sub_rule_idx                   # [B, G, K_r]
+    success = resolved.rule_success                    # [B, G, K_r]
+    goals = resolved.rule_child_goals[..., :M, :]      # [B, G, K_r, M, 3]
+    B, S, K_r = rule_idx.shape
+    dev = rule_idx.device
+    rule_idx = rule_idx.reshape(-1).long()
+    body = goals.reshape(-1, M, 3)
+    rule_idx = torch.where(success.reshape(-1), rule_idx,
+                           torch.full_like(rule_idx, -1))
+    b_idx = (torch.arange(B, device=dev).view(B, 1, 1)
+             .expand(B, S, K_r).reshape(-1))
+    s_idx = (torch.arange(S, device=dev).view(1, S, 1)
+             .expand(B, S, K_r).reshape(-1))
+
     active_atom = body[..., 0] != pad
     has_body = active_atom.any(dim=-1)
     valid = has_body & (rule_idx >= 0)
@@ -53,17 +70,23 @@ def _extract_considered_rows(plan, resolved, fr):
     v2o = plan.variant_to_orig
     if v2o is not None:
         rule_idx = v2o[rule_idx.clamp(min=0)]
+    rule_idx = torch.where(valid, rule_idx, torch.full_like(rule_idx, -1))
 
-    sel = fr.selected_atom  # always set when capture_step runs
-    head = sel[b_idx.long(), s_idx.long()]
-
-    return (rule_idx[valid], head[valid], body[valid], b_idx[valid].long())
+    head = fr.selected_atom[b_idx, s_idx]              # [T0, 3]
+    pad_row = torch.full_like(head, pad)
+    head = torch.where(valid.unsqueeze(-1), head, pad_row)
+    body = torch.where(valid.view(-1, 1, 1), body, torch.full_like(body, pad))
+    return (rule_idx, head, body, b_idx)
 
 
 def capture_step(plan, resolved, fr, run, query_offset: int):
-    """Append one ``FiringSet`` emission (rule_idx, head, body, global query_idx)."""
-    r_rule, r_head, r_body, r_bidx = _extract_considered_rows(
-        plan, resolved, fr)
+    """Append one ``FiringSet`` emission (rule_idx, head, body, global query_idx).
+
+    Eager-path composition (kept for direct callers/tests). The compiled path
+    runs :func:`extract_rows` inside the step core and appends in the eager
+    rim (``backward.loop``) — Python tuple appends can't live under fullgraph.
+    """
+    r_rule, r_head, r_body, r_bidx = extract_rows(plan, resolved, fr)
     emission = FiringSet.from_emission(r_rule, r_head, r_body,
                                        r_bidx + query_offset)
     return replace(run, firings=run.firings.extend(emission))
@@ -88,34 +111,49 @@ def finalize(plan, firings) -> Optional[RuleGroundings]:
         rule_idx < 0, torch.full_like(rule_idx, num_rules), rule_idx).long()
     all_atoms_flat = torch.cat(
         [head.long().unsqueeze(1), body.long()], dim=1).reshape(-1, 3)
-    abase = int(all_atoms_flat.max().item()) + 1  # T>=1, never empty
+    abase = all_atoms_flat.max() + 1  # 0-dim tensor; T>=1, never empty
     akey = (all_atoms_flat[:, 0] * abase + all_atoms_flat[:, 1]) * abase \
         + all_atoms_flat[:, 2]
     uniq_akey, ainv = torch.unique(akey, return_inverse=True)
     n_atoms = uniq_akey.size(0)
-    rep_at = torch.zeros(n_atoms, dtype=torch.long, device=akey.device)
-    rep_at.scatter_reduce_(
-        0, ainv, torch.arange(akey.size(0), device=akey.device),
-        reduce="amax", include_self=False)
-    atom_table = all_atoms_flat[rep_at]
+    # int(abase): scalar host read — free next to the dynamic-shape unique above.
+    if int(abase) ** 3 < (1 << 62):
+        # Key injective + no int64 wraparound: unique keys DECODE straight back
+        # to triples — no representative scatter_reduce + gather.
+        arest = uniq_akey // abase
+        atom_table = torch.stack([arest // abase, arest % abase, uniq_akey % abase], dim=1)
+    else:
+        # Wraparound possible (only mod-2^64 injectivity): pick representatives.
+        rep_at = torch.zeros(n_atoms, dtype=torch.long, device=akey.device)
+        rep_at.scatter_reduce_(
+            0, ainv, torch.arange(akey.size(0), device=akey.device),
+            reduce="amax", include_self=False)
+        atom_table = all_atoms_flat[rep_at]
     ainv = ainv.reshape(T, M + 1)
-    row = torch.cat([rule_idx_safe.unsqueeze(1), ainv], dim=1)
     A = max(int(num_rules) + 1, int(n_atoms))
     if A ** (M + 1) * (int(num_rules) + 1) < (1 << 62):
         key = rule_idx_safe.clone()
         for c in range(M + 1):
             key = key * A + ainv[:, c]
-        _, inv_row = torch.unique(key, return_inverse=True)
-        n_uniq = int(inv_row.max().item()) + 1  # T>=1, never empty
-        rep = torch.zeros(n_uniq, dtype=torch.long, device=row.device)
-        rep.scatter_reduce_(0, inv_row, torch.arange(T, device=row.device),
-                            reduce="amax", include_self=False)
-        uniq_row = row[rep]
+        uniq_keys = torch.unique(key)
+        # Decode the digits (base A; rule most significant, then ainv[:,0..M]).
+        # Digits < A by construction, so the decode is exact; sorted unique keys
+        # ⇒ u_rule comes out non-decreasing (CSR rule sort for free, below).
+        digs = []
+        rest = uniq_keys
+        for _ in range(M + 1):
+            digs.append(rest % A)
+            rest = rest // A
+        u_rule = rest
+        head_atom_idx = digs[M]                      # LSB-first: digs[M] = ainv[:,0]
+        body_atom_idx = (torch.stack(digs[:M][::-1], dim=1) if M > 0
+                         else uniq_keys.new_zeros((uniq_keys.size(0), 0)))
     else:
-        uniq_row, _ = torch.unique(row, dim=0, return_inverse=True)
-    u_rule = uniq_row[:, 0].long()
-    head_atom_idx = uniq_row[:, 1].long()
-    body_atom_idx = uniq_row[:, 2:].long()
+        row = torch.cat([rule_idx_safe.unsqueeze(1), ainv], dim=1)
+        uniq_row = torch.unique(row, dim=0)
+        u_rule = uniq_row[:, 0].long()
+        head_atom_idx = uniq_row[:, 1].long()
+        body_atom_idx = uniq_row[:, 2:].long()
     u_head = atom_table[head_atom_idx]
     u_body = atom_table[body_atom_idx]
 
@@ -130,21 +168,18 @@ def finalize(plan, firings) -> Optional[RuleGroundings]:
     guard_keep = pred_ok & bind_ok
 
     keep = (u_rule < num_rules) & guard_keep
-    u_rule_keep = u_rule[keep]
-    head_atom_keep = head_atom_idx[keep]
-    body_atom_keep = body_atom_idx[keep]
-
-    sort_idx = torch.argsort(u_rule_keep, stable=True)
-    rule_idx_sorted = u_rule_keep[sort_idx]
-    body_atom_sorted = body_atom_keep[sort_idx]
-    head_atom_sorted = head_atom_keep[sort_idx]
+    # u_rule is non-decreasing in BOTH branches (most-significant key digit /
+    # first lexicographic unique(dim=0) column) and keep preserves order, so
+    # the old stable argsort was the identity permutation — dropped.
+    rule_idx_sorted = u_rule[keep]
+    head_atom_sorted = head_atom_idx[keep]
+    body_atom_sorted = body_atom_idx[keep]
     sizes = torch.bincount(rule_idx_sorted, minlength=num_rules)
     rule_offsets = torch.zeros(
         num_rules + 1, dtype=torch.long, device=rule_idx_sorted.device)
     rule_offsets[1:] = torch.cumsum(sizes, dim=0)
 
-    body_atoms_gathered = atom_table[body_atom_sorted]
-    body_atom_valid = body_atoms_gathered[..., 0] != pad
+    body_atom_valid = (u_body[..., 0] != pad)[keep]
 
     return RuleGroundings(
         atom_table=atom_table.contiguous(),
@@ -162,7 +197,7 @@ def finalize(plan, firings) -> Optional[RuleGroundings]:
 def _atom_hash(atoms: Tensor) -> Tensor:
     """Injective int64 key for atom triples ``(p, a0, a1)`` (..., 3) -> (...)."""
     a = atoms.long()
-    base = int(a.max().item()) + 1 if a.numel() else 1
+    base = (a.max() + 1) if a.numel() else 1  # 0-dim tensor; avoids host sync
     return (a[..., 0] * base + a[..., 1]) * base + a[..., 2]
 
 
@@ -184,22 +219,24 @@ def populate_query_pool_idx(
     # Hash over the union so query and pool keys share one base — atom_hash's
     # per-call max base would diverge between the two tensors otherwise.
     both = torch.cat([pool, queries], dim=0) if pool.numel() else queries
-    base = int(both.max().item()) + 1 if both.numel() else 1
+    base = (both.max() + 1) if both.numel() else 1  # 0-dim tensor; avoids host sync
 
     def _h(a: Tensor) -> Tensor:
         a = a.long()
         return (a[..., 0] * base + a[..., 1]) * base + a[..., 2]
 
-    pool_h = _h(pool)
     query_h = _h(queries)
+    P = pool.size(0)
     # Membership via searchsorted on sorted pool hashes (perfect hash → exact),
     # not an O(Q*P) [Q,P] pairwise that OOMs at exhaustive-eval scale.
     if pool.numel():
-        pool_sorted, _ = torch.sort(pool_h)
-        ins = torch.searchsorted(pool_sorted, query_h).clamp(max=pool_sorted.numel() - 1)
+        pool_sorted, pool_perm = torch.sort(_h(pool))
+        ins = torch.searchsorted(pool_sorted, query_h).clamp(max=P - 1)
         in_pool = pool_sorted[ins] == query_h
+        idx_pool = pool_perm[ins]            # pool slot of each in-pool query
     else:
         in_pool = torch.zeros_like(query_h, dtype=torch.bool)
+        idx_pool = torch.zeros_like(query_h)
 
     novel = queries[~in_pool]
     novel_h = _h(novel)
@@ -209,10 +246,14 @@ def populate_query_pool_idx(
                         reduce="amax", include_self=False)
     new_pool = torch.cat([pool, novel[rep]], dim=0)
 
-    new_h = _h(new_pool)
-    sort_idx = new_h.argsort()
-    pos = torch.searchsorted(new_h[sort_idx], query_h)
-    query_pool_idx = sort_idx[pos]
+    # query_pool_idx WITHOUT rehashing + argsorting the merged pool: hashes are
+    # unique across pool (finalize dedups) ∪ novel (unique, disjoint by the
+    # membership test), so in-pool queries resolve through the kept pool sort
+    # perm and novel ones land at P + rank among the sorted unique novel hashes
+    # (novel[rep] rows follow nuniq_h order). pos_novel is arithmetic-only for
+    # in-pool rows (masked out by the where; never used as an index).
+    pos_novel = torch.searchsorted(nuniq_h, query_h)
+    query_pool_idx = torch.where(in_pool, idx_pool, P + pos_novel)
 
     return replace(rg, atom_table=new_pool.contiguous(),
                    num_atoms=int(new_pool.shape[0]),
@@ -310,5 +351,5 @@ def pad_rule_groundings(
         num_rules=num_rules, M_max=M_max, query_pool_idx=rg.query_pool_idx)
 
 
-__all__ = ["capture_step", "finalize", "populate_query_pool_idx",
+__all__ = ["capture_step", "extract_rows", "finalize", "populate_query_pool_idx",
            "pad_rule_groundings", "next_pow2"]

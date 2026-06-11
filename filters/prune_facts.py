@@ -21,16 +21,23 @@ def prune_ground_facts(
     constant_no: int,
     padding_idx: int,
     excluded_queries: Optional[Tensor] = None,
+    return_keep: bool = False,
 ) -> Tensor:
-    """Remove known ground facts from candidates → pruned states (fixed shape)."""
+    """Remove known ground facts from candidates → pruned states (fixed shape).
+
+    ``return_keep=True`` returns the ``[B,K,M]`` keep mask instead of the
+    materialized pruned tensor (compact_atoms fusion — saves one full
+    read+write round; ``compact_atoms(candidates, pad, valid=keep)`` yields
+    the byte-identical compacted result)."""
     B, K, M, _ = candidates.shape
     pad = padding_idx
 
     preds = candidates[:, :, :, 0]
-    args = candidates[:, :, :, 1:3]
 
     valid_atom = (preds != pad)
-    is_ground = (args <= constant_no).all(dim=-1)
+    # two column compares, not a [B,K,M,2] bool materialization + all-reduce
+    is_ground = ((candidates[:, :, :, 1] <= constant_no)
+                 & (candidates[:, :, :, 2] <= constant_no))
     ground_atoms = valid_atom & is_ground
 
     flat_atoms = candidates.reshape(-1, 3)
@@ -45,6 +52,8 @@ def prune_ground_facts(
         is_fact = is_fact & ~is_excluded_atom
 
     keep_atom = valid_atom & ~is_fact
+    if return_keep:
+        return keep_atom
     pad_t = torch.tensor(pad, dtype=candidates.dtype, device=candidates.device)
     pruned_states = torch.where(keep_atom.unsqueeze(-1), candidates, pad_t)
     return pruned_states

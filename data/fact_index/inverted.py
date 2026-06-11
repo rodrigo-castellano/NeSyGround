@@ -113,14 +113,31 @@ class InvertedFactIndex(FactIndex):
         counts = torch.where(is_obj, counts_ps, counts_po)
         counts = torch.where(valid_input, counts, torch.zeros_like(counts))
 
-        pos = torch.arange(M, device=dev).unsqueeze(0).expand(N, -1)
+        # Memory-lean candidate gather. Both value arrays hold exactly one
+        # entry per fact (``_offset_table`` returns ``values[order]``), so
+        # their sizes are equal and the historical per-array re-clamps were
+        # no-ops — dropped. ``[N, M]`` int64 transients are the fill-stage
+        # peak at production shapes (wn18rr: 7 simultaneous [502k, 64]
+        # tensors); the broadcast add + in-place clamp + ONE stacked-table
+        # gather leaves exactly ``gi`` + ``cands``, and the eager path
+        # row-chunks the gather (per-row pure) so the ``gi`` transient stays
+        # ~128 MB next to the unavoidable [N, M] output.
+        F = self._ps_values.size(0)
+        pos = torch.arange(M, device=dev).unsqueeze(0)            # [1, M] (broadcast)
         valid = pos < counts.unsqueeze(1)
-        gi = (starts.unsqueeze(1) + pos).clamp(
-            0, max(self._ps_values.size(0), self._po_values.size(0)) - 1)
-        gi_ps = gi.clamp(max=self._ps_values.size(0) - 1)
-        gi_po = gi.clamp(max=self._po_values.size(0) - 1)
-        cands = torch.where(is_obj.unsqueeze(1),
-                            self._ps_values[gi_ps], self._po_values[gi_po])
+        # vals2 is [2, F] (tiny); row 0 = ps (direction 0), row 1 = po.
+        vals2 = torch.stack([self._ps_values, self._po_values])
+        d = (~is_obj).long()
+        chunk = max(1, 64_000_000 // (8 * max(M, 1)))              # 64 MB gi budget
+        if torch.compiler.is_compiling() or N <= chunk:
+            gi = (starts.unsqueeze(1) + pos).clamp_(0, F - 1)      # [N, M]
+            cands = vals2[d.unsqueeze(1), gi]                      # [N, M]
+            return cands, valid
+        cands = torch.empty((N, M), dtype=vals2.dtype, device=dev)
+        for s in range(0, N, chunk):
+            e = min(s + chunk, N)
+            gi = (starts[s:e].unsqueeze(1) + pos).clamp_(0, F - 1)
+            cands[s:e] = vals2[d[s:e].unsqueeze(1), gi]
         return cands, valid
 
     def __repr__(self) -> str:

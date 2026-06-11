@@ -120,11 +120,16 @@ def resolve_rules(
                     & goal_valid.unsqueeze(-1) & active_mask.unsqueeze(-1))
     rule_subs = subs_flat.view(B, S, K_r, 2, 2)
 
-    # ── apply subs to [body, remaining] ──
-    rem_exp = remaining.unsqueeze(2).expand(B, S, K_r, G, 3).reshape(N_r, G, 3)
-    combined = apply_substitutions(torch.cat([std_bodies, rem_exp], dim=1), subs_flat, enc)
-    rule_body_subst = combined[:, :Bmax, :].view(B, S, K_r, Bmax, 3)
-    rule_remaining = combined[:, Bmax:, :].view(B, S, K_r, G, 3)
+    # ── apply subs to body and the LIVE remaining slice SEPARATELY: the old
+    # cat([bodies, remaining]) substituted all G remaining rows then dropped
+    # every one past G-Bmax — one [N_r,Bmax+G,3] cat + Bmax rows of dead
+    # substitution saved (apply_substitutions is per-atom, so the split is
+    # byte-exact) ──
+    rule_body_subst = apply_substitutions(std_bodies, subs_flat, enc).view(B, S, K_r, Bmax, 3)
+    n_rem = G - Bmax                                    # ≥ 0 (Bmax ≤ G invariant)
+    rem_exp = (remaining[:, :, :n_rem, :].unsqueeze(2)
+               .expand(B, S, K_r, n_rem, 3).reshape(N_r, n_rem, 3))
+    rule_remaining = apply_substitutions(rem_exp, subs_flat, enc).view(B, S, K_r, n_rem, 3)
 
     rule_grounding_body_out = torch.zeros(B, S, K_r, M_g, 3, dtype=torch.long, device=dev)
 
@@ -132,16 +137,11 @@ def resolve_rules(
     sub_lens_v = sub_lens_flat.view(B, S, K_r)
     atom_idx = torch.arange(Bmax, device=dev).view(1, 1, 1, Bmax)
     inactive = atom_idx >= sub_lens_v.unsqueeze(-1)
-    pad_t = torch.tensor(pad, dtype=torch.long, device=dev)
-    rule_body_subst = torch.where(inactive.unsqueeze(-1).expand(B, S, K_r, Bmax, 3),
-                                  pad_t, rule_body_subst)
+    rule_body_subst = torch.where(inactive.unsqueeze(-1), pad, rule_body_subst)
 
-    # ── assemble rule_goals: body then remaining ──
-    rule_goals = torch.full((B, S, K_r, G, 3), pad, dtype=torch.long, device=dev)
-    rule_goals[:, :, :, :Bmax, :] = rule_body_subst
-    n_rem = min(G - Bmax, G)
-    if n_rem > 0:
-        rule_goals[:, :, :, Bmax:Bmax + n_rem, :] = rule_remaining[:, :, :, :n_rem, :]
+    # ── assemble rule_goals: body then remaining (one cat; Bmax+n_rem == G,
+    # so the old full-pad fill + two slice writes wrote every slot anyway) ──
+    rule_goals = torch.cat([rule_body_subst, rule_remaining], dim=3)
 
     return rule_goals, rule_grounding_body_out, rule_success, sub_rule_idx, sub_lens_v, Bmax, rule_subs
 
@@ -163,9 +163,10 @@ def _resolve_facts_argkey(goals, remaining, fact_index, facts_idx, enc, K_f,
     safe_idx = fact_item_idx.clamp(0, max(F - 1, 0))
     fact_atoms = facts_idx[safe_idx.view(-1)].view(N, K_f, 3)
     q_exp = flat_q.unsqueeze(1).expand(-1, K_f, -1)
-    ok_flat, subs_flat = unify_one_to_one(q_exp.reshape(-1, 3), fact_atoms.reshape(-1, 3), enc)
-    ok = ok_flat.view(N, K_f)
-    subs = subs_flat.view(N, K_f, 2, 2)
+    # rank-agnostic unify: pass the [N,K_f,3] views straight in (the old
+    # q_exp.reshape(-1, 3) forced an [N*K_f,3] copy of the expanded queries)
+    ok, subs = unify_one_to_one(q_exp, fact_atoms, enc)
+    subs_flat = subs.reshape(-1, 2, 2)
     success = ok & fact_valid & flat_active.unsqueeze(1)
 
     if excluded_queries is not None and facts_idx.numel() > 0:

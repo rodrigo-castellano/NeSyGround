@@ -134,7 +134,8 @@ def merge_finalize(plan) -> Callable[[Sequence[GoalState], object], BackwardResu
     run-scoped, already globally-concatenated trees/firings (ONE terminal fp_batch,
     never per-chunk)."""
     def _fn(parts: Sequence[GoalState], run) -> BackwardResult:
-        goal_state = _merge_proof_states(parts)
+        # FIRINGS-only requests skip the per-chunk proof-state build → no parts.
+        goal_state = _merge_proof_states(parts) if parts else None
         completed_tree_firings = finalize_evidence(plan, run.trees)
         rule_groundings = finalize_rule_groundings(plan, run.firings)
         return BackwardResult(goal_state=goal_state,

@@ -114,15 +114,27 @@ class BlockSparseFactIndex(InvertedFactIndex):
         sp = preds.clamp(max=P - 1)
         sa = bound_args.clamp(max=E - 1)
         is_obj = (direction == 0)
-        cands = torch.where(is_obj.unsqueeze(1),
-                            self._ps_blocks[sp, sa], self._po_blocks[sp, sa])
+        # Eager + row-dominated calls: ONE direction-indexed gather instead of
+        # two [N, K] block gathers + a [N, K] where (3x -> 1x transient; the
+        # [N, K] gathers are the enumerate-stage memory peak at production
+        # shapes). The per-call [2, P, E, K] stack (2*P*E*K int64 = ~17 MB on
+        # family) only pays off when the [N, K] tensors dominate it
+        # (2*P*E < N); small-N calls and the compiled path keep the original
+        # where-formulation (compiled cells stay graph-identical).
+        if not torch.compiler.is_compiling() and 2 * P * E < preds.size(0):
+            blocks2 = torch.stack([self._ps_blocks, self._po_blocks])
+            cands = blocks2[(~is_obj).long(), sp, sa]             # [N, K]
+        else:
+            cands = torch.where(is_obj.unsqueeze(1),
+                                self._ps_blocks[sp, sa], self._po_blocks[sp, sa])
         counts = torch.where(is_obj, self._ps_counts[sp, sa], self._po_counts[sp, sa])
         counts = torch.where(valid_input, counts, torch.zeros_like(counts))
         valid = self._k_arange(preds.device).unsqueeze(0) < counts.unsqueeze(1)
         return cands, valid
 
     def exists(self, atoms: Tensor) -> Tensor:
-        """``[N,3] -> [N]`` bool. Chunked in eager (T*K can exceed 16 GiB);
+        """``[N,3] -> [N]`` bool. Chunked in eager (the [chunk, K] block gather
+        is the fill-stage transient — sized in BYTES so it stays ~256 MB);
         single inline gather under compile (Python loops break graph capture)."""
         if not self._use_dense:
             return super().exists(atoms)
@@ -130,7 +142,10 @@ class BlockSparseFactIndex(InvertedFactIndex):
         if torch.compiler.is_compiling():
             return self._exists_chunk(atoms, P, E)
         N = atoms.shape[0]
-        chunk = max(1, 256_000_000 // max(K, 1))   # 256 M booleans / chunk
+        # 256 MB int64 gather budget: chunk rows = bytes / (8 * K). The old
+        # row-count sizing (256 M ROWS / K) let the [chunk, K] int64 gather
+        # transiently reach ~2 GiB; per-row purity makes any chunking exact.
+        chunk = max(1, 256_000_000 // (8 * max(K, 1)))
         if N <= chunk:
             return self._exists_chunk(atoms, P, E)
         out = torch.empty(N, dtype=torch.bool, device=atoms.device)
@@ -146,7 +161,9 @@ class BlockSparseFactIndex(InvertedFactIndex):
         block = self._ps_blocks[sp, ss]
         counts = self._ps_counts[sp, ss]
         pos = self._k_arange(atoms.device).unsqueeze(0)
-        matched = ((block == atoms[:, 2].unsqueeze(1)) & (pos < counts.unsqueeze(1))).any(1)
+        eq = block == atoms[:, 2].unsqueeze(1)
+        del block          # free the [chunk, K] int64 gather before the bool masks
+        matched = (eq & (pos < counts.unsqueeze(1))).any(1)
         return matched & in_range
 
     def __repr__(self) -> str:

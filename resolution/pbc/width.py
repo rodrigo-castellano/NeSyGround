@@ -50,19 +50,25 @@ def head_pred_all_ok(body_pred_vals: Tensor, exists: Tensor,
     return all_body_active_ok(exists | head_pred_ok, body_active)
 
 
-def apply_filters_dense(body_atoms: Tensor, exists: Tensor, body_active: Tensor,
-                       active_mask: Tensor, cand_mask: Tensor, queries: Tensor,
-                       Y_r: int, width, head_pred_mask: Optional[Tensor],
-                       *, is_last: Optional[Tensor] = None) -> Tensor:
+def apply_filters_dense(has_query_atom: Tensor, exists: Tensor, body_active: Tensor,
+                        body_preds: Tensor, active_mask: Tensor, cand_mask: Tensor,
+                        width, head_pred_mask: Optional[Tensor],
+                        *, is_last: Optional[Tensor] = None) -> Tensor:
     """Dense width + query-exclusion + head-pred prune → ``[B,K_r,Y_r]`` mask.
+
+    Slice-fused: the padded ``[.,Y_r,M,3]`` body tensor never exists.
+    ``has_query_atom [B,K_r,Y_r]`` is precomputed by the dense fill (the only
+    consumer of full body triples); the head-pred prune reads ``body_preds
+    [B,K_r,M]`` directly (per-rule, y-independent). Inactive slots feed raw
+    (unpadded) preds — every reduction ORs ``~body_active``, so the result is
+    bit-identical to the padded-body recipe.
 
     ``width``: int (eager) | 0-dim Tensor (compiled) | None (∞).
     ``head_pred_mask=None`` disables the unprovable-unknown prune (last step,
     keras ``prune_incomplete_proofs=False``). In the compiled path the prune /
     strict branch are gated on ``is_last`` via ``torch.where`` (no Python if).
     """
-    B, K_r = active_mask.shape
-    M = body_atoms.shape[3]
+    Y_r = exists.size(2)
     body_active_exp = body_active.expand(-1, -1, Y_r, -1)
 
     if width is None:
@@ -71,13 +77,14 @@ def apply_filters_dense(body_atoms: Tensor, exists: Tensor, body_active: Tensor,
         num_unknown = (body_active_exp & ~exists).sum(dim=-1)
         mask = (num_unknown <= width) & active_mask.unsqueeze(2) & cand_mask
 
-    query_exp = queries.view(B, 1, 1, 1, 3).expand(-1, K_r, Y_r, M, -1)
-    has_query_atom = ((body_atoms == query_exp).all(dim=-1) & body_active_exp).any(dim=-1)
     mask = mask & ~has_query_atom
 
     if width is not None:
         if head_pred_mask is not None:
-            all_ok = head_pred_all_ok(body_atoms[..., 0], exists, body_active_exp, head_pred_mask)
+            P = head_pred_mask.size(0)
+            head_pred_ok = head_pred_mask[body_preds.clamp(max=P - 1)]   # [B,K_r,M]
+            all_ok = all_body_active_ok(exists | head_pred_ok.unsqueeze(2),
+                                        body_active_exp)
             if is_last is not None:
                 all_ok = torch.where(is_last, torch.ones_like(all_ok), all_ok)
             mask = mask & all_ok

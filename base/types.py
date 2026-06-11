@@ -123,7 +123,8 @@ class ResolvedChildren(NamedTuple):
     fact_child_goals: Tensor    # [B, G, K_f, L, 3]
     fact_grounding_body: Tensor # [B, G, K_f, M, 3]
     fact_success: Tensor        # [B, G, K_f]
-    rule_child_goals: Tensor    # [B, G, K_r, L, 3]
+    rule_child_goals: Tensor    # [B, G, K_r, L, 3]; pbc-dense fused emit: body-only
+                                # [B, G, K_r, M, 3] (pack_states rebuilds the tail)
     rule_grounding_body: Tensor # [B, G, K_r, M, 3]
     rule_success: Tensor        # [B, G, K_r]
     sub_rule_idx: Tensor        # [B, G, K_r]
