@@ -354,6 +354,16 @@ class FlatMaterializer:
         b_idx, s_idx = surv_n // S, surv_n % S
         # same single-cat assembly as the dense emit (pad tail only if M == 0)
         n_rem = min(G - M, G - 1)
+        # DROP, never truncate: survivors whose parent remaining tail past 1+n_rem has live
+        # atoms would lose them in the child → drop those survivors (sound: drop, not cut).
+        if 1 + n_rem < G:
+            keep_of = (inp.remaining[b_idx, s_idx, 1 + n_rem:, 0] == pad).all(-1)   # [T_surv]
+            if not bool(keep_of.all()):
+                surv_body, surv_rule = surv_body[keep_of], surv_rule[keep_of]
+                b_idx, s_idx = b_idx[keep_of], s_idx[keep_of]
+                T_surv = surv_body.size(0)
+                if T_surv == 0:
+                    return self.empty(inp, plan)
         parts = [surv_body]
         if n_rem > 0:
             parts.append(inp.remaining[b_idx, s_idx, 1:1 + n_rem, :])

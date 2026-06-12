@@ -127,6 +127,12 @@ def resolve_rules(
     # byte-exact) ──
     rule_body_subst = apply_substitutions(std_bodies, subs_flat, enc).view(B, S, K_r, Bmax, 3)
     n_rem = G - Bmax                                    # ≥ 0 (Bmax ≤ G invariant)
+    # DROP, never truncate: a state whose live remaining beyond n_rem won't fit body+tail in
+    # G atoms would silently lose those atoms in EVERY child — invalidate the state's children
+    # instead (sound: fewer groundings, never a child missing required atoms).
+    if n_rem < G:
+        overflow = (remaining[:, :, n_rem:, 0] != enc.pad).any(-1)        # [B, S]
+        rule_success = rule_success & ~overflow.unsqueeze(-1)
     rem_exp = (remaining[:, :, :n_rem, :].unsqueeze(2)
                .expand(B, S, K_r, n_rem, 3).reshape(N_r, n_rem, 3))
     rule_remaining = apply_substitutions(rem_exp, subs_flat, enc).view(B, S, K_r, n_rem, 3)

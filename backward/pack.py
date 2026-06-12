@@ -189,6 +189,10 @@ def pack_states(
         # parent tail (== emit's per-K broadcast); invalid slots stay pad.
         assert parent_goals is not None and K_f == 0
         n_rem = min(G - G_emit, G - 1)
+        # DROP, never truncate: a parent with live atoms past the kept tail (1+n_rem) would
+        # lose them in its children → invalidate those child slots (sound: drop, not cut).
+        overflow_parent = (parent_goals[:, :, 1 + n_rem:, 0] != pad).any(-1)   # [B, S_in]
+        out_valid = out_valid & ~overflow_parent.gather(1, parents_s)
         if n_rem > 0:
             tail = parent_goals[:, :, 1:1 + n_rem, :].gather(
                 1, parents_s.unsqueeze(-1).unsqueeze(-1).expand(B, S_out, n_rem, 3))

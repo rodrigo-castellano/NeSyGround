@@ -54,6 +54,11 @@ def _rtf_cascade(
         if n_goal_rem > 0:
             body_rem[:, :, :, n_body_rem:n_body_rem + n_goal_rem, :] = \
                 rule_goals_l1[:, :, :, Bmax:Bmax + n_goal_rem, :]
+        # DROP, never truncate: if the L1 remaining beyond the kept tail still has live atoms,
+        # the L2 child can't fit them in G → invalidate it.
+        if Bmax + n_goal_rem < G:
+            overflow = (rule_goals_l1[:, :, :, Bmax + n_goal_rem:, 0] != pad).any(-1)   # [B,S,K_r]
+            rule_success_l1 = rule_success_l1 & ~overflow
 
         N = B * S
         flat_atoms = rule_goals_l1[:, :, :, 0, :].reshape(N, K_r, 3)
