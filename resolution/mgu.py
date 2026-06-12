@@ -233,20 +233,18 @@ def _resolve_facts_enumerate(goals, remaining, fact_index, enc,
 
 
 def init_mgu(
-    resolution: str,
-    K_f: int,
-    K_r: int,
-    rule_index,
-    max_total_groundings: int,
-    *,
+    grounder, *,
     max_children: int,                   # the children cap K (shell owns the default)
-    K_f_min_budget: int = 10,            # internal guard: min fact slots; not user config
+    max_total_groundings: int,
     max_groundings_per_rule: Optional[int] = None,
-) -> dict:
-    """Compute MGU shape params (K, K_f, max_vars_per_rule, Y_q) for sld/rtf.
-
-    S is NOT returned — the shell (BackwardGrounder.__init__) is the single owner."""
+    K_f_min_budget: int = 10,            # internal guard: min fact slots; not user config
+) -> None:
+    """Compute the sld/rtf MGU shape params and WIRE them onto the grounder
+    (``K``, ``kb.K_f``, ``max_vars_per_rule``, ``Y_q``, ``_max_fact_pairs_body``).
+    S stays shell-owned (``BackwardGrounder.__init__``)."""
     import warnings
+    resolution, kb = grounder.resolution, grounder.kb
+    K_f, K_r, rule_index = kb.K_f, kb.K_r, kb.rule_index
     K_uncapped = K_f * K_r if resolution == "rtf" else K_f + K_r
     K = min(K_uncapped, max_children)
 
@@ -263,12 +261,13 @@ def init_mgu(
     elif K_f > K:
         K_f = K
 
-    max_vars_per_rule = (int(rule_index.rule_lens_sorted.max().item()) + 2
-                         if rule_index.rule_lens_sorted.numel() > 0 else 3)
-    Y_q = (min(max_total_groundings, rule_index.max_rule_pairs * max(max_groundings_per_rule, 1))
-           if max_groundings_per_rule is not None else max_total_groundings)
-    return {"K": K, "K_f": K_f, "max_vars_per_rule": max_vars_per_rule,
-            "Y_q": Y_q, "max_fact_pairs_body": K_f}
+    grounder.K = K
+    kb.K_f = K_f
+    grounder.max_vars_per_rule = (int(rule_index.rule_lens_sorted.max().item()) + 2
+                                  if rule_index.rule_lens_sorted.numel() > 0 else 3)
+    grounder.Y_q = (min(max_total_groundings, rule_index.max_rule_pairs * max(max_groundings_per_rule, 1))
+                    if max_groundings_per_rule is not None else max_total_groundings)
+    grounder._max_fact_pairs_body = K_f
 
 
 __all__ = ["resolve_facts", "resolve_rules", "empty_rule_results", "init_mgu"]

@@ -17,7 +17,7 @@ from typing import Dict, NamedTuple, Optional, Tuple
 import torch
 from torch import Tensor
 
-from grounder.resolution.pbc.candidates import cumcount_flat
+from grounder.resolution.pbc.enumerate import cumcount_flat
 
 
 _POW_CACHE: Dict[Tuple[int, int, str], Tensor] = {}
@@ -51,6 +51,10 @@ class _Packed(NamedTuple):
 def compact_atoms(states: Tensor, padding_idx: int,
                   valid: Optional[Tensor] = None) -> Tensor:
     """Left-align non-padding atoms within each ``[..., M, 3]`` slice.
+
+    Performs atom/subgoal-level compaction. It removes padding gaps within a
+    single goal's subgoals by shifting all remaining unsolved/valid subgoals
+    to the front (left-alignment) and placing padding atoms at the end.
 
     Scatter-based: valid atoms write to their cumsum rank (unique by
     construction); padding atoms all write to one discarded trash slot ``M``

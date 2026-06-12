@@ -1,7 +1,7 @@
 """BackwardGrounder — query-directed proof search (sld / rtf / pbc).
 
 The backward shell: reads its typed ``Backward`` config, wires the per-resolution
-setup (``init_mgu`` for sld/rtf, ``init_enum`` for pbc), fixes the shared static
+setup (``init_mgu`` for sld/rtf, ``build_tables`` for pbc), fixes the shared static
 layout (G, A, S, Y_q), and drives the depth loop via ``backward.loop.run_backward``.
 The single runtime verb is ``ground(request)``; ``request.output_spec`` selects
 which tiers are produced (and what the engine collects).
@@ -40,8 +40,6 @@ _CELLS = frozenset({
 def _validate(config: Backward, layout: str, compile: str) -> None:
     """All ctor contract checks, raised before any state is built."""
     res = config.resolution
-    if getattr(res, "materialization", "cartesian") == "join" and not isinstance(res, PBC):
-        raise ConfigError("materialization='join' requires resolution='pbc'")
     if getattr(res, "guided_topk", None) is not None and config.guided_scorer is None:
         raise ConfigError(
             "guided_topk requires Backward.guided_scorer (nesy.hooks.GuidedScorer)")
@@ -55,11 +53,13 @@ class BackwardGrounder(nn.Module):
     """Unified backward-chaining grounder (sld / rtf / pbc), built from a ``Backward`` config."""
 
     def __init__(self, kb: KB, config: Backward, *, layout: str = "auto",
-                 compile: str = "off", chunk_size: Optional[int] = None) -> None:
+                 compile: str = "off", chunk_size: Optional[int] = None,
+                 init_state_shape: str = "minimal") -> None:
         super().__init__()
         _validate(config, layout, compile)
         # Build inputs snapshotted for rebound() (re-snapshot over a rewritten KB).
-        self._build = dict(config=config, layout=layout, compile=compile, chunk_size=chunk_size)
+        self._build = dict(config=config, layout=layout, compile=compile,
+                           chunk_size=chunk_size, init_state_shape=init_state_shape)
         self.kb = kb
         self.num_rules = kb.num_rules
 
@@ -73,22 +73,18 @@ class BackwardGrounder(nn.Module):
         self.w_last_depth = pbc.u if pbc else 0
         self._cartesian_product = pbc.cartesian_product if pbc else False
         self._all_anchors = pbc is not None                  # forced for pbc
-        flat_intermediate = pbc.flat_intermediate if pbc else False
-        materialization = pbc.materialization if pbc else "cartesian"
-
-        # ── materialization routing: "join" → L3 JoinResolver (pbc tables, flat-eager);
-        #    guided beam (KGE prior) needs the join's incremental per-fv expansion ──
+        # Flat path prunes by default — push width into the enumeration as a per-fv branch
+        # pruner (set-identical to one-shot, join_ab-gated). A KGE beam (guided_topk) implies
+        # pruning + forces a flat-eager layout (the incremental expansion the beam rides on).
+        self._flat_prune = bool(pbc.flat_prune or pbc.guided_topk is not None) if pbc else False
         if pbc is not None and pbc.guided_topk is not None:
-            materialization = "join"
-        self._dispatch_resolution = "join" if materialization == "join" else self.resolution
-        if materialization == "join":
-            flat_intermediate, layout = True, "flat"
+            layout = "flat"
 
         # ── shared search knobs (mirrored onto self for RunPlan.snapshot) ──
         self.depth = config.depth
         self.prune_facts = config.prune_facts
         self._pack_dedup = config.pack_dedup
-        self._init_state_shape = config.init_state_shape
+        self._init_state_shape = init_state_shape   # exec-surface knob (only buffers.py reads it)
         self._bump_s_to_k = config.bump_s_to_k
 
         # ── nesy hooks (resolution + step/grounding injection points) ──
@@ -102,10 +98,9 @@ class BackwardGrounder(nn.Module):
         self.guided_stats = None      # GuidedStats census counters (attach post-ctor)
 
         # ── collection / output (which tiers + soundness filter) ──
-        self._collect_mode = "terminal"
-        # collect_evidence / _collect_rule_groundings come from the request's output_spec (set in ground()).
-        self.collect_evidence = self._collect_rule_groundings = False
-        # Default spec always present so plan.snapshot reads an attribute (no frozenset under compile).
+        # output_spec is the SINGLE source for which tiers to collect; RunPlan derives
+        # collect_evidence (TREES) / collect_rule_groundings (FIRINGS) from it. Default spec
+        # always present so plan.snapshot reads an attribute (no frozenset under compile).
         self.output_spec = OutputSpec(frozenset({Tier.PROOF_STATE}))
         # Filter default: pbc with u=0 → fp_batch; else none.
         self.filter_mode = config.filter or ("fp_batch" if (pbc and self.w_last_depth == 0) else "none")
@@ -119,14 +114,13 @@ class BackwardGrounder(nn.Module):
         # ── exec-surface knobs ──
         self._layout_knob, self._compile_knob, self._chunk_size = layout, compile, chunk_size
         self._knobs_set = layout != "auto" or compile != "off" or chunk_size is not None
-        flat_requested = {"dense": False, "flat": True}.get(layout, flat_intermediate)
 
-        # ── shared static layout: G, A, S computed ONCE ──
+        # ── shared static layout: L, A, G computed ONCE ──
         M, D = kb.M, self.depth
-        mg = config.max_goals if config.max_goals is not None else M + (M - 1) * D
-        self.max_goals = max(mg, M)                                          # G
+        mg = config.max_atoms if config.max_atoms is not None else M + (M - 1) * D
+        self.max_atoms = max(mg, M)                                          # L
         self.A = D * M                                                       # A
-        self.S = config.max_states if config.max_states is not None else 256  # S
+        self.G = config.max_goals if config.max_goals is not None else 256  # G
 
         # Universal children-per-state cap: None → family default
         # (sld/rtf 550; pbc the grounding budget, since a pbc child IS a grounding).
@@ -135,67 +129,35 @@ class BackwardGrounder(nn.Module):
         self._init_resolution(
             max_children=children_cap,
             max_total_groundings=config.max_groundings_per_query,
-            max_groundings_per_rule=pbc.max_groundings_per_rule if pbc else None,
-            flat_intermediate=flat_requested)
+            max_groundings_per_rule=pbc.max_groundings_per_rule if pbc else None)
 
         # ── pre-resolved exec cell (read by plan.snapshot) ──
         lay = _LAYOUT[layout]
+        # FLAT is eager-only, so under layout=auto a compile request resolves to DENSE
+        # (the compilable layout); without compile, pbc prefers flat, sld/rtf dense.
+        auto_flat = pbc is not None and compile == "off"
         self._exec_layout = lay if lay is not None else (
-            Layout.FLAT if self._flat_intermediate else Layout.DENSE)
-        # FLAT is eager-only: an auto-resolved flat layout downgrades a compile pref to
-        # EAGER; an explicit flat+compile is illegal, left for capability.validate.
+            Layout.FLAT if auto_flat else Layout.DENSE)
+        # An auto-resolved flat layout downgrades a compile pref to EAGER; an explicit
+        # flat+compile is illegal, left for capability.validate.
         self._exec_compile = (EAGER if (self._exec_layout is Layout.FLAT and layout == "auto")
                               else _COMPILE[compile])
 
     def _init_resolution(self, *, max_children: int,
-                         max_total_groundings: int, max_groundings_per_rule: Optional[int],
-                         flat_intermediate: bool) -> None:
-        """Per-resolution build: shape budgets (+ pbc binding buffers). S is already set."""
+                         max_total_groundings: int, max_groundings_per_rule: Optional[int]) -> None:
+        """Dispatch to the resolution layer's grounder-setup — ``init_mgu`` (sld/rtf) /
+        ``build_tables`` (pbc) own the budget computation AND the wiring (buffers +
+        scalars + S-bump) onto self. S is already set; flat-vs-dense is exec-resolved."""
+        from grounder.resolution.mgu import init_mgu
+        from grounder.resolution.pbc import build_tables
+        kw = dict(max_children=max_children, max_total_groundings=max_total_groundings,
+                  max_groundings_per_rule=max_groundings_per_rule)
         if self.resolution in ("sld", "rtf"):
-            from grounder.resolution.mgu import init_mgu
-            cfg = init_mgu(
-                resolution=self.resolution, K_f=self.kb.K_f, K_r=self.kb.K_r,
-                rule_index=self.kb.rule_index,
-                max_total_groundings=max_total_groundings, max_children=max_children,
-                max_groundings_per_rule=max_groundings_per_rule)
-            self.K = cfg["K"]
-            self.kb.K_f = cfg["K_f"]
-            self.max_vars_per_rule = cfg["max_vars_per_rule"]
-            self.Y_q = cfg["Y_q"]
-            self._max_fact_pairs_body = cfg["max_fact_pairs_body"]
-            self._flat_intermediate = False
-            return
-        if self.resolution != "pbc":
+            init_mgu(self, **kw)
+        elif self.resolution == "pbc":
+            build_tables(self, **kw)
+        else:
             raise ValueError(f"Unknown resolution: {self.resolution}")
-
-        from grounder.resolution.pbc import init_enum
-        meta = init_enum(
-            rule_index=self.kb.rule_index, fact_index=self.kb.fact_index,
-            facts_idx=self.kb.fact_index.facts_idx, constant_no=self.kb.constant_no,
-            num_rules=self.kb.num_rules, M=self.kb.M, width=self.width,
-            max_total_groundings=max_total_groundings, max_children=max_children,
-            max_groundings_per_query=max_groundings_per_rule,   # the per-rule Y_r cap
-            device=self.kb.device_,
-            cartesian_product=self._cartesian_product, all_anchors=self._all_anchors,
-            flat_intermediate=flat_intermediate)
-        for name, tensor in meta["buffers"].items():
-            self.register_buffer(name, tensor)
-        self._enum_ri = meta["enum_rule_index"]
-        self._P, self._E = meta["P"], meta["E"]
-        self.K_r, self.K, self.Y_q = meta["K_r"], meta["K"], meta["Y_q"]
-        self.Y_r = meta["Y_r"]
-        self.V, self.K_v = meta.get("V", 1), meta.get("K_v", 64)
-        self._fv_any_valid = meta.get("fv_any_valid", None)
-        self._flat_intermediate = meta.get("flat_intermediate", False)
-        self.max_vars_per_rule = 3
-        # all_anchors dedup/remap needs the variant→original rule mapping on device.
-        if self._all_anchors:
-            self.register_buffer("_variant_to_orig_t", self._enum_ri.variant_to_orig.to(
-                dtype=torch.long, device=self.kb.device_))
-        # Optional S bump: enlarge S toward K_r*K_v when depth>1 (pbc only).
-        if self._bump_s_to_k and self.depth > 1 and self.width is not None and self.width > 0:
-            K_v = meta.get("K_v", 0) or 0
-            self.S = max(self.S, min(self.K, max(self.K_r * K_v, 1)))
 
     # ── Grounder API ──
     @torch.no_grad()
@@ -203,9 +165,7 @@ class BackwardGrounder(nn.Module):
         """The single runtime verb — proof search over ``request.queries`` for the tiers
         in ``request.output_spec`` (which also drives what the engine collects)."""
         spec = request.output_spec
-        self.output_spec = spec
-        self.collect_evidence = spec.trees             # Tier.TREES requested
-        self._collect_rule_groundings = spec.firings   # Tier.FIRINGS requested
+        self.output_spec = spec     # RunPlan derives collect_evidence/collect_rule_groundings from this
         result = run_backward(self, request.queries, request.query_mask,
                               excluded_queries=request.excluded_queries)
         if spec.firings:
@@ -238,7 +198,7 @@ class BackwardGrounder(nn.Module):
     def __repr__(self) -> str:
         return (f"BackwardGrounder(resolution={self.resolution!r}, filter={self.filter_mode!r}, "
                 f"depth={self.depth}, width={self.width}, num_rules={self.kb.num_rules}, "
-                f"S={self.S}, Y_q={self.Y_q})")
+                f"G={self.G}, Y_q={self.Y_q})")
 
 
 __all__ = ["BackwardGrounder"]

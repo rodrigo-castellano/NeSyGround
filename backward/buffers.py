@@ -37,13 +37,13 @@ def init_frontier(
     B = queries.size(0)
     dev = queries.device
     pad = plan.kb.padding_idx
-    G = plan.max_goals
+    G = plan.max_atoms
     Y_q = plan.Y_q
     D = plan.depth
     M = plan.kb.M
     M_work = M
 
-    S_init = 1 if plan.init_state_shape == "minimal" else plan.S
+    S_init = 1 if plan.init_state_shape == "minimal" else plan.G
 
     goal_atoms = torch.full((B, S_init, G, 3), pad, dtype=torch.long, device=dev)
     if initial_goals is not None:

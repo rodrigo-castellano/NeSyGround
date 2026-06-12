@@ -150,10 +150,9 @@ def _pbc_grounder(**knobs) -> BackwardGrounder:
     L = torch.tensor([2])
     kb = KB(facts, H, B, L, constant_no=3, predicate_no=12,
             padding_idx=9, device=torch.device("cpu"))
-    # flat_intermediate=False exercises the auto-DENSE exec path these snapshot
-    # assertions target (the PBC config default is flat-intermediate=True).
-    return BackwardGrounder(kb, Backward(PBC(depth=2, width=1, flat_intermediate=False)),
-                            **knobs)
+    # dense/flat is driven by the layout knob (pbc auto-resolves to flat); callers pass
+    # layout=/compile=/chunk_size= via knobs to target a specific exec cell.
+    return BackwardGrounder(kb, Backward(PBC(depth=2, width=1)), **knobs)
 
 
 def test_explicit_knobs_select_declared_cell() -> None:
@@ -180,12 +179,12 @@ def test_explicit_flat_compiled_rejected() -> None:
 
 
 def test_snapshot_lockstep_default_and_layout_knobs() -> None:
-    # Default ctor (knobs unset) -> auto path: eager FLAT cell, flat_intermediate
-    # stays False (as configured), one chunk for the whole query batch.
+    # Default ctor (knobs unset) -> auto path: eager FLAT cell; pbc auto-defaults to
+    # flat_intermediate True, one chunk for the whole query batch.
     default = RunPlan.snapshot(_pbc_grounder())
     assert default.strategy.cell.compile.eager  # auto-downgraded to eager
     assert default.strategy.cell == Cell(Layout.FLAT, EAGER)
-    assert default.flat_intermediate is False
+    assert default.flat_intermediate is True
     assert len(list(default.strategy.chunk.slices(50))) == 1
     # layout='dense' -> Cell(DENSE,EAGER) AND flat_intermediate False.
     dense = RunPlan.snapshot(_pbc_grounder(layout="dense"))
@@ -231,8 +230,8 @@ def _bc_kb() -> KB:
 def _bc_fingerprint(g: BackwardGrounder) -> tuple:
     """The resolved knobs that define a backward grounder's behavior."""
     return (g.resolution, g.filter_mode, g.depth, g.width, g.w_last_depth,
-            g._all_anchors, g._flat_intermediate,
-            g.S, g.Y_q, g.max_goals)
+            g._all_anchors, g._exec_layout,
+            g.G, g.Y_q, g.max_atoms)
 
 
 def test_make_grounder_dispatches_on_config_type() -> None:
@@ -261,8 +260,7 @@ def test_make_grounder_pbc_forces_invariants() -> None:
 def test_construction_paths_equivalent() -> None:
     """make_grounder and the direct config-driven BackwardGrounder ctor produce the
     same resolved backward grounder (the BC/FC fork collapsed to one factory)."""
-    cfg = Backward(PBC(depth=2, width=1, u=0, flat_intermediate=True,
-                       max_groundings_per_rule=32),
+    cfg = Backward(PBC(depth=2, width=1, u=0, max_groundings_per_rule=32),
                    max_groundings_per_query=64)
     via_factory = make_grounder(_bc_kb(), cfg)
     via_ctor = BackwardGrounder(_bc_kb(), cfg)

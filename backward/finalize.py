@@ -20,7 +20,7 @@ from grounder.base.types import CompletedTreeFirings, GoalState, RuleGroundings
 
 def _make_shapes(plan, B: int, Y_q: int) -> Shapes:
     """plan.shapes rebatched to B for the completed-tree-firings view (E = entities+1)."""
-    return replace(plan.shapes, B=B, N=B * plan.S, Y_q=Y_q, E=plan.kb.constant_no + 1)
+    return replace(plan.shapes, B=B, N=B * plan.G, Y_q=Y_q, E=plan.kb.constant_no + 1)
 
 
 def finalize_evidence(plan, trees) -> Optional[CompletedTreeFirings]:

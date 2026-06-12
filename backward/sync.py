@@ -14,7 +14,7 @@ from grounder.resolution.primitives import apply_substitutions
 from grounder.backward.state import Frontier
 
 
-def sync_accumulated(plan, fr: Frontier, sync, dsel) -> Frontier:
+def advance_tree_tape(plan, fr: Frontier, sync, dsel) -> Frontier:
     """Propagate accumulated_body: gather from parents, apply subs, write at depth d."""
     parent_map = sync["parent_map"]
     winning_subs = sync["winning_subs"]
@@ -93,4 +93,4 @@ def sync_accumulated(plan, fr: Frontier, sync, dsel) -> Frontier:
         rule_idx_per_depth=rule_idx, head_per_depth=head)
 
 
-__all__ = ["sync_accumulated"]
+__all__ = ["advance_tree_tape"]

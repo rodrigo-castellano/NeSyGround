@@ -34,7 +34,7 @@ _FC_PY = Path(__file__).parent.parent / "forward" / "router.py"
 
 
 def test_resolvers_keyed_exactly() -> None:
-    assert set(RESOLVERS) == {"sld", "rtf", "pbc", "join"}
+    assert set(RESOLVERS) == {"sld", "rtf", "pbc"}
 
 
 def test_every_resolver_impls_protocol() -> None:

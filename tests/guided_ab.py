@@ -32,7 +32,7 @@ from join_ab import _grounding_set, _load  # noqa: E402
 from grounder.api.config import Backward, PBC  # noqa: E402
 from grounder.api.backward import BackwardGrounder  # noqa: E402
 from grounder.core import GroundRequest, OutputSpec, Tier  # noqa: E402
-from grounder.resolution.pbc.candidates import GuidedStats  # noqa: E402
+from grounder.resolution.pbc.guided import GuidedStats  # noqa: E402
 
 _ALL = OutputSpec(frozenset({Tier.PROOF_STATE, Tier.FIRINGS, Tier.TREES}))
 _CELLS = ["family", "countries_s2", "ablation_d2"]
@@ -52,11 +52,11 @@ class HashScorer:
 
 def _build(kb, *, d, k=None, scorer=None, stats=None):
     cfg = Backward(
-        PBC(depth=d, width=1, u=0, materialization="join",
-            flat_intermediate=True, max_groundings_per_rule=64,
+        PBC(depth=d, width=1, u=0,
+            max_groundings_per_rule=64,
             guided_topk=k),
-        max_groundings_per_query=4096, max_states=256, prune_facts=True,
-        bump_s_to_k=False, init_state_shape="minimal", guided_scorer=scorer)
+        max_groundings_per_query=4096, max_goals=256, prune_facts=True,
+        bump_s_to_k=False, guided_scorer=scorer)
     g = BackwardGrounder(kb, cfg)
     if stats is not None:
         g.guided_stats = stats

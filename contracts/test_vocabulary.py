@@ -121,7 +121,7 @@ def test_config_fields_registered() -> None:
 # make_grounder exec knobs + the KB construction knobs (genuine ctor knobs that are
 # NOT config-dataclass fields). KNOBS == config_fields ∪ this set, exactly.
 _EXEC_AND_KB_KNOBS = frozenset({
-    "layout", "compile", "chunk_size", "transforms",        # make_grounder exec knobs
+    "layout", "compile", "chunk_size", "transforms", "init_state_shape",  # exec knobs
     "max_facts_per_query", "fact_index_type", "max_memory_mb",  # KB knobs
     "fact_order", "rule_order", "order_seed", "pack_base",
 })
@@ -258,14 +258,13 @@ _GROUNDER_PRIVATE: dict[str, str] = {
     "kb": "the bound KB (submodule)",
     "_enum_ri": "the PbcRuleIndex — pbc binding analysis (submodule)",
     "_build": "ctor inputs snapshot, replayed by rebound()",
-    "_dispatch_resolution": "resolver registry key: sld | rtf | pbc | join",
+    "_flat_prune": "pbc flat: in-enumeration width branch-prune (PBC.flat_prune)",
     "_exec_layout": "resolved Layout for the exec cell",
     "_exec_compile": "resolved compile spec for the exec cell",
     "_knobs_set": "whether any exec knob was set explicitly",
     "_layout_knob": "raw layout knob string (auto | dense | flat)",
     "_compile_knob": "raw compile knob string (off | graph | dynamic)",
     "_chunk_size": "raw chunk-size knob (None = auto)",
-    "_collect_mode": "groundings collection mode (terminal)",
     "_standardize_fn": "built variable-renaming fn, or None",
     "_num_entities": "FC: entity count (E)",
     "_num_predicates": "FC: real predicate range (P)",

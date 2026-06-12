@@ -1,10 +1,22 @@
-"""Per-depth proof step — SELECT → RESOLVE → PACK → POSTPROCESS(+sync).
+"""Per-depth proof step — SELECT → RESOLVE → PACK → POSTPROCESS.
 
 Eager path (the fingerprint runs CPU/eager). RESOLVE dispatches via the
 ``RESOLVERS`` registry keyed on ``plan.resolution`` (sld/rtf/pbc) — a pure lookup.
-The ``capture_step`` accumulator runs AFTER resolve and BEFORE pack. Working state
-is a frozen ``Frontier`` (+ private ``_Collected``); each phase returns a
-functional update.
+Working state is a frozen ``Frontier`` (+ private ``_Collected``); each phase
+returns a functional update.
+
+Evidence collection is THREE stages, each gated by the requested output tier.
+Stage 1 feeds the FIRINGS tier; Stages 2+3 feed the TREES tier; PROOF_STATE (the
+default) needs none of them:
+
+  Stage 1  extract_firings         (resolve-time, FIRINGS): record every fired rule
+           app → FiringSet → RuleGroundings.        gate: collect_rule_groundings
+  Stage 2  advance_tree_tape       (pack-time, TREES): carry the per-depth proof tape
+           (accumulated_body) forward onto surviving states.  gate: collect_evidence
+  Stage 3  harvest_completed_trees (postprocess-time, TREES): harvest states that just
+           completed → ProofTrees → CompletedTreeFirings.     gate: collect_evidence
+
+Stage 1 is standalone; Stages 2+3 are a pair — Stage 3 harvests the tape Stage 2 maintains.
 """
 from __future__ import annotations
 
@@ -14,26 +26,15 @@ import torch
 from torch import Tensor
 
 from grounder.backward.buffers import _Collected
-from grounder.backward.considered import extract_rows
+from grounder.backward.considered import extract_firings
 from grounder.backward.pack import compact_atoms, pack_states, pack_states_flat
-from grounder.backward.postprocess import collect_groundings
-from grounder.backward.sync import sync_accumulated
+from grounder.backward.postprocess import harvest_tree_firings
+from grounder.backward.sync import advance_tree_tape
 from grounder.filters.prune_facts import prune_ground_facts
 from grounder.api.registry import RESOLVERS
 from grounder.resolution.api import ResolveRequest
 from grounder.backward.state import Frontier
 from grounder.base.types import FlatResolvedChildren
-
-
-def capture_selected_atom(plan, fr: Frontier) -> Frontier:
-    """Snapshot the atom resolved at this depth (= head atom) for per-depth heads.
-
-    A view, not a clone: goal_atoms is never mutated in place (select writes
-    only its own clone on sld/rtf; pack/postprocess build fresh tensors) and
-    every consumer (extract_rows, sync_accumulated) copies via gather/indexing."""
-    if plan.collect_evidence or plan.collect_rule_groundings:
-        return fr.replace(selected_atom=fr.goal_atoms[:, :, 0, :])
-    return fr
 
 
 def step_core(plan, fr: Frontier, coll: Optional[_Collected], dsel,
@@ -53,14 +54,20 @@ def step_core(plan, fr: Frontier, coll: Optional[_Collected], dsel,
     before pack, so the rule_groundings output is byte-identical.
     Returns ``(fr, coll, rows|None)``.
     """
-    fr = capture_selected_atom(plan, fr)
+    if plan.collect_evidence or plan.collect_rule_groundings:
+        # Snapshot the atom resolved at this depth (= head atom) for per-depth heads.
+        # A view, not a clone: goal_atoms is never mutated in place (select writes
+        # only its own clone on sld/rtf; pack/postprocess build fresh tensors) and
+        # every consumer (extract_firings, advance_tree_tape) copies via gather/indexing.
+        fr = fr.replace(selected_atom=fr.goal_atoms[:, :, 0, :])
 
     goal_queries, remaining, active_mask = select(plan, fr)
 
     resolved = resolve(plan, goal_queries, remaining, fr, active_mask, dsel,
                        excluded_queries)
 
-    rows = (extract_rows(plan, resolved, fr)
+    # Stage 1 (FIRINGS tier): record this step's fired rule apps, resolve-time.
+    rows = (extract_firings(plan, resolved, fr)
             if plan.collect_rule_groundings else None)
 
     if skip_tail:
@@ -117,7 +124,12 @@ def resolve(plan, queries, remaining, fr: Frontier, active_mask, dsel,
 
 
 def pack(plan, resolved, fr: Frontier) -> Tuple[Frontier, dict]:
-    """Flatten S*K children, compact to S; return (Frontier, sync dict)."""
+    """Flatten S*K children, compact to S; return (Frontier, sync dict).
+
+    Performs state/frontier-level compaction. It resolves branching by selecting
+    and pruning/deduplicating valid child states from the expanded S_in * K candidates,
+    mapping them back down to the frontier width cap (S_out <= max_states).
+    """
     if isinstance(resolved, FlatResolvedChildren):
         subs_noop = resolved.subs_noop
         packed = pack_states_flat(
@@ -125,18 +137,18 @@ def pack(plan, resolved, fr: Frontier) -> Tuple[Frontier, dict]:
             fr.body_count, plan.kb.padding_idx,
             collect_evidence=plan.collect_evidence, M_rule=plan.kb.M,
             dedup=(plan.pack_dedup and subs_noop), subs_noop=subs_noop,
-            S_cap=(None if subs_noop else plan.S))
+            S_cap=(None if subs_noop else plan.G))
     else:
         subs_noop = False
         packed = pack_states(
             resolved, fr.top_rule_idx, fr.grounding_body,
-            fr.body_count, plan.S, plan.kb.padding_idx,
+            fr.body_count, plan.G, plan.kb.padding_idx,
             collect_evidence=plan.collect_evidence, M_rule=plan.kb.M,
             parent_goals=fr.goal_atoms)
 
     # next_var advances by the FIXED dense width on the sld/rtf flat path so the
     # unbound-var labels match dense (enum-flat keeps the dynamic G_out advance).
-    S_adv = plan.S if (isinstance(resolved, FlatResolvedChildren)
+    S_adv = plan.G if (isinstance(resolved, FlatResolvedChildren)
                        and not subs_noop) else packed.goal_atoms.shape[1]
     fr = fr.replace(
         grounding_body=packed.grounding_body,
@@ -171,16 +183,15 @@ def postprocess_goals(plan, fr: Frontier, excluded_queries) -> Frontier:
     return fr.replace(goal_atoms=compact_atoms(fr.goal_atoms, plan.kb.padding_idx))
 
 
-def collect_groundings_step(plan, fr: Frontier, coll: _Collected) -> Tuple[Frontier, _Collected]:
+def harvest_completed_trees(plan, fr: Frontier, coll: _Collected) -> Tuple[Frontier, _Collected]:
     """Collect completed groundings into output buffer (coll non-None here)."""
-    deactivate = (plan.collect_mode != "grounded")
-    cb, cm, cr, sv, c_bc, c_hd = collect_groundings(
+    cb, cm, cr, sv, c_bc, c_hd = harvest_tree_firings(
         fr.accumulated_body, fr.goal_atoms, fr.goal_valid,
         fr.rule_idx_per_depth, coll.collected_body, coll.collected_mask,
         coll.collected_rule_idx, plan.kb.constant_no, plan.kb.padding_idx,
         plan.Y_q, body_count=fr.body_count,
-        collected_body_count=coll.collected_body_count, collect_mode=plan.collect_mode,
-        deactivate=deactivate, head_per_depth=fr.head_per_depth,
+        collected_body_count=coll.collected_body_count,
+        head_per_depth=fr.head_per_depth,
         collected_head=coll.collected_head,
         variant_to_orig=plan.variant_to_orig)
     fr = fr.replace(goal_valid=sv)
@@ -195,11 +206,11 @@ def postprocess(plan, fr: Frontier, coll: Optional[_Collected], sync, dsel,
                 excluded_queries) -> Tuple[Frontier, Optional[_Collected]]:
     """Prune goals + sync accumulated + (last-step clear) + collect groundings."""
     fr = postprocess_goals(plan, fr, excluded_queries)
-    fr = sync_accumulated(plan, fr, sync, dsel)
+    fr = advance_tree_tape(plan, fr, sync, dsel)        # Stage 2 (TREES tier): carry the proof tape forward
     if plan.w_last_depth is not None and plan.w_last_depth > 0 and dsel.is_last:
         fr = fr.replace(goal_atoms=torch.full_like(fr.goal_atoms, plan.kb.padding_idx))
     if plan.collect_evidence:
-        fr, coll = collect_groundings_step(plan, fr, coll)
+        fr, coll = harvest_completed_trees(plan, fr, coll)   # Stage 3 (TREES tier): harvest finished proofs
     return fr, coll
 
 

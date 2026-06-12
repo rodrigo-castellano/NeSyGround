@@ -67,16 +67,16 @@ def _build_grounder(kind: str, kb, cfg: dict, chunk_size=None) -> BackwardGround
     if kind in ("SLD", "RTF"):
         res = SLD(depth=cfg["depth"]) if kind == "SLD" else RTF(depth=cfg["depth"])
         config = Backward(res, filter="none", max_groundings_per_query=4096,
-                          max_children=64, max_states=256, prune_facts=True)
+                          max_children=64, max_goals=256, prune_facts=True)
         return BackwardGrounder(kb, config, chunk_size=chunk_size)
     if kind in ("enum-flat", "enum-dense"):
         flat = (kind == "enum-flat")
         config = Backward(
-            PBC(depth=cfg["d"], width=cfg["w"], u=0, flat_intermediate=flat,
-                max_groundings_per_rule=64),
-            max_groundings_per_query=4096, max_states=256, prune_facts=True,
-            bump_s_to_k=False, init_state_shape="minimal")
-        return BackwardGrounder(kb, config, chunk_size=chunk_size)
+            PBC(depth=cfg["d"], width=cfg["w"], u=0, max_groundings_per_rule=64),
+            max_groundings_per_query=4096, max_goals=256, prune_facts=True,
+            bump_s_to_k=False)
+        return BackwardGrounder(kb, config, layout=("flat" if flat else "dense"),
+                                chunk_size=chunk_size)
     raise ValueError(f"unsupported kind: {kind!r}")
 
 

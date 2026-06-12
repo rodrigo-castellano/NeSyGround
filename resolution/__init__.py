@@ -18,7 +18,7 @@ from grounder.resolution.api import ResolveRequest, Resolver
 from grounder.resolution.mgu import (
     empty_rule_results, init_mgu, resolve_facts, resolve_rules,
 )
-from grounder.resolution.pbc import PbcResolver, build_plan, init_enum, resolve_step
+from grounder.resolution.pbc import PbcResolver, build_plan, build_tables, resolve_step
 from grounder.resolution.primitives import apply_substitutions, unify_one_to_one
 from grounder.resolution.rtf import RtfResolver, resolve_rtf
 from grounder.resolution.sld import SldResolver, resolve_sld
@@ -31,7 +31,7 @@ __all__ = [
     "unify_one_to_one", "apply_substitutions",
     "resolve_facts", "resolve_rules", "empty_rule_results", "init_mgu",
     "resolve_sld", "resolve_rtf",
-    "pbc", "init_enum", "build_plan", "resolve_step",
+    "pbc", "build_tables", "build_plan", "resolve_step",
     "Resolver", "ResolveRequest", "SldResolver", "RtfResolver", "PbcResolver",
     "StandardizationConfig", "build_standardize_fn",
     "standardize_vars_offset", "standardize_vars_canonical",

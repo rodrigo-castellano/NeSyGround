@@ -50,7 +50,7 @@ def head_pred_all_ok(body_pred_vals: Tensor, exists: Tensor,
     return all_body_active_ok(exists | head_pred_ok, body_active)
 
 
-def apply_filters_dense(has_query_atom: Tensor, exists: Tensor, body_active: Tensor,
+def filter_dense(has_query_atom: Tensor, exists: Tensor, body_active: Tensor,
                         body_preds: Tensor, active_mask: Tensor, cand_mask: Tensor,
                         width, head_pred_mask: Optional[Tensor],
                         *, is_last: Optional[Tensor] = None) -> Tensor:
@@ -97,7 +97,7 @@ def apply_filters_dense(has_query_atom: Tensor, exists: Tensor, body_active: Ten
     return mask
 
 
-def apply_filters_flat(flat_body: Tensor, flat_exists: Tensor, flat_b_idx: Tensor,
+def filter_flat(flat_body: Tensor, flat_exists: Tensor, flat_b_idx: Tensor,
                        flat_num_body: Tensor, queries: Tensor, width,
                        head_pred_mask: Optional[Tensor], M: int,
                        body_active: Optional[Tensor] = None) -> Tensor:
@@ -125,4 +125,4 @@ def apply_filters_flat(flat_body: Tensor, flat_exists: Tensor, flat_b_idx: Tenso
     return mask
 
 
-__all__ = ["apply_filters_dense", "apply_filters_flat", "all_body_active_ok", "head_pred_all_ok", "depth_gate"]
+__all__ = ["filter_dense", "filter_flat", "all_body_active_ok", "head_pred_all_ok", "depth_gate"]

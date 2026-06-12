@@ -5,6 +5,14 @@ groundings pays for nothing more). Scopes nest run ⊃ chunk ⊃ step:
   - ``Frontier``                   — working frontier (chunk-scoped, threaded step→step; PURE)
   - ``FiringSet`` / ``ProofTrees`` — append-only accumulators (run-scoped)
 Tiers: groundings→GoalState, firings→RuleGroundings, trees→CompletedTreeFirings.
+
+The two evidence accumulators capture at DIFFERENT stages and neither derives from
+the other (this is why both exist):
+  - ``FiringSet`` (firings tier) — captured at RESOLVE time: EVERY fired rule
+    application, the full "considered" set → ``RuleGroundings``.
+  - ``ProofTrees`` (trees tier)  — captured at COLLECT/finalize time: only firings
+    inside COMPLETED proof trees (Y_q-budgeted; ~3× fewer than considered)
+    → ``CompletedTreeFirings``.
 """
 from __future__ import annotations
 

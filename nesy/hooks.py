@@ -60,7 +60,7 @@ class GuidedScorer(Protocol):
 
     Called by the guided join path on GROUND NON-FACT atoms only — facts score
     exactly 1.0 via the fact index and variable atoms are neutral, both handled
-    grounder-side (see ``resolution.pbc.candidates.GuidedSelect``). Must be
+    grounder-side (see ``resolution.pbc.guided.GuidedBeam``). Must be
     deterministic and is invoked under ``no_grad``.
     """
 

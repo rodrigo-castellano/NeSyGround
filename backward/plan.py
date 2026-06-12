@@ -37,15 +37,12 @@ class RunPlan:
     depth: int
     width: Optional[int]
     w_last_depth: int
-    S: int
+    G: int
     Y_q: int
-    max_goals: int
+    max_atoms: int
     max_vars_per_rule: int
     max_fact_pairs_body: int
-    collect_evidence: bool
-    collect_rule_groundings: bool
-    collect_mode: str
-    flat_intermediate: bool
+    flat_prune: bool                     # pbc flat: push width into the enumeration (per-fv prune)
     pack_dedup: bool
     prune_facts: bool
     all_anchors: bool
@@ -67,26 +64,23 @@ class RunPlan:
         B = getattr(grounder, "B", 1)
         is_pbc = grounder.resolution == "pbc"
         shapes = Shapes(
-            B=B, G=grounder.S, L=grounder.max_goals, M=kb.M, D=grounder.depth, A=grounder.A,
+            B=B, G=grounder.G, L=grounder.max_atoms, M=kb.M, D=grounder.depth, A=grounder.A,
             Y_q=grounder.Y_q, K_f=kb.K_f, K_r=getattr(grounder, "K_r", kb.K_r),
             Y_r=getattr(grounder, "Y_r", 1), K_v=getattr(grounder, "K_v", 1),
             V=getattr(grounder, "V", 1), E=getattr(grounder, "_E", kb.constant_no),
-            N=B * grounder.S, pad=kb.padding_idx)
+            N=B * grounder.G, pad=kb.padding_idx)
         return RunPlan(
             shapes=shapes, kb=kb,
             output_spec=grounder.output_spec,  # set in __init__ (no eager default → compile-safe)
             strategy=RunPlan._resolve_strategy(grounder, shapes, is_pbc),
             pbc=build_plan(grounder) if is_pbc else None,
-            resolution=getattr(grounder, "_dispatch_resolution", grounder.resolution),
+            resolution=grounder.resolution,
             filter_mode=grounder.filter_mode,
             depth=grounder.depth, width=grounder.width,
-            w_last_depth=grounder.w_last_depth, S=grounder.S, Y_q=grounder.Y_q,
-            max_goals=grounder.max_goals, max_vars_per_rule=grounder.max_vars_per_rule,
+            w_last_depth=grounder.w_last_depth, G=grounder.G, Y_q=grounder.Y_q,
+            max_atoms=grounder.max_atoms, max_vars_per_rule=grounder.max_vars_per_rule,
             max_fact_pairs_body=getattr(grounder, "_max_fact_pairs_body", 0),
-            collect_evidence=grounder.collect_evidence,
-            collect_rule_groundings=grounder._collect_rule_groundings,
-            collect_mode=grounder._collect_mode,
-            flat_intermediate=grounder._flat_intermediate,
+            flat_prune=getattr(grounder, "_flat_prune", False),
             pack_dedup=grounder._pack_dedup, prune_facts=grounder.prune_facts,
             all_anchors=grounder._all_anchors,
             init_state_shape=grounder._init_state_shape,
@@ -111,11 +105,26 @@ class RunPlan:
             return ExecStrategy.explicit(row, Cell(grounder._exec_layout, grounder._exec_compile), chunk)
         strategy = ExecStrategy.auto(row, shapes=shapes)
         if not strategy.cell.compile.eager and not getattr(grounder, "compile_enabled", False):
-            want = Layout.FLAT if grounder._flat_intermediate else Layout.DENSE
+            want = Layout.FLAT if is_pbc else Layout.DENSE   # auto flat-pref: pbc→flat, sld/rtf→dense
             return ExecStrategy.explicit(row, Cell(want, EAGER), strategy.chunk)
         if not is_pbc and strategy.cell.layout is Layout.FLAT:
             return ExecStrategy.explicit(row, Cell(Layout.DENSE, EAGER), strategy.chunk)
         return strategy
+
+    @property
+    def flat_intermediate(self) -> bool:
+        """flat-vs-dense is an EXEC-layer decision — derived from the resolved cell layout,
+        not stored. (Kept as a property so the resolver + snapshot tests read one source.)"""
+        return self.strategy.cell.layout is Layout.FLAT
+
+    # which evidence tiers to collect — derived from the ONE source (output_spec), not stored.
+    @property
+    def collect_evidence(self) -> bool:           # TREES tier (CompletedTreeFirings)
+        return self.output_spec.trees
+
+    @property
+    def collect_rule_groundings(self) -> bool:    # FIRINGS tier (RuleGroundings)
+        return self.output_spec.firings
 
     def for_chunk(self, B: int) -> "RunPlan":
         """New immutable plan with Shapes rebatched to ``B``."""

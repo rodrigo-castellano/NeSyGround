@@ -1,7 +1,7 @@
 """PBC resolve — the per-step driver + the two materializers.
 
-Fixed, shared pipeline:  depth_gate → prepare → cluster → enumerate → fill →
-width → emit.  The dense and flat MATERIALIZERS implement the stages that differ
+Fixed, shared pipeline:  set_step → prepare → cluster → enumerate → fill →
+filter → emit.  The dense and flat MATERIALIZERS implement the stages that differ
 by layout (chosen once per run — no hot-loop branching, each traces its own
 graph); ``cluster``/``depth_gate`` and the inner cores (`_gather_body_atoms`,
 the width reductions) are shared.
@@ -18,9 +18,10 @@ import torch
 from torch import Tensor
 
 from grounder.execution.capability import Cell, EAGER, COMPILED_STEP, COMPILED_DYNAMIC
-from grounder.resolution.pbc import candidates as C
-from grounder.resolution.pbc.candidates import cluster
-from grounder.resolution.pbc.width import apply_filters_dense, apply_filters_flat, depth_gate
+from grounder.resolution.pbc import enumerate as C
+from grounder.resolution.pbc.enumerate import cluster
+from grounder.resolution.pbc.guided import GuidedBeam
+from grounder.resolution.pbc.width import filter_dense, filter_flat, depth_gate
 from grounder.base.types import FlatResolvedChildren, Layout, ResolvedChildren
 
 
@@ -45,6 +46,7 @@ def resolve_step(inp: StepInputs, plan, fact_index, materializer):
     """Drive the pbc pipeline for one step → ResolvedChildren | FlatResolvedChildren."""
     w_d, hpm_d = depth_gate(inp.d, inp.depth, inp.width, inp.w_last_depth,
                             plan.tables.head_pred_mask, inp.is_last)
+    materializer.set_step(w_d, inp.d)   # no-op for dense / one-shot flat; arms prune+beam for the pruned flat
     work = materializer.prepare(inp, plan)
     if work is None:
         return materializer.empty(inp, plan)
@@ -53,7 +55,7 @@ def resolve_step(inp: StepInputs, plan, fact_index, materializer):
     if cand is None:
         return materializer.empty(inp, plan)
     body, exists, body_active = materializer.fill(cand, cl, plan, fact_index, work)
-    keep = materializer.width(body, exists, body_active, cand, cl, work, w_d, hpm_d, inp)
+    keep = materializer.filter(body, exists, body_active, cand, cl, work, w_d, hpm_d, inp)
     return materializer.emit(body, keep, cand, cl, work, inp, plan)
 
 
@@ -69,6 +71,9 @@ class _DenseCand(NamedTuple):
 
 class DenseMaterializer:
     """Static padded [B,S,K,…] children (compile/CUDA-graph)."""
+
+    def set_step(self, w_d, d) -> None:    # dense has no per-step prune/beam state
+        pass
 
     def prepare(self, inp: StepInputs, plan) -> _DenseWork:
         B, S, _ = inp.queries.shape
@@ -86,14 +91,14 @@ class DenseMaterializer:
 
         if plan.V >= 2 and not plan.cartesian_product:           # ≥2 free vars: cartesian
             dep_src, dep_bpreds = t.arg_source_dep[ai], t.body_preds_dep[ai]
-            source, cmask, Y_r = C.enumerate_cartesian_dense(
+            source, cmask, Y_r = C.enumerate_dense_cartesian(
                 N, K_r, qs, qo, t.fv_enum_pred[ai], t.fv_enum_bound_src[ai],
                 t.fv_enum_direction[ai], t.fv_enum_valid[ai], cl.has_free_q, cl.active_mask,
                 fact_index, K_v=plan.K_v, V=plan.V, G_cap=Y_r, fv_any_valid=plan.fv_any_valid,
                 check_arg_source_q=dep_src, body_preds_q=dep_bpreds, num_body_q=num_body_q, M=plan.M)
             return _DenseCand(source, dep_src, dep_bpreds, cmask, Y_r, num_body_q)
 
-        cands, cmask = C.enumerate_single_dense(                  # ≤1 free var: single lookup
+        cands, cmask = C.enumerate_dense_single(                  # ≤1 free var: single lookup
             N, K_r, Y_r, qs, qo, t.enum_pred[ai], t.enum_bound[ai], t.enum_dir[ai],
             fact_index, cartesian_product=plan.cartesian_product, E=plan.E)
         Y_r = cands.size(2)
@@ -132,9 +137,9 @@ class DenseMaterializer:
                                & body_active[..., m])
         return has_query_atom, exists, body_active
 
-    def width(self, body, exists, body_active, cand: _DenseCand, cl, work, w_d, hpm_d, inp):
+    def filter(self, body, exists, body_active, cand: _DenseCand, cl, work, w_d, hpm_d, inp):
         # ``body`` carries fill's precomputed has_query_atom (see fill docstring).
-        return apply_filters_dense(body, exists, body_active, cand.body_preds,
+        return filter_dense(body, exists, body_active, cand.body_preds,
                                    cl.active_mask, cand.cmask, w_d, hpm_d,
                                    is_last=inp.is_last)
 
@@ -230,7 +235,24 @@ class _FlatCand:
 
 
 class FlatMaterializer:
-    """Compact [T,…] children via nonzero (eager, zero-waste)."""
+    """Compact [T,…] children via nonzero (eager, zero-waste).
+
+    ``prune`` pushes the width predicate INTO the enumeration as a per-fv branch
+    pruner (incremental ``enumerate_flat_pruned``); ``prune=False`` runs the
+    one-shot cartesian enumeration + post-hoc width filter — set-identical
+    survivors (gated by tests/join_ab.py), the prune only drops partials the
+    filter would reject anyway. ``beam`` (GuidedBeam) layers a KGE top-k over the
+    pruned expansion and implies pruning. Both are flat-eager only."""
+
+    def __init__(self, prune: bool = False, beam: Optional[GuidedBeam] = None) -> None:
+        self._prune = prune or beam is not None      # a beam prunes by construction
+        self._beam = beam
+        self._prune_width = None      # int | 0-dim Tensor | None (set per step)
+
+    def set_step(self, w_d, d) -> None:
+        self._prune_width = w_d
+        if self._beam is not None:
+            self._beam.d = int(d)
 
     def prepare(self, inp: StepInputs, plan) -> Optional[_FlatWork]:
         B, S, _ = inp.queries.shape
@@ -250,10 +272,25 @@ class FlatMaterializer:
     def enumerate(self, work: _FlatWork, cl, plan, fact_index) -> Optional[_FlatCand]:
         t, ai = plan.tables, cl.active_idx
         qs, qo = work.flat_q[:, 1], work.flat_q[:, 2]
-        flat_source, n_idx, r_idx = C.enumerate_cartesian_flat(
-            work.flat_q.size(0), cl.K_r, qs, qo, t.fv_enum_pred[ai], t.fv_enum_bound_src[ai],
-            t.fv_enum_direction[ai], t.fv_enum_valid[ai], cl.has_free_q, cl.active_mask,
-            fact_index, V=plan.V, fv_any_valid=plan.fv_any_valid)
+        if not self._prune:
+            flat_source, n_idx, r_idx = C.enumerate_flat_cartesian(
+                work.flat_q.size(0), cl.K_r, qs, qo, t.fv_enum_pred[ai], t.fv_enum_bound_src[ai],
+                t.fv_enum_direction[ai], t.fv_enum_valid[ai], cl.has_free_q, cl.active_mask,
+                fact_index, V=plan.V, fv_any_valid=plan.fv_any_valid)
+        else:
+            # ready_after[r,m]: max free-var dep-index a body atom refs (-1 if none) →
+            # the fv step after which the atom is fully determined (subj/obj cols → -1).
+            ready_after = (t.arg_source_dep[ai] - 2).clamp(min=-1).max(dim=-1).values  # [N,K_r,M]
+            w_d = self._prune_width
+            # eager-only int width supports pruning; None / 0-dim tensor → no prune (sound).
+            prune_w = w_d if isinstance(w_d, int) else None
+            flat_source, n_idx, r_idx = C.enumerate_flat_pruned(
+                work.flat_q.size(0), cl.K_r, qs, qo, t.fv_enum_pred[ai], t.fv_enum_bound_src[ai],
+                t.fv_enum_direction[ai], t.fv_enum_valid[ai], cl.active_mask,
+                fact_index, V=plan.V, fv_any_valid=plan.fv_any_valid,
+                arg_source_dep_q=t.arg_source_dep[ai], body_preds_dep_q=t.body_preds_dep[ai],
+                num_body_q=t.num_body_atoms[ai], ready_after_q=ready_after,
+                width=prune_w, w_is_capped=(prune_w is not None), guided=self._beam)
         if flat_source.size(0) == 0:
             return None
         rule_global = ai[n_idx, r_idx]
@@ -263,24 +300,26 @@ class FlatMaterializer:
 
     def fill(self, cand: _FlatCand, cl, plan, fact_index, work: _FlatWork):
         M, dev = plan.M, work.flat_q.device
-        body = C.fill_body_flat(cand.flat_source, cand.check_flat, cand.bpreds_flat)
+        body = C.fill_flat(cand.flat_source, cand.check_flat, cand.bpreds_flat)
         # Fill-only inputs are dead from here on — release before the exists
         # gather (the fill-stage transient peak) instead of after emit.
         cand.flat_source = cand.check_flat = cand.bpreds_flat = None
         T = body.size(0)
         exists = fact_index.exists(body.reshape(-1, 3)).reshape(T, M)
         body_active = C.arange_cached(M, dev).unsqueeze(0) < cand.nbody_flat.unsqueeze(1)
-        # In-place: body is the fresh fill_body_flat cat output (sole ref), so
+        # In-place: body is the fresh fill_flat cat output (sole ref), so
         # masking in place skips a second [T, M, 3] materialization.
         body.masked_fill_(~body_active.unsqueeze(-1), fact_index._padding_idx)
         return body, exists, body_active
 
-    def width(self, body, exists, body_active, cand: _FlatCand, cl, work, w_d, hpm_d, inp):
+    def filter(self, body, exists, body_active, cand: _FlatCand, cl, work, w_d, hpm_d, inp):
         M = body.size(1)
-        return apply_filters_flat(body, exists, cand.n_idx_eff, cand.nbody_flat,
+        return filter_flat(body, exists, cand.n_idx_eff, cand.nbody_flat,
                                   work.flat_q, w_d, hpm_d, M, body_active=body_active)
 
     def emit(self, body, mask, cand: _FlatCand, cl, work: _FlatWork, inp: StepInputs, plan):
+        if self._beam is not None:               # per-query state beam (guided only)
+            mask = self._beam.state_beam(body, mask, cand, work, inp, plan.M)
         B, S, M, dev = work.B, work.S, plan.M, body.device
         G, G_body, pad = inp.remaining.shape[2], inp.grounding_body.shape[2], inp.padding_idx
         surv = torch.nonzero(mask, as_tuple=False).squeeze(1)
@@ -324,7 +363,7 @@ class FlatMaterializer:
         flat_goals = torch.cat(parts, dim=1) if len(parts) > 1 else surv_body
         # Dead provenance on the enum path (subs_noop=True): pack_states_flat
         # reads grounding_body/subs/is_fact/top ONLY on the sld/rtf
-        # (subs_noop=False) path and extract_rows never touches them — emit
+        # (subs_noop=False) path and extract_firings never touches them — emit
         # zero-stride expanded constants instead of [T, …] materializations.
         flat_grounding_body = torch.zeros(1, G_body, 3, dtype=torch.long,
                                           device=dev).expand(T_surv, -1, -1)
@@ -348,95 +387,6 @@ class FlatMaterializer:
             torch.zeros(0, dtype=torch.bool, device=dev), z(0), B, S, True)
 
 
-# ══════════════════════════ join (L3) ══════════════════════════
-
-class JoinMaterializer(FlatMaterializer):
-    """L3 join layout — flat compact rows + an in-join width BRANCH PRUNER.
-
-    SIBLING of FlatMaterializer: reuses prepare/fill/width/emit UNCHANGED and only
-    swaps ``enumerate`` for an incremental (per-fv) expansion that drops partial
-    rows whose determined-unknown count already exceeds the step width. Because the
-    final ``apply_filters_flat`` (in .width) is untouched and the pruner removes
-    only rows it too would reject, the survivor SET equals the flat path's.
-
-    ``set_step(w_d, d)`` is called by ``resolve_step_join`` with the per-step
-    width (== the filter's, accounting for the last-step ``w_last_depth``) and
-    the eager depth index ``d`` (join is eager-only)."""
-
-    def __init__(self):
-        self._prune_width = None   # int | 0-dim Tensor | None (set per step)
-        self._gsel = None          # GuidedSelect (GuidedMaterializer only)
-
-    def set_step(self, w_d, d) -> None:
-        self._prune_width = w_d
-
-    def enumerate(self, work: _FlatWork, cl, plan, fact_index) -> Optional[_FlatCand]:
-        t, ai = plan.tables, cl.active_idx
-        qs, qo = work.flat_q[:, 1], work.flat_q[:, 2]
-        N = work.flat_q.size(0)
-        # ready_after[r,m]: max free-var dep-index a body atom refs (-1 if none) →
-        # the fv step after which the atom is fully determined (subj/obj cols → -1).
-        ready_after = (t.arg_source_dep[ai] - 2).clamp(min=-1).max(dim=-1).values  # [N,K_r,M]
-        w_d = self._prune_width
-        # eager-only int width supports pruning; None / 0-dim tensor → no prune (sound).
-        prune_w = w_d if isinstance(w_d, int) else None
-        flat_source, n_idx, r_idx = C.enumerate_join_flat(
-            N, cl.K_r, qs, qo, t.fv_enum_pred[ai], t.fv_enum_bound_src[ai],
-            t.fv_enum_direction[ai], t.fv_enum_valid[ai], cl.active_mask,
-            fact_index, V=plan.V, fv_any_valid=plan.fv_any_valid,
-            arg_source_dep_q=t.arg_source_dep[ai], body_preds_dep_q=t.body_preds_dep[ai],
-            num_body_q=t.num_body_atoms[ai], ready_after_q=ready_after,
-            width=prune_w, w_is_capped=(prune_w is not None), guided=self._gsel)
-        if flat_source.size(0) == 0:
-            return None
-        rule_global = ai[n_idx, r_idx]
-        return _FlatCand(flat_source, n_idx, r_idx, rule_global,
-                         t.arg_source_dep[rule_global], t.body_preds_dep[rule_global],
-                         t.num_body_atoms[rule_global])
-
-
-class GuidedMaterializer(JoinMaterializer):
-    """KGE-guided join (``PBC.guided_topk``) — the join loop + a per-state
-    binding beam + a per-query state beam, one scoring rule at both levels:
-    fact atoms 1.0 EXACTLY (index membership, never the KGE), ground unknowns
-    the consumer's ``GuidedScorer`` prior, variables/padding neutral. Rows whose
-    every determined atom is a fact are proof material and ride OUTSIDE the
-    budget — ``k`` rations speculation only, so found proofs are never evicted
-    and the proof set is monotone in depth. ``k=None`` + attached GuidedStats =
-    census mode: byte-identical survivors to Join, counters only."""
-
-    def __init__(self, k, tnorm, scorer, kb, stats=None):
-        super().__init__()
-        self._gsel = C.GuidedSelect(k, tnorm, scorer, kb.fact_index,
-                                    kb.constant_no, kb.padding_idx, stats)
-
-    def set_step(self, w_d, d) -> None:
-        super().set_step(w_d, d)
-        self._gsel.d = int(d)
-
-    def emit(self, body, mask, cand, cl, work: _FlatWork, inp: StepInputs, plan):
-        mask = self._gsel.state_beam(body, mask, cand, work, inp, plan.M)
-        return super().emit(body, mask, cand, cl, work, inp, plan)
-
-
-def resolve_step_join(inp: StepInputs, plan, fact_index, materializer: JoinMaterializer):
-    """resolve_step for the join: identical pipeline, but feeds the per-step width
-    ``w_d`` (+ eager depth) to the materializer's in-join pruner before enumerate."""
-    w_d, hpm_d = depth_gate(inp.d, inp.depth, inp.width, inp.w_last_depth,
-                            plan.tables.head_pred_mask, inp.is_last)
-    materializer.set_step(w_d, inp.d)
-    work = materializer.prepare(inp, plan)
-    if work is None:
-        return materializer.empty(inp, plan)
-    cl = cluster(work.q_preds, work.q_valid, plan.tables)
-    cand = materializer.enumerate(work, cl, plan, fact_index)
-    if cand is None:
-        return materializer.empty(inp, plan)
-    body, exists, body_active = materializer.fill(cand, cl, plan, fact_index, work)
-    keep = materializer.width(body, exists, body_active, cand, cl, work, w_d, hpm_d, inp)
-    return materializer.emit(body, keep, cand, cl, work, inp, plan)
-
-
 # ══════════════════════════ resolver wrapper (AXIS 1 seam) ══════════════════════════
 
 class PbcResolver:
@@ -452,8 +402,16 @@ class PbcResolver:
     def resolve(self, req):
         plan, fr, kb, dsel = req.plan, req.frontier, req.plan.kb, req.depth_selector
         pbc = plan.pbc
-        mat = (FlatMaterializer() if (plan.flat_intermediate and pbc.V >= 1)
-               else DenseMaterializer())
+        if plan.flat_intermediate and pbc.V >= 1:
+            # flat: prune by default (set-identical to one-shot; join_ab-gated). A KGE beam
+            # (guided_topk / census stats) rides the same pruned per-fv expansion.
+            beam = None
+            if plan.guided_topk is not None or plan.guided_stats is not None:
+                beam = GuidedBeam(plan.guided_topk, plan.guided_tnorm, plan.guided_scorer,
+                                  kb.fact_index, kb.constant_no, kb.padding_idx, plan.guided_stats)
+            mat = FlatMaterializer(prune=plan.flat_prune, beam=beam)
+        else:
+            mat = DenseMaterializer()
         inp = StepInputs(
             req.queries, req.remaining, fr.grounding_body, req.goal_valid,
             req.active_mask, padding_idx=kb.padding_idx, d=dsel.d, depth=plan.depth,
@@ -466,34 +424,5 @@ class PbcResolver:
         return resolve_step(inp, pbc, kb.fact_index, mat)
 
 
-class JoinResolver:
-    """RESOLVERS["join"] — L3 join SIBLING of pbc (NOT a modification of it).
-
-    Reuses the PbcPlan binding tables; drives ``resolve_step_join`` with a
-    ``JoinMaterializer`` (flat-eager only). Produces the EXACT pbc flat survivor
-    SET (set-equality gated by tests/join_ab.py), with the width predicate pushed
-    into the join as a branch pruner instead of a post-hoc filter."""
-    name = "join"
-
-    def declared_cells(self) -> frozenset:
-        return frozenset({Cell(Layout.FLAT, EAGER)})
-
-    def resolve(self, req):
-        plan, fr, kb, dsel = req.plan, req.frontier, req.plan.kb, req.depth_selector
-        pbc = plan.pbc
-        if plan.guided_topk is not None or plan.guided_stats is not None:
-            mat = GuidedMaterializer(plan.guided_topk, plan.guided_tnorm,
-                                     plan.guided_scorer, kb, plan.guided_stats)
-        else:
-            mat = JoinMaterializer()
-        inp = StepInputs(
-            req.queries, req.remaining, fr.grounding_body, req.goal_valid,
-            req.active_mask, padding_idx=kb.padding_idx, d=dsel.d, depth=plan.depth,
-            is_last=None, width=plan.width, w_last_depth=plan.w_last_depth,
-            collect_evidence=plan.collect_evidence, dedup_goals=False)
-        return resolve_step_join(inp, pbc, kb.fact_index, mat)
-
-
-__all__ = ["StepInputs", "resolve_step", "resolve_step_join", "DenseMaterializer",
-           "FlatMaterializer", "JoinMaterializer", "GuidedMaterializer",
-           "PbcResolver", "JoinResolver"]
+__all__ = ["StepInputs", "resolve_step", "DenseMaterializer",
+           "FlatMaterializer", "PbcResolver"]

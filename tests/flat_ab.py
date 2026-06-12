@@ -38,7 +38,7 @@ _MATRIX = [
 def _build(kb, resolution, depth, layout):
     res = SLD(depth=depth) if resolution == "sld" else RTF(depth=depth)
     config = Backward(res, filter="none", max_groundings_per_query=4096,
-                      max_children=64, max_states=256, prune_facts=True)
+                      max_children=64, max_goals=256, prune_facts=True)
     return BackwardGrounder(kb, config, layout=layout, compile="off")
 
 

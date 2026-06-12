@@ -1,8 +1,8 @@
-"""Join-vs-cartesian SET-equality oracle — gates the L3 JoinResolver against pbc.
+"""Pruned-vs-one-shot flat SET-equality oracle — gates FlatMaterializer(prune=True) vs one-shot.
 
 For (dataset in {family, countries_s2, ablation_d2} + countries_s3) x (w,d,u)
 covering the fingerprint configs, builds TWO BackwardGrounders identical except the
-pbc layout knob (materialization="cartesian" vs "join") and asserts the EMITTED
+the flat_prune knob (one-shot vs pruned) and asserts the EMITTED
 GROUNDING SET is EXACTLY equal — canonical ``(orig_rule_idx, head, sorted_body)``
 keys read off ``out.rule_groundings``. This is set-equality, NOT byte-identity:
 the join pushes the width predicate into the join as a branch pruner, so the row
@@ -49,13 +49,13 @@ _MATRIX = [
 _PEAK_CELL = ("countries_s3", 1, 3, 0)
 
 
-def _build(kb, materialization, w, d, u):
+def _build(kb, mode, w, d, u):
+    # mode "cartesian" → one-shot flat (the oracle); "join" → flat_prune (the pruned path).
     config = Backward(
-        PBC(depth=d, width=w, u=u, materialization=materialization,
-            flat_intermediate=True, max_groundings_per_rule=64),
-        max_groundings_per_query=4096, max_states=256, prune_facts=True,
-        bump_s_to_k=False, init_state_shape="minimal")
-    return BackwardGrounder(kb, config)
+        PBC(depth=d, width=w, u=u, flat_prune=(mode == "join"), max_groundings_per_rule=64),
+        max_groundings_per_query=4096, max_goals=256, prune_facts=True,
+        bump_s_to_k=False)
+    return BackwardGrounder(kb, config, layout="flat")
 
 
 def _grounding_set(out) -> set:

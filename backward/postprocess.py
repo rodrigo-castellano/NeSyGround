@@ -1,6 +1,6 @@
 """Grounding collection + dedup.
 
-``collect_groundings`` gathers terminal (all-goals-padding, body-ground) states
+``harvest_tree_firings`` gathers terminal (all-goals-padding, body-ground) states
 into the per-query collected buffer each step; ``_dedup_groundings`` removes
 duplicate (rule, body) firings via the 5-prime order-invariant hash.
 """
@@ -14,7 +14,7 @@ from torch import Tensor
 from grounder.backward.pack import _pow_desc
 
 
-def collect_groundings(
+def harvest_tree_firings(
     grounding_body: Tensor,     # [B, G, D, M, 3]
     goal_atoms: Tensor,         # [B, G, L, 3]
     goal_valid: Tensor,         # [B, G]
@@ -27,8 +27,6 @@ def collect_groundings(
     Y_q: int,
     body_count: Tensor,          # [B, G, D]
     collected_body_count: Tensor,    # [B, Y_q, D]
-    collect_mode: str = "terminal",
-    deactivate: bool = True,
     head_per_depth: Optional[Tensor] = None,
     collected_head: Optional[Tensor] = None,
     variant_to_orig: Optional[Tensor] = None,
@@ -45,12 +43,7 @@ def collect_groundings(
     body_active = (body_flat[:, :, :, 0] != pad_idx)
     is_ground = ((body_args < E) | ~body_active.unsqueeze(-1)).all(dim=-1).all(dim=-1)
 
-    if collect_mode == "grounded":
-        goal_args = goal_atoms[:, :, :, 1:3]
-        goal_grounded = (goal_args < E).all(dim=-1)
-        all_goals_ok = (is_padding | goal_grounded).all(dim=2)
-    else:
-        all_goals_ok = is_padding.all(dim=2)
+    all_goals_ok = is_padding.all(dim=2)   # terminal collect: a grounding completes when every goal atom is pad
 
     valid_grounding = all_goals_ok & is_ground & goal_valid
 
@@ -77,8 +70,7 @@ def collect_groundings(
     out_body_count = c_bc.gather(1, ki_rule_idx)
     out_head = c_hd.gather(1, ki_head)
 
-    if deactivate:
-        goal_valid = goal_valid & ~valid_grounding
+    goal_valid = goal_valid & ~valid_grounding   # terminal: deactivate goals that just completed
 
     return out_body, out_mask, out_rule_idx, goal_valid, out_body_count, out_head
 
@@ -130,4 +122,4 @@ def _dedup_groundings(
     return mask & ~is_dup_orig
 
 
-__all__ = ["collect_groundings", "_dedup_groundings"]
+__all__ = ["harvest_tree_firings", "_dedup_groundings"]

@@ -20,8 +20,12 @@ from grounder.backward.state import FiringSet
 from grounder.base.types import FlatResolvedChildren, RuleGroundings
 
 
-def extract_rows(plan, resolved, fr):
+def extract_firings(plan, resolved, fr):
     """``(resolved, fr) -> considered rows`` (body in canonical order).
+
+    extract_firings is responsible for extracting the rule firing details (rule index,
+    head atom, body atoms, and batch index) from a single resolution step's output
+    so they can be captured for the Tier.FIRINGS ( RuleGroundings ) output.
 
     FLAT resolved (eager-only): data-dependent ``[valid]`` compaction — the
     returned rows are exactly the valid firings.
@@ -83,10 +87,10 @@ def capture_step(plan, resolved, fr, run, query_offset: int):
     """Append one ``FiringSet`` emission (rule_idx, head, body, global query_idx).
 
     Eager-path composition (kept for direct callers/tests). The compiled path
-    runs :func:`extract_rows` inside the step core and appends in the eager
+    runs :func:`extract_firings` inside the step core and appends in the eager
     rim (``backward.loop``) — Python tuple appends can't live under fullgraph.
     """
-    r_rule, r_head, r_body, r_bidx = extract_rows(plan, resolved, fr)
+    r_rule, r_head, r_body, r_bidx = extract_firings(plan, resolved, fr)
     emission = FiringSet.from_emission(r_rule, r_head, r_body,
                                        r_bidx + query_offset)
     return replace(run, firings=run.firings.extend(emission))
@@ -351,5 +355,5 @@ def pad_rule_groundings(
         num_rules=num_rules, M_max=M_max, query_pool_idx=rg.query_pool_idx)
 
 
-__all__ = ["capture_step", "extract_rows", "finalize", "populate_query_pool_idx",
+__all__ = ["capture_step", "extract_firings", "finalize", "populate_query_pool_idx",
            "pad_rule_groundings", "next_pow2"]

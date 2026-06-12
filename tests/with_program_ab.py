@@ -68,9 +68,9 @@ def _fp(out) -> str:
 
 def _ground(kb, queries) -> str:
     config = Backward(
-        PBC(depth=2, width=1, u=0, flat_intermediate=True, max_groundings_per_rule=64),
-        max_groundings_per_query=4096, max_states=256, prune_facts=True,
-        bump_s_to_k=False, init_state_shape="minimal")
+        PBC(depth=2, width=1, u=0, max_groundings_per_rule=64),
+        max_groundings_per_query=4096, max_goals=256, prune_facts=True,
+        bump_s_to_k=False)
     g = BackwardGrounder(kb, config)
     qmask = torch.ones(queries.shape[0], dtype=torch.bool, device=queries.device)
     with torch.no_grad():

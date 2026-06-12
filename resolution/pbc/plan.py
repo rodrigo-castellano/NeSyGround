@@ -1,6 +1,6 @@
 """PBC compile — build-time setup: binding tables + shape budgets → PbcPlan.
 
-``init_enum`` builds the ``PbcRuleIndex`` (binding analysis), the head-predicate
+``build_tables`` builds the ``PbcRuleIndex`` (binding analysis), the head-predicate
 mask, the per-fv "any rule uses this slot" list, and the K/Y_r/K_v/Y_q budgets; the
 shell registers the buffers + stores the scalars. ``build_plan`` then bundles a
 grounder's (registered, on-device) buffers + budgets into one frozen ``PbcPlan``
@@ -72,18 +72,19 @@ def build_plan(grounder) -> PbcPlan:
         cartesian_product=grounder._cartesian_product)
 
 
-def init_enum(
-    rule_index, fact_index, facts_idx: Tensor, constant_no: int,
-    num_rules: int, M: int, *,
-    width: Optional[int], max_groundings_per_query: int, max_total_groundings: int,
-    device: torch.device, max_children: Optional[int] = None,
-    cartesian_product: bool = False, all_anchors: bool = True,
-    flat_intermediate: bool = False,
-) -> Dict:
-    """Build pbc binding buffers + budgets. Returns buffers + scalar config.
+def build_tables(grounder, *, max_children: int, max_total_groundings: int,
+                 max_groundings_per_rule: Optional[int]) -> None:
+    """Build the pbc binding buffers + budgets and WIRE them onto the grounder:
+    register the buffers, set ``_enum_ri``/``_P``/``_E``/``K_r``/``K``/``Y_q``/``Y_r``/
+    ``V``/``K_v``/``_fv_any_valid``/``max_vars_per_rule``/``_variant_to_orig_t``, then the
+    optional S-bump. S is otherwise shell-owned.
 
-    BIT-EXACT: P = max(fact predicates, rule-HEAD predicates); E from the fact
-    index range. S is owned by the shell (not returned)."""
+    BIT-EXACT: P = max(fact predicates, rule-HEAD predicates); E from the fact index range."""
+    kb = grounder.kb
+    rule_index, fact_index = kb.rule_index, kb.fact_index
+    facts_idx, constant_no, device = fact_index.facts_idx, kb.constant_no, kb.device_
+    all_anchors, cartesian_product = grounder._all_anchors, grounder._cartesian_product
+    max_groundings_per_query = max_groundings_per_rule       # the per-rule Y_r cap
     P_facts = getattr(fact_index, "_num_predicates", None)
     if P_facts is None:
         P_facts = int(facts_idx[:, 0].max().item()) + 1 if facts_idx.numel() > 0 else 1
@@ -140,13 +141,22 @@ def init_enum(
     K = min(K_r * Y_r, children_cap)           # children per state (capped by max_children)
     Y_q = min(max_total_groundings, K_r * Y_r) # collected-groundings budget; ==K when max_children unset
 
-    return {
-        "buffers": buffers, "enum_rule_index": enum_ri,
-        "P": P, "E": E, "K_r": K_r, "K": K, "Y_q": Y_q,
-        "Y_r": Y_r, "cartesian_product": cartesian_product,
-        "V": V, "K_v": K_v, "fv_any_valid": fv_any_valid,
-        "flat_intermediate": flat_intermediate,
-    }
+    for name, tensor in buffers.items():
+        grounder.register_buffer(name, tensor)
+    grounder._enum_ri = enum_ri
+    grounder._P, grounder._E = P, E
+    grounder.K_r, grounder.K, grounder.Y_q = K_r, K, Y_q
+    grounder.Y_r = Y_r
+    grounder.V, grounder.K_v = V, K_v
+    grounder._fv_any_valid = fv_any_valid
+    grounder.max_vars_per_rule = 3
+    # all_anchors dedup/remap needs the variant→original rule mapping on device.
+    if all_anchors:
+        grounder.register_buffer("_variant_to_orig_t", enum_ri.variant_to_orig.to(
+            dtype=torch.long, device=device))
+    # Optional S bump: enlarge S toward K_r*K_v when depth>1 (pbc only).
+    if grounder._bump_s_to_k and grounder.depth > 1 and grounder.width is not None and grounder.width > 0:
+        grounder.G = max(grounder.G, min(K, max(K_r * K_v, 1)))
 
 
-__all__ = ["PbcTables", "PbcPlan", "build_plan", "init_enum"]
+__all__ = ["PbcTables", "PbcPlan", "build_plan", "build_tables"]
