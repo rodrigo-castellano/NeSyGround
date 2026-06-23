@@ -96,6 +96,18 @@ def standardize_vars_offset(
     max_gen_shifted = next_var + extra_new_vars
     new_next_var = torch.maximum(max_in_shifted, max_gen_shifted) + 1
 
+    # next_var MUST exceed every variable in the output: it is the base for the
+    # NEXT step's rule standardize-apart (rule_var_base = next_var + ...). If it
+    # only equals the max live var, a fresh rule head var aliases a live var in
+    # the remaining goals and the head's var↦const unification leaks that constant
+    # into them. The extra_new_vars heuristic above can under-count the true new-var
+    # span, so clamp to the exact max var in the standardized output (cheap masked
+    # amax over an already-materialized tensor; vectorized + CUDA-graph-safe).
+    out_is_var = (std_args > constant_no) & (std_args != pad)              # [B,K,M,2]
+    max_var_out = torch.where(out_is_var, std_args,
+                              torch.zeros_like(std_args)).amax(dim=(1, 2, 3))  # [B]
+    new_next_var = torch.maximum(new_next_var, max_var_out + 1)
+
     if enforce_runtime_range and runtime_var_end_index is not None:
         if _STD_ASSERTS:
             torch._assert_async((new_next_var <= runtime_var_end_index).all(),
