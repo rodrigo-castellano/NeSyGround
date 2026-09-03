@@ -96,6 +96,12 @@ class BackwardGrounder(nn.Module):
         self.guided_tnorm = pbc.guided_tnorm if pbc else "min"
         self.guided_scorer = config.guided_scorer
         self.guided_stats = None      # GuidedStats census counters (attach post-ctor)
+        # Per-call runtime attrs (attach pre-call, like guided_stats; RunPlan
+        # re-snapshots both): per-query beam widths + training capture list.
+        self.guided_query_topk = None   # Optional[Tensor [B]] (learned budgets)
+        self.guided_capture = None      # Optional[list] state-beam decision records
+        self.guided_sample_tau = None   # Optional[float] stochastic state-beam (training)
+        self.guided_query_depth = None  # Optional[Tensor [B]] per-query depth gate
 
         # ── collection / output (which tiers + soundness filter) ──
         # output_spec is the SINGLE source for which tiers to collect; RunPlan derives

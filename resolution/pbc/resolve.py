@@ -271,6 +271,8 @@ class FlatMaterializer:
 
     def enumerate(self, work: _FlatWork, cl, plan, fact_index) -> Optional[_FlatCand]:
         t, ai = plan.tables, cl.active_idx
+        if self._beam is not None:      # per-query budgets need the state→query map
+            self._beam.bind_states(work.active_pos, work.S, work.state_to_goal)
         qs, qo = work.flat_q[:, 1], work.flat_q[:, 2]
         if not self._prune:
             flat_source, n_idx, r_idx = C.enumerate_flat_cartesian(
@@ -314,8 +316,21 @@ class FlatMaterializer:
 
     def filter(self, body, exists, body_active, cand: _FlatCand, cl, work, w_d, hpm_d, inp):
         M = body.size(1)
-        return filter_flat(body, exists, cand.n_idx_eff, cand.nbody_flat,
-                                  work.flat_q, w_d, hpm_d, M, body_active=body_active)
+        mask = filter_flat(body, exists, cand.n_idx_eff, cand.nbody_flat,
+                           work.flat_q, w_d, hpm_d, M, body_active=body_active)
+        # Per-query depth gate: a query's LAST gated step applies the native
+        # last-step strictness (w_last=0: every active body atom a fact), so
+        # gate=D reproduces a plain depth-D run exactly. All-fact rows are
+        # budget-exempt at both selection levels in both runs, so the beam
+        # keeps them identically; the speculative rows this kills would not
+        # exist in the native run's last step at all.
+        if self._beam is not None and self._beam._query_depth is not None:
+            from grounder.resolution.pbc.width import all_body_active_ok
+            b = work.active_pos[cand.n_idx_eff] // work.S
+            last_q = self._beam._query_depth[b] == (self._beam.d + 1)
+            strict = all_body_active_ok(exists, body_active)
+            mask = mask & (strict | ~last_q)
+        return mask
 
     def emit(self, body, mask, cand: _FlatCand, cl, work: _FlatWork, inp: StepInputs, plan):
         if self._beam is not None:               # per-query state beam (guided only)
@@ -416,9 +431,16 @@ class PbcResolver:
             # flat: prune by default (set-identical to one-shot; join_ab-gated). A KGE beam
             # (guided_topk / census stats) rides the same pruned per-fv expansion.
             beam = None
-            if plan.guided_topk is not None or plan.guided_stats is not None:
+            if (plan.guided_topk is not None or plan.guided_stats is not None
+                    or plan.guided_query_topk is not None
+                    or plan.guided_query_depth is not None):
                 beam = GuidedBeam(plan.guided_topk, plan.guided_tnorm, plan.guided_scorer,
-                                  kb.fact_index, kb.constant_no, kb.padding_idx, plan.guided_stats)
+                                  kb.fact_index, kb.constant_no, kb.padding_idx, plan.guided_stats,
+                                  query_topk=plan.guided_query_topk,
+                                  capture=plan.guided_capture,
+                                  query_offset=plan.guided_query_offset,
+                                  sample_tau=plan.guided_sample_tau,
+                                  query_depth=plan.guided_query_depth)
             mat = FlatMaterializer(prune=plan.flat_prune, beam=beam)
         else:
             mat = DenseMaterializer()

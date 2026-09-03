@@ -403,11 +403,26 @@ def enumerate_flat_pruned(B, K_r, query_subjs, query_objs, fv_pred_q, fv_bound_s
             if guided.stats is not None:
                 guided.stats._bump(guided.stats.bindings_in, guided.d, n_idx.size(0))
             if guided.active:
+                # per-query depth gate FIRST: gated rows never reach the
+                # select (fact-perfect rows die past the gate too).
+                alive = guided.depth_alive(guided._state_q[n_idx]) \
+                    if guided._query_depth is not None else None
+                if alive is not None:
+                    surv = torch.nonzero(alive, as_tuple=False).squeeze(1)
+                    n_idx, r_idx, src = n_idx[surv], r_idx[surv], src[surv]
+                    run_score, run_fact = run_score[surv], run_fact[surv]
+            if guided.active and guided.budget_active:
                 run_score, run_fact = guided.update_bindings(
                     src, n_idx, r_idx, fv, run_score, run_fact,
                     arg_source_dep_q, body_preds_dep_q, num_body_q,
                     ready_after_q, M)
-                keep_g = guided.topk_keep(n_idx, run_score, run_fact)
+                keep_g = guided.topk_keep(n_idx, run_score, run_fact,
+                                          k_rows=guided.binding_k(n_idx),
+                                          sample_tau=guided._sample_tau)
+                guided.capture_binding(
+                    src, n_idx, r_idx, fv, run_score, run_fact, keep_g,
+                    arg_source_dep_q, body_preds_dep_q, num_body_q,
+                    ready_after_q, M)
                 n_idx, r_idx, src = n_idx[keep_g], r_idx[keep_g], src[keep_g]
                 run_score, run_fact = run_score[keep_g], run_fact[keep_g]
             if guided.stats is not None:

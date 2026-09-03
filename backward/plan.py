@@ -56,6 +56,11 @@ class RunPlan:
     guided_tnorm: str
     guided_scorer: object                # GuidedScorer (REFERENCE)
     guided_stats: object                 # GuidedStats census counters (REFERENCE; mutable)
+    guided_query_topk: object = None     # Optional[Tensor [B]] per-query beam width (RL budget)
+    guided_capture: object = None        # Optional[list]; state-beam training records (mutable)
+    guided_query_offset: int = 0         # chunk offset: local b_idx → pre-chunk query index
+    guided_sample_tau: object = None     # Optional[float]; stochastic state-beam temperature
+    guided_query_depth: object = None    # Optional[Tensor [B]] per-query depth gate
 
     @staticmethod
     def snapshot(grounder) -> "RunPlan":
@@ -91,7 +96,11 @@ class RunPlan:
             guided_topk=getattr(grounder, "guided_topk", None),
             guided_tnorm=getattr(grounder, "guided_tnorm", "min"),
             guided_scorer=getattr(grounder, "guided_scorer", None),
-            guided_stats=getattr(grounder, "guided_stats", None))
+            guided_stats=getattr(grounder, "guided_stats", None),
+            guided_query_topk=getattr(grounder, "guided_query_topk", None),
+            guided_capture=getattr(grounder, "guided_capture", None),
+            guided_sample_tau=getattr(grounder, "guided_sample_tau", None),
+            guided_query_depth=getattr(grounder, "guided_query_depth", None))
 
     @staticmethod
     def _resolve_strategy(grounder, shapes, is_pbc) -> ExecStrategy:
