@@ -74,13 +74,22 @@ def prune_rule_groundings(rg, *, facts_idx: Tensor, depth: int,
 
     if facts_idx.numel() > 0:
         fi_dev = facts_idx.to(device)
-        base = int(torch.maximum(atom_table.max(), fi_dev.max()).item()) + 1
+        # ``base`` stays a 0-dim tensor: reading it to host (int(...).item())
+        # blocks on every call, and this runs once per grounder invocation.
+        # Device-side arithmetic keeps the same int64 key, no sync.
+        base = torch.maximum(atom_table.max(), fi_dev.max()) + 1
         bb = base * base
         atom_h = (atom_table[:, 0].long() * bb
                   + atom_table[:, 1].long() * base + atom_table[:, 2].long())
         fact_h = (fi_dev[:, 0].long() * bb
                   + fi_dev[:, 1].long() * base + fi_dev[:, 2].long())
-        is_fact = torch.isin(atom_h, fact_h)
+        # sort + searchsorted instead of torch.isin: isin is data-dependent
+        # internally and synchronises, while both of these are shape-static.
+        # Same membership test — equality against the nearest sorted key.
+        fact_sorted, _ = torch.sort(fact_h)
+        pos = torch.searchsorted(fact_sorted, atom_h).clamp_(
+            max=fact_sorted.numel() - 1)
+        is_fact = fact_sorted.gather(0, pos) == atom_h
     else:
         is_fact = torch.zeros(num_atoms, dtype=torch.bool, device=device)
 
