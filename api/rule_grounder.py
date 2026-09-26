@@ -568,8 +568,7 @@ class RuleGrounder(nn.Module):
         """
         from grounder.backward import fast
         from grounder.core import GroundRequest, OutputSpec, Tier
-        if (fast.supports(self._inner) and self._guided_budget[0] is None
-                and self._guided_depth[0] is None):
+        if self.fast():
             # width <= 1 pbc: the fast path — the engine's firings, few host syncs, a compacted atom table
             rg = fast.ground(self._inner, queries, query_mask, chunk_size=self._inner._chunk_size)
         else:
@@ -592,6 +591,25 @@ class RuleGrounder(nn.Module):
                     pad_atom_table_to=next_pow2(max(int(rg.atom_table.size(0)) + 1, 16)),
                     pad_idx_for_atoms=0)
         return rg
+
+    def fast(self) -> bool:
+        """Whether ``run_bc`` / ``run_bc_many`` take :mod:`grounder.backward.fast`."""
+        from grounder.backward import fast
+        return (fast.supports(self._inner) and self._guided_budget[0] is None
+                and self._guided_depth[0] is None)
+
+    def run_bc_many(self, queries: Tensor, query_mask: Tensor, *, depth: Optional[int] = None,
+                    stats: Optional[list] = None) -> list:
+        """``[run_bc(queries[s], query_mask[s]) for s in range(S)]`` for ``queries`` ``[S, Q, 3]``: one grounding
+        pass on the fast path (each batch's output unchanged), else one call per batch. On the fast path ``depth``
+        grounds fewer steps than the grounder's and ``stats`` collects each step's ``(depth, goals, kept)``."""
+        from grounder.backward import fast
+        if self.fast():
+            return fast.ground_many(self._inner, queries, query_mask, chunk_size=self._inner._chunk_size,
+                                    depth=depth, stats=stats)
+        if depth is not None or stats is not None:
+            raise ValueError("depth / stats need the fast path (a width <= 1 pbc grounder on the GPU)")
+        return [self.run_bc(q, m) for q, m in zip(queries, query_mask)]
 
     def __repr__(self) -> str:
         return f"RuleGrounder(inner={self._inner!r})"
