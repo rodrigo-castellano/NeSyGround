@@ -552,7 +552,8 @@ class RuleGrounder(nn.Module):
         batch_size: Optional[int] = None,
         pad_outputs: bool = False,
     ):
-        """Rule-evidence entry point for SBR/DCR/R2N pool-iter consumers.
+        """Rule-evidence entry point for SBR/DCR/R2N pool-iter consumers. Width <= 1 pbc grounders take
+        :mod:`grounder.backward.fast` (the engine's firings, its atom table compacted to the firings' atoms).
 
         ``ground()`` for the FIRINGS tier → :class:`grounder.base.types.RuleGroundings`
         with ``query_pool_idx`` populated (the grounder pins every query into the
@@ -565,16 +566,22 @@ class RuleGrounder(nn.Module):
         far more than the ~0.3 ms/call sync it saves.) ``batch_size`` is accepted
         for caller compatibility but unused.
         """
+        from grounder.backward import fast
         from grounder.core import GroundRequest, OutputSpec, Tier
-        # FIRINGS-only: the rule path consumes ONLY rule_groundings, and a
-        # spec without PROOF_STATE lets the engine skip the final step's
-        # pack/postprocess + the GoalState build (~20% of a depth-2 call;
-        # firings are captured at resolve time, so rg is byte-identical).
-        spec = OutputSpec(frozenset({Tier.FIRINGS}))
-        self._apply_guided_budget(queries)
-        rg = self._inner.ground(
-            GroundRequest(queries=queries, query_mask=query_mask, output_spec=spec)
-        ).rule_groundings
+        if (fast.supports(self._inner) and self._guided_budget[0] is None
+                and self._guided_depth[0] is None):
+            # width <= 1 pbc: the fast path — the engine's firings, few host syncs, a compacted atom table
+            rg = fast.ground(self._inner, queries, query_mask, chunk_size=self._inner._chunk_size)
+        else:
+            # FIRINGS-only: the rule path consumes ONLY rule_groundings, and a
+            # spec without PROOF_STATE lets the engine skip the final step's
+            # pack/postprocess + the GoalState build (~20% of a depth-2 call;
+            # firings are captured at resolve time, so rg is byte-identical).
+            spec = OutputSpec(frozenset({Tier.FIRINGS}))
+            self._apply_guided_budget(queries)
+            rg = self._inner.ground(
+                GroundRequest(queries=queries, query_mask=query_mask, output_spec=spec)
+            ).rule_groundings
         if pad_outputs and rg is not None and rg.rule_offsets.numel() > 1:
             sizes = rg.rule_offsets[1:] - rg.rule_offsets[:-1]
             max_K_r = int(sizes.max().item()) if sizes.numel() else 0
