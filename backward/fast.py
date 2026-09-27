@@ -152,7 +152,8 @@ def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[
             count = one.long()
     rows, vals = last_stage(src, rule, n, goals, start, count, one, facts.values, arg_src, g.body_preds_dep,
                             g.num_body_atoms, _enumerated_atoms(g), head_pred_mask, facts.seen, pad, width,
-                            facts.count, facts.P, facts.E)
+                            facts.count, facts.P, facts.E,
+                            cycle="unknown" if getattr(g, "filter_mode", None) == "keras" else "all")
     n, rule = n[rows], rule[rows]
     src = torch.cat([src[rows], vals.unsqueeze(1), src.new_zeros(rows.shape[0], 1 + V - src.shape[1])], 1)[:, :2 + V]
     args = src.unsqueeze(1).expand(-1, M, -1).gather(-1, arg_src[rule])
@@ -293,11 +294,12 @@ def _keras_proved(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, keep
     Its goals: the queries, then at each step the non-fact atoms of the groundings so far, less, for a grounding's own
     rule, the goals already of that rule's head predicate (a query can be a goal again). Every grounding of a goal is a
     proof of it, its unknown atoms the proof's atoms (a rule with one body atom records none). After the last step,
-    ``depth - 1`` rounds walk the proofs in the rules' order (``g.keras_rule_order``), a rule's step-1 goals' proofs
-    before its step-2 goals', ..., each proving its head if its atoms are proved by then. Keras walks a (rule, step)
-    block's goals in the order of a Python set, which varies with the string hash seed (so does its output, a few
-    groundings in thousands); here in atom order, one of the orders it can take. An atom's earliest proof (its
-    position in the walk) is found by propagation to a fixed point."""
+    ``depth - 1`` rounds (``g.keras_rounds`` if set: the later keras-ns walks ``depth``) walk the proofs in the rules'
+    order (``g.keras_rule_order``), a rule's step-1 goals' proofs before its step-2 goals', ..., each proving its head
+    if its atoms are proved by then. Keras walks a (rule, step) block's goals in the order of a Python set, which varies
+    with the string hash seed (so does its output, a few groundings in thousands); here in atom order, one of the
+    orders it can take. An atom's earliest proof (its position in the walk) is found by propagation to a fixed
+    point."""
     if rule.numel() == 0:
         return keep
     pad, R = g.kb.padding_idx, g.kb.num_rules
@@ -322,7 +324,8 @@ def _keras_proved(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, keep
         return (~unknown).all(1)
     proof = keep & (g.kb.rule_lens.to(rule.device)[rc] >= 2)
     order = getattr(g, "keras_rule_order", torch.arange(R, device=rule.device)).to(rule.device)[rc]
-    walk, rounds, never = R * depth * n, depth - 1, torch.iinfo(torch.long).max // 4
+    rounds = getattr(g, "keras_rounds", None) or depth - 1
+    walk, never = R * depth * n, torch.iinfo(torch.long).max // 4
     t = torch.full((n,), never, dtype=torch.long, device=rule.device)          # each atom's earliest proof
     while True:
         latest = torch.where(unknown, t[bid], -1).amax(1)                               # its atoms' latest proof

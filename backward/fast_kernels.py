@@ -268,7 +268,7 @@ def _last_stage(order_ptr, src_ptr, W, rule_ptr, n_ptr, goal_ptr, start_ptr, cou
                 arg_src_ptr, body_pred_ptr, n_body_ptr, known_ptr, hpm_ptr, P, table_ptr, base, pad, width,
                 out_row_ptr, out_val_ptr, counter_ptr, T,
                 M: tl.constexpr, MP: tl.constexpr, U: tl.constexpr, HPM: tl.constexpr, LOG2T: tl.constexpr,
-                BLOCK: tl.constexpr):
+                BLOCK: tl.constexpr, CYCLE: tl.constexpr = 1):
     """Rows ``order[pid * BLOCK : +BLOCK]`` (rows ordered by candidate count: a block's lanes walk as many): each
     walks its ``count`` candidates (``values[start + j]``, or one 0 with ``one``), ``U`` at a time, as the source
     column ``W`` (columns past it read 0); the kept (row, value) pairs are appended. A row's body atoms (``MP``, the
@@ -301,7 +301,12 @@ def _last_stage(order_ptr, src_ptr, W, rule_ptr, n_ptr, goal_ptr, start_ptr, cou
     exists_fixed = known | _probe3(table_ptr, (p * base + b0) * base + b1, fixed & ~known, LOG2T)
     unknown_fixed = tl.sum((fixed & ~exists_fixed).to(tl.int32), 2)                         # [BLOCK, 1]
     bad_fixed = (live & (n_body <= 0))[:, None]
-    bad_fixed = bad_fixed | (tl.max((fixed & (p == g0) & (b0 == g1) & (b1 == g2)).to(tl.int32), 2) > 0)
+    # a body atom that is the goal itself (CYCLE 1: always dropped; 2, keras-ns's: unless it is a fact, the only way
+    # its grounding keeps the goal: as the atom drawn from the facts)
+    goal_fixed = fixed & (p == g0) & (b0 == g1) & (b1 == g2)
+    if CYCLE == 2:
+        goal_fixed = goal_fixed & ~exists_fixed
+    bad_fixed = bad_fixed | (tl.max(goal_fixed.to(tl.int32), 2) > 0)
     varying = act & uses_v
     if HPM:                                        # an unknown atom must be provable
         unprovable = tl.load(hpm_ptr + tl.minimum(p, P - 1), mask=act, other=1) == 0
@@ -320,7 +325,10 @@ def _last_stage(order_ptr, src_ptr, W, rule_ptr, n_ptr, goal_ptr, start_ptr, cou
         exists = known | _probe3(table_ptr, (p * base + x0) * base + x1, test & ~known, LOG2T)
         missing = test & ~exists
         unknown = unknown_fixed + tl.sum(missing.to(tl.int32), 2)
-        bad = bad_fixed | (tl.max((test & (p == g0) & (x0 == g1) & (x1 == g2)).to(tl.int32), 2) > 0)
+        goal_at = test & (p == g0) & (x0 == g1) & (x1 == g2)
+        if CYCLE == 2:
+            goal_at = goal_at & ~exists
+        bad = bad_fixed | (tl.max(goal_at.to(tl.int32), 2) > 0)
         if HPM:
             bad = bad | (tl.max((missing & unprovable).to(tl.int32), 2) > 0)
         keep = on & ~bad & (unknown <= width)
@@ -402,12 +410,14 @@ def live_count(src: Tensor, rule: Tensor, count: Tensor, arg_src: Tensor, body_p
 def last_stage(src: Tensor, rule: Tensor, n: Tensor, goals: Tensor, start: Tensor, count: Tensor, one: Tensor,
                values: Tensor, arg_src: Tensor, body_pred: Tensor, n_body: Tensor, known: Tensor,
                head_pred_mask: Optional[Tensor], facts: HashSet, pad: int, width: int, slot_count: Tensor, P: int,
-               E: int) -> Tuple[Tensor, Tensor]:
+               E: int, cycle: str = "all") -> Tuple[Tensor, Tensor]:
     """The kept ``(row, value)`` pairs of rows ``src [T, W]`` (rule ``rule [T]``, goal ``goals[n] [T, 3]``) whose
     source column ``W`` walks ``values[start : start + count]`` (``one``: a single 0); ``arg_src [R, M, 2]`` holds
     each body argument's source column (past ``W``: 0), ``known [R, M]`` the body atoms an enumeration drew from
     the facts (not probed). Rows that cannot keep a candidate (:func:`_live_count`, from the fact index's slot
-    counts ``slot_count`` over ``P`` predicates and ``E`` entities) are not walked."""
+    counts ``slot_count`` over ``P`` predicates and ``E`` entities) are not walked. ``cycle``: a grounding whose body
+    holds its own goal is dropped (``"all"``), or only when that atom is not a fact (``"unknown"``: keras-ns, which
+    draws one body atom from the facts and rejects the goal among the others)."""
     T, W = src.shape
     dev = src.device
     src, rule = src.contiguous(), rule.contiguous()
@@ -428,7 +438,7 @@ def last_stage(src: Tensor, rule: Tensor, n: Tensor, goals: Tensor, start: Tenso
             one.to(torch.int8).contiguous(), values, values.numel(), arg_src.contiguous(), body_pred.contiguous(),
             n_body.contiguous(), known8, hpm, hpm.numel(), facts.table, facts.base, pad, width, rows, vals, counter,
             n_live, M=M, MP=triton.next_power_of_2(M), U=UNROLL, HPM=head_pred_mask is not None,
-            LOG2T=facts.log2t, BLOCK=BLOCK)
+            LOG2T=facts.log2t, BLOCK=BLOCK, CYCLE={"all": 1, "unknown": 2}[cycle])
     k = int(counter.item())
     rows, vals = rows[:k], vals[:k]
     return rows.long(), vals.long()

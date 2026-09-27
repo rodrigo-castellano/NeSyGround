@@ -484,8 +484,11 @@ class RuleGrounder(nn.Module):
                     # keras-ns takes such an atom, bound by the head alone, as known without looking it up
                     raise NotImplementedError(f"the keras filter: a body atom of {head} :- {body} has only head "
                                               f"variables")
-            # keras-ns walks the rules in their input order
+            # keras-ns walks the rules in their input order, depth - 1 rounds (the IJCAI-25 code) or ``.r<N>`` rounds
+            # (the later keras-ns of XAI-25 / NeSy-25 walks depth rounds: ``enum.keras.w1.d2.r2.flat``)
             self._inner.keras_rule_order = torch.tensor(self.input_rule, dtype=torch.long)
+            m_r = re.search(r"\.r(\d+)(?:\.|$)", grounder_type)
+            self._inner.keras_rounds = int(m_r.group(1)) if m_r else None
 
         self.fact_index = fact_index
         # Learned-budget provider (rides a list — never registered, so the
