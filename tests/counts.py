@@ -36,9 +36,11 @@ BATCH, GROUP, ORACLE_QUERIES = 256, 4, 64
 FP = ["enum.fp_batch.w0.d1.flat", "enum.fp_batch.w1.d2.flat", "enum.fp_batch.w1.d3.flat"]
 KERAS = ["enum.keras.w0.d1.flat", "enum.keras.w1.d1.flat", "enum.keras.w1.d2.flat", "enum.keras.w1.d2.r2.flat",
          "enum.keras.w1.d3.flat", "enum.keras.w1.d3.r3.flat"]
+KERAS_W2 = ["enum.keras.w2.d1.flat", "enum.keras.w2.d2.flat", "enum.keras.w2.d3.flat"]     # IJCAI-25's Countries BC2x
 # (dataset, query split, first n queries or None, grounder types)
 CELLS = [("family", "test", None, FP + KERAS), ("family", "train", 2048, FP[1:2] + KERAS[2:4]),
-         ("wn18rr", "test", None, FP + KERAS), ("countries_s3", "test", None, FP + KERAS)]
+         ("wn18rr", "test", None, FP + KERAS), ("countries_s3", "test", None, FP + KERAS + KERAS_W2),
+         ("family", "test", 1024, KERAS_W2[1:2])]
 INFO = ("raw", "seconds")      # reported, not checked
 FIELDS = ("atom_table", "body_pool_idx", "body_atom_valid", "head_pool_idx", "rule_idx", "rule_offsets",
           "query_pool_idx")
@@ -54,9 +56,9 @@ class KB:
         every = [t for s in splits.values() for t in s]
         self.relation2id = {n: i for i, n in enumerate(sorted({r for r, _, _ in every}))}
         self.entity2id = {n: i for i, n in enumerate(sorted({e for _, h, t in every for e in (h, t)}))}
-        ids = lambda ts: torch.tensor([[self.relation2id[r], self.entity2id[h], self.entity2id[t]] for r, h, t in ts],  # noqa: E731
-                                      dtype=torch.long).reshape(-1, 3)
-        self.split = {s: ids(ts) for s, ts in splits.items()}
+        r, e = self.relation2id, self.entity2id
+        self.split = {s: torch.tensor([[r[p], e[h], e[t]] for p, h, t in ts], dtype=torch.long).reshape(-1, 3)
+                      for s, ts in splits.items()}
         self.rules = [r for r in parse_rules(path / "rules.txt")
                       if all(a[0] in self.relation2id for a in (r[0], *r[1]))]
         self.rule_names = [f"r{i}" for i in range(len(self.rules))]
@@ -144,8 +146,9 @@ def main() -> int:
             bad = [] if want is None else [k for k in got if k not in INFO and got[k] != want.get(k)]
             if got.get("engine_equal") is False:
                 bad.append("engine_equal")
-            status = ("NEW" if want is None else "DRIFT " + ",".join(bad) if bad
-                      else "ok (raw was " + ">".join(map(str, want["raw"])) + ")" if got["raw"] != want["raw"] else "ok")
+            raw_was = ("" if want is None or got["raw"] == want["raw"]
+                       else " (raw was " + ">".join(map(str, want["raw"])) + ")")
+            status = "NEW" if want is None else "DRIFT " + ",".join(bad) if bad else "ok" + raw_was
             if want is not None and bad:
                 drift.append((name, {k: (want.get(k), got[k]) for k in bad}))
             print(f"{name:52s} goals {'>'.join(map(str, got['goals'])):22s} raw {'>'.join(map(str, got['raw'])):24s}"

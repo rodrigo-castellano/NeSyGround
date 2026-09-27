@@ -16,7 +16,7 @@
   "raw": [
    125
   ],
-  "seconds": 3.84,
+  "seconds": 0.03,
   "sha": "a4b5d02fa9a1f602"
  },
  "countries_s3:test:enum.fp_batch.w1.d2.flat": {
@@ -38,7 +38,7 @@
    561,
    984
   ],
-  "seconds": 5.25,
+  "seconds": 0.04,
   "sha": "2fdd6ef4a647cb25"
  },
  "countries_s3:test:enum.fp_batch.w1.d3.flat": {
@@ -62,7 +62,7 @@
    4137,
    1187
   ],
-  "seconds": 0.02,
+  "seconds": 0.03,
   "sha": "3c53076a2e688e83"
  },
  "countries_s3:test:enum.keras.w0.d1.flat": {
@@ -100,7 +100,7 @@
   "raw": [
    561
   ],
-  "seconds": 0.02,
+  "seconds": 0.01,
   "sha": "a4b5d02fa9a1f602"
  },
  "countries_s3:test:enum.keras.w1.d2.flat": {
@@ -165,7 +165,7 @@
    4137,
    6826
   ],
-  "seconds": 0.03,
+  "seconds": 0.02,
   "sha": "6fc02aa2c326d70b"
  },
  "countries_s3:test:enum.keras.w1.d3.r3.flat": {
@@ -188,7 +188,70 @@
    4137,
    6826
   ],
-  "seconds": 0.03,
+  "seconds": 0.02,
+  "sha": "6fc02aa2c326d70b"
+ },
+ "countries_s3:test:enum.keras.w2.d1.flat": {
+  "atoms": 106,
+  "firings": 42,
+  "goals": [
+   24
+  ],
+  "per_rule": [
+   0,
+   1,
+   41
+  ],
+  "proved_queries": 19,
+  "queries": 24,
+  "raw": [
+   561
+  ],
+  "seconds": 0.01,
+  "sha": "a4b5d02fa9a1f602"
+ },
+ "countries_s3:test:enum.keras.w2.d2.flat": {
+  "atoms": 869,
+  "firings": 3114,
+  "goals": [
+   24,
+   135
+  ],
+  "per_rule": [
+   74,
+   586,
+   2454
+  ],
+  "proved_queries": 24,
+  "queries": 24,
+  "raw": [
+   561,
+   4137
+  ],
+  "seconds": 0.02,
+  "sha": "01d806243d25a8aa"
+ },
+ "countries_s3:test:enum.keras.w2.d3.flat": {
+  "atoms": 1013,
+  "firings": 5616,
+  "goals": [
+   24,
+   135,
+   241
+  ],
+  "per_rule": [
+   83,
+   1022,
+   4511
+  ],
+  "proved_queries": 24,
+  "queries": 24,
+  "raw": [
+   561,
+   4137,
+   6826
+  ],
+  "seconds": 0.02,
   "sha": "6fc02aa2c326d70b"
  },
  "family:test:enum.fp_batch.w0.d1.flat": {
@@ -253,7 +316,7 @@
   "raw": [
    35824
   ],
-  "seconds": 1.78,
+  "seconds": 1.81,
   "sha": "c678dc6a1a568d5e"
  },
  "family:test:enum.fp_batch.w1.d2.flat": {
@@ -320,7 +383,7 @@
    61795,
    77876
   ],
-  "seconds": 1.18,
+  "seconds": 0.13,
   "sha": "f99be4ed02c8f769"
  },
  "family:test:enum.fp_batch.w1.d3.flat": {
@@ -389,7 +452,7 @@
    325107,
    121982
   ],
-  "seconds": 0.27,
+  "seconds": 0.12,
   "sha": "1bfc685049eac15f"
  },
  "family:test:enum.keras.w0.d1.flat": {
@@ -453,7 +516,7 @@
   "raw": [
    35824
   ],
-  "seconds": 0.09,
+  "seconds": 0.07,
   "sha": "c678dc6a1a568d5e"
  },
  "family:test:enum.keras.w1.d1.flat": {
@@ -517,7 +580,7 @@
   "raw": [
    141086
   ],
-  "seconds": 0.1,
+  "seconds": 0.07,
   "sha": "c678dc6a1a568d5e"
  },
  "family:test:enum.keras.w1.d2.flat": {
@@ -583,7 +646,7 @@
    141086,
    699385
   ],
-  "seconds": 0.16,
+  "seconds": 0.1,
   "sha": "0b3a90c677c0ed95"
  },
  "family:test:enum.keras.w1.d2.r2.flat": {
@@ -649,7 +712,7 @@
    141086,
    699385
   ],
-  "seconds": 0.18,
+  "seconds": 0.1,
   "sha": "699aacedd3379e2b"
  },
  "family:test:enum.keras.w1.d3.flat": {
@@ -717,7 +780,7 @@
    699385,
    1711417
   ],
-  "seconds": 0.15,
+  "seconds": 0.14,
   "sha": "0f02de437733a11c"
  },
  "family:test:enum.keras.w1.d3.r3.flat": {
@@ -785,8 +848,74 @@
    699385,
    1711417
   ],
-  "seconds": 0.23,
+  "seconds": 0.15,
   "sha": "a322dceaa8130065"
+ },
+ "family:test[:1024]:enum.keras.w2.d2.flat": {
+  "atoms": 11461,
+  "firings": 14091,
+  "goals": [
+   1024,
+   25338
+  ],
+  "per_rule": [
+   511,
+   216,
+   1883,
+   1993,
+   1879,
+   1989,
+   393,
+   344,
+   2407,
+   42,
+   34,
+   82,
+   91,
+   107,
+   119,
+   90,
+   0,
+   0,
+   45,
+   86,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   1422,
+   35,
+   91,
+   86,
+   146,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0,
+   0
+  ],
+  "proved_queries": 772,
+  "queries": 1024,
+  "raw": [
+   36764,
+   146898
+  ],
+  "seconds": 0.02,
+  "sha": "731258012c349de1"
  },
  "family:train[:2048]:enum.fp_batch.w1.d2.flat": {
   "atoms": 29552,
@@ -852,7 +981,7 @@
    40038,
    43638
   ],
-  "seconds": 0.05,
+  "seconds": 0.04,
   "sha": "3398bf38d5eb1028"
  },
  "family:train[:2048]:enum.keras.w1.d2.flat": {
@@ -918,7 +1047,7 @@
    125246,
    480665
   ],
-  "seconds": 0.06,
+  "seconds": 0.04,
   "sha": "d3b92569092515a6"
  },
  "family:train[:2048]:enum.keras.w1.d2.r2.flat": {
@@ -984,7 +1113,7 @@
    125246,
    480665
   ],
-  "seconds": 0.05,
+  "seconds": 0.04,
   "sha": "022041957792c707"
  },
  "wn18rr:test:enum.fp_batch.w0.d1.flat": {
@@ -1043,7 +1172,7 @@
   "raw": [
    1433
   ],
-  "seconds": 0.84,
+  "seconds": 0.04,
   "sha": "42b2231f619db464"
  },
  "wn18rr:test:enum.fp_batch.w1.d2.flat": {
@@ -1104,7 +1233,7 @@
    28616,
    1525
   ],
-  "seconds": 1.74,
+  "seconds": 0.06,
   "sha": "4ac5b17c3471aac4"
  },
  "wn18rr:test:enum.fp_batch.w1.d3.flat": {
@@ -1167,7 +1296,7 @@
    126376,
    1435
   ],
-  "seconds": 1.03,
+  "seconds": 0.07,
   "sha": "46f341c1ea6676c8"
  },
  "wn18rr:test:enum.keras.w0.d1.flat": {
@@ -1225,7 +1354,7 @@
   "raw": [
    1433
   ],
-  "seconds": 1.83,
+  "seconds": 0.03,
   "sha": "42b2231f619db464"
  },
  "wn18rr:test:enum.keras.w1.d1.flat": {
@@ -1283,7 +1412,7 @@
   "raw": [
    123292
   ],
-  "seconds": 0.95,
+  "seconds": 0.04,
   "sha": "42b2231f619db464"
  },
  "wn18rr:test:enum.keras.w1.d2.flat": {
@@ -1343,7 +1472,7 @@
    123292,
    528278
   ],
-  "seconds": 0.08,
+  "seconds": 0.06,
   "sha": "e29578f2a37ccd36"
  },
  "wn18rr:test:enum.keras.w1.d2.r2.flat": {
@@ -1403,7 +1532,7 @@
    123292,
    528278
   ],
-  "seconds": 0.19,
+  "seconds": 0.06,
   "sha": "b601f9930c069200"
  },
  "wn18rr:test:enum.keras.w1.d3.flat": {
@@ -1465,7 +1594,7 @@
    528278,
    1177938
   ],
-  "seconds": 0.2,
+  "seconds": 0.09,
   "sha": "40bf55ec0c506a02"
  },
  "wn18rr:test:enum.keras.w1.d3.r3.flat": {
@@ -1527,7 +1656,7 @@
    528278,
    1177938
   ],
-  "seconds": 0.13,
+  "seconds": 0.09,
   "sha": "1e1a749c5f38d259"
  }
 }

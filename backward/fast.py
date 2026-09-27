@@ -1,10 +1,12 @@
-"""The FIRINGS of a PBC backward grounder, fast: width <= 1, any depth, few host syncs, many batches per call.
+"""The FIRINGS of a PBC backward grounder, fast: width <= 1 (the keras filter: <= 2), any depth, few host syncs, many
+batches per call.
 
 Same output as the general engine (``backward.loop.run_backward`` + ``finalize`` + the fp_batch prune + query pinning)
-on the configurations it covers — flat pbc, unguided, width <= 1, last-step width 0, a dense-block or offset-table fact
-index — with its atom table compacted to the atoms the kept firings reference (the engine keeps every considered atom;
-the compaction keeps the order, so every per-atom reduction a reasoner runs over it is unchanged). It reuses the
-engine's compiled rule tables (every anchor variant), its fact index and its per-rule binding tables.
+on the configurations it covers — flat pbc, unguided, width <= 1 and last-step width 0 (the keras filter, which the
+engine does not run: width <= 2 at every step, as keras-ns's BC_{w,d}), a dense-block or offset-table fact index —
+with its atom table compacted to the atoms the kept firings reference (the engine keeps every considered atom; the
+compaction keeps the order, so every per-atom reduction a reasoner runs over it is unchanged). It reuses the engine's
+compiled rule tables (every anchor variant), its fact index and its per-rule binding tables.
 
 :func:`ground_many` grounds ``S`` batches of queries in one pass: every atom carries its batch as the most significant
 digit of its key, so the batches never share an atom and batch ``s``'s output is exactly ``ground(queries[s])``, at a
@@ -13,16 +15,17 @@ fraction of the per-call cost (the kernels and host syncs are shared).
 Per chunk of queries and step, the goals (the queries, then the unknown body atoms of the previous step's kept
 groundings) are deduplicated; the live (goal, rule) pairs enumerate their free variables through the fact index. The
 last free variable is enumerated in a fused kernel (``fast_kernels.last_stage``) that also tests every candidate
-grounding (width, cycle, head-predicate prune; existence through a fact hash set) and writes only the kept ones, so
-the rejected candidates (most of them) never reach memory. With width <= 1 a kept grounding has at most one unknown
-atom, the next step's goal; a (goal, rule) row none of whose candidates can be kept (a body atom with no fact on its
-bound side, ...: ``fast_kernels.live_count``) is not walked. With fp_batch, the step before the last keeps only the
-groundings whose unknown atom can still be proved (a fact, an earlier step's goal, or a goal some rule could ground at
-the last step: ``fast_kernels.live_atoms``), so the last step grounds only those. The groundings are then filtered by the rules' variable
-bindings and pruned: fp_batch to the provable ones (``depth`` rounds of Kleene propagation from the facts, over hash
-sets of the raw groundings); keras first to those whose unknown atom can be proved at all (the least fixed point from
-the all-fact groundings: :func:`_keras_provable`, a few thousand of the millions a keras step writes), then by keras-ns's
-proof walk. They are canonicalised (unique atoms and firings, sorted), and the queries pinned into the atom table.
+grounding (width, cycle, head-predicate prune; existence through a fact hash set) and writes only the kept ones, so the
+rejected candidates (most of them) never reach memory. A kept grounding's unknown atoms (at most the width) are the
+next step's goals; a (goal, rule) row none of whose candidates can be kept (a body atom with no fact on its bound side,
+...: ``fast_kernels.live_count``) is not walked. With fp_batch, the step before the last keeps only the groundings
+whose unknown atom can still be proved (a fact, an earlier step's goal, or a goal some rule could ground at the last
+step: ``fast_kernels.live_atoms``), so the last step grounds only those. The groundings are then filtered by the rules'
+variable bindings and pruned: fp_batch to the provable ones (``depth`` rounds of Kleene propagation from the facts,
+over hash sets of the raw groundings); keras first to those whose unknown atom can be proved at all (the least fixed
+point from the all-fact groundings: :func:`_keras_provable`, a few thousand of the millions a keras step writes), then
+by keras-ns's proof walk. They are canonicalised (unique atoms and firings, sorted), and the queries pinned into the
+atom table.
 """
 from __future__ import annotations
 
@@ -42,8 +45,8 @@ def supports(g) -> bool:
     return (torch.device(g.kb.device_).type == "cuda" and g.resolution == "pbc" and g._exec_layout is Layout.FLAT
             and g.guided_topk is None
             and g.guided_stats is None and g.guided_query_topk is None and g.guided_query_depth is None
-            and g.width is not None and g.width <= 1 and not g._cartesian_product
-            and (g.w_last_depth == 0 or (g.filter_mode == "keras" and g.w_last_depth <= 1))
+            and g.width is not None and g.width <= (2 if g.filter_mode == "keras" else 1) and not g._cartesian_product
+            and (g.w_last_depth == 0 or (g.filter_mode == "keras" and g.w_last_depth <= 2))
             and isinstance(g.kb.fact_index, InvertedFactIndex) and g.filter_mode in ("fp_batch", "none", "keras"))
 
 
