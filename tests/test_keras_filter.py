@@ -51,3 +51,35 @@ def test_keras_walk_rounds_parse(grounder_type, rounds):
     """``.r<N>``: the proof walk's rounds (the later keras-ns walks depth rounds, the IJCAI-25 code depth - 1)."""
     rg, _ = _groundings(grounder_type, [(0, A, Z)])
     assert rg._inner.keras_rounds == rounds
+
+
+@pytest.mark.parametrize("grounder_type", ["enum.keras.w1.d2.flat", "enum.keras.w1.d3.flat", "enum.keras.w1.d3.r3.flat"])
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_keras_prefilter_keeps_the_walks_output(grounder_type, seed, monkeypatch):
+    """Dropping the groundings no chain from the all-fact ones can prove (``fast._keras_provable``) before keras-ns's
+    proof walk changes nothing it outputs: recursive and one-body rules, several batches at once."""
+    from grounder.backward import fast
+    from test_fast import RULES, _setup
+    rules = [(h, b) for h, b in RULES if len(b) == 1 or all(set(a[1:]) - set(h[1:]) for a in b)]   # keras's
+    fi, vocab, queries = _setup(seed)
+    vocab.rule_names = [f"r{i}" for i in range(len(rules))]
+    rg = create_grounder(grounder_type, fact_index=fi, rules=rules, kb=vocab, max_groundings=32,
+                         max_total_groundings=64, provable_set_method="spmm", device=DEV)
+    qs = torch.stack([queries, queries.flip(0), queries.roll(17, 0)])
+    mask = torch.rand(qs.shape[:2], generator=torch.Generator().manual_seed(seed)).to(DEV) < 0.9
+    outs, sizes, provable = {}, [], fast._keras_provable
+
+    def counted(g, rule, *args):
+        out = provable(g, rule, *args)
+        sizes.append((int(rule.shape[0]), int(out[0].shape[0])))
+        return out
+    monkeypatch.setattr(fast, "_keras_provable", counted)
+    for rows in (0, 1 << 62):                          # the prefilter on every call / never
+        monkeypatch.setattr(fast, "KERAS_PREFILTER_ROWS", rows)
+        outs[rows] = rg.run_bc_many(qs, mask)
+    assert sizes and all(after < before for before, after in sizes)      # it drops groundings
+    for a, b in zip(*outs.values()):
+        for f in ("atom_table", "body_pool_idx", "body_atom_valid", "head_pool_idx", "rule_idx", "rule_offsets",
+                  "query_pool_idx"):
+            assert torch.equal(getattr(a, f), getattr(b, f)), f
+    assert sum(int(o.rule_idx.shape[0]) for o in outs[0]) > 0

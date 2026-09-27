@@ -19,9 +19,10 @@ atom, the next step's goal; a (goal, rule) row none of whose candidates can be k
 bound side, ...: ``fast_kernels.live_count``) is not walked. With fp_batch, the step before the last keeps only the
 groundings whose unknown atom can still be proved (a fact, an earlier step's goal, or a goal some rule could ground at
 the last step: ``fast_kernels.live_atoms``), so the last step grounds only those. The groundings are then filtered by the rules' variable
-bindings and (fp_batch) pruned to the provable ones (``depth`` rounds of Kleene propagation from the facts, over hash
-sets of the raw groundings), canonicalised (unique atoms and firings, sorted), and the queries pinned into the atom
-table.
+bindings and pruned: fp_batch to the provable ones (``depth`` rounds of Kleene propagation from the facts, over hash
+sets of the raw groundings); keras first to those whose unknown atom can be proved at all (the least fixed point from
+the all-fact groundings: :func:`_keras_provable`, a few thousand of the millions a keras step writes), then by keras-ns's
+proof walk. They are canonicalised (unique atoms and firings, sorted), and the queries pinned into the atom table.
 """
 from __future__ import annotations
 
@@ -342,6 +343,31 @@ def _keras_proved(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, keep
     return (~unknown | (t[bid] < never)).all(1)
 
 
+KERAS_PREFILTER_ROWS = 1 << 20      # below it the walk's sorts cost less than the fixed point's rounds (a sync each)
+
+
+def _keras_provable(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, base: int):
+    """The raw groundings less those with an unknown atom that no chain of groundings from the all-fact ones reaches:
+    keras-ns proves an atom only by a grounding of it whose unknown atoms are proved before, so what it proves lies in
+    that least fixed point (cheap to find: few atoms), and :func:`_keras_proved` never keeps a grounding outside it; it
+    then walks thousands of groundings instead of millions. Exact with at most one unknown atom per grounding (the
+    fast path's width <= 1; else nothing is dropped): a dropped grounding's unknown atom is outside the fixed point, so
+    are all its groundings' (dropped too), and the goals it would mark matter to no grounding left; the atoms left keep
+    their order, so the walk's positions compare the same."""
+    unknown = (body[..., 0] != g.kb.padding_idx) & ~_Facts.get(g, base).facts.contains(body)          # [T, M]
+    if bool((unknown.sum(1) > 1).any()):
+        return rule, head, body, seg
+    row, slot = torch.nonzero(unknown, as_tuple=True)
+    ukey, hkey = _key(seg[row], body[row, slot], base), _key(seg, head, base)
+    ok = ~unknown.any(1)
+    while True:
+        ok_next = torch.ones_like(ok)
+        ok_next[row[~HashSet.of_keys(hkey[ok]).contains_keys(ukey)]] = False
+        if torch.equal(ok_next, ok):
+            return rule[ok], head[ok], body[ok], seg[ok]
+        ok = ok_next
+
+
 def _kept(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, base: int, depth: int, qkey: Tensor):
     """The groundings ``(rule, head [T, 3], body [T, M, 3], batch)`` whose atoms fit their rule's variable bindings (a
     repeated variable binds one constant) and, with fp_batch, whose body is proved within ``depth`` rounds of
@@ -349,6 +375,8 @@ def _kept(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, base: int, d
     round before); with keras, as the keras-ns grounder prunes them (:func:`_keras_proved`; ``qkey``: the queries) —
     before canonicalising, on the raw groundings (repeats keep or drop together)."""
     kb, pad, M, R = g.kb, g.kb.padding_idx, g.kb.M, g.kb.num_rules
+    if g.filter_mode == "keras" and depth >= 2 and rule.shape[0] >= KERAS_PREFILTER_ROWS:
+        rule, head, body, seg = _keras_provable(g, rule, head, body, seg, base)
     bt = kb.binding_tables(M, pad)
     rc = rule.clamp(min=0, max=R - 1)
     ent = torch.cat([head.unsqueeze(1), body], 1)[..., 1:].reshape(-1, 2 * (M + 1))
