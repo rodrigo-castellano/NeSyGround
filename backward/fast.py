@@ -41,8 +41,9 @@ def supports(g) -> bool:
     return (torch.device(g.kb.device_).type == "cuda" and g.resolution == "pbc" and g._exec_layout is Layout.FLAT
             and g.guided_topk is None
             and g.guided_stats is None and g.guided_query_topk is None and g.guided_query_depth is None
-            and g.width is not None and g.width <= 1 and g.w_last_depth == 0 and not g._cartesian_product
-            and isinstance(g.kb.fact_index, InvertedFactIndex) and g.filter_mode in ("fp_batch", "none"))
+            and g.width is not None and g.width <= 1 and not g._cartesian_product
+            and (g.w_last_depth == 0 or (g.filter_mode == "keras" and g.w_last_depth <= 1))
+            and isinstance(g.kb.fact_index, InvertedFactIndex) and g.filter_mode in ("fp_batch", "none", "keras"))
 
 
 class _Facts:
@@ -266,7 +267,7 @@ def _ground_steps(g, goals: Tensor, seg: Tensor, base: int, chunk_size: Optional
             prior.append(key)
             s, atoms = _decode(key, base)
             r, n, b, nxt = _step(g, facts, atoms, g.w_last_depth if last else g.width,
-                                 None if last else g.head_pred_mask, not last)
+                                 None if last and g.filter_mode != "keras" else g.head_pred_mask, not last)
             if d == depth - 2 and g.filter_mode == "fp_batch" and nxt[0].numel():
                 r, n, b, nxt = _provable_next(g, facts, s, r, n, b, nxt, torch.cat(prior), base)
             if stats is not None:
@@ -284,11 +285,66 @@ def _ground_steps(g, goals: Tensor, seg: Tensor, base: int, chunk_size: Optional
     return torch.cat(rules), torch.cat(heads), torch.cat(bodies), torch.cat(segs)
 
 
-def _kept(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, base: int, depth: int):
+def _keras_proved(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, keep: Tensor, qkey: Tensor, base: int,
+                  depth: int) -> Tensor:
+    """``[T]``: whether each raw grounding survives the pruning of keras-ns's ``ApproximateBackwardChainingGrounder``
+    (the IJCAI-25 code's BC_{w,d}): every body atom a fact or proved.
+
+    Its goals: the queries, then at each step the non-fact atoms of the groundings so far, less, for a grounding's own
+    rule, the goals already of that rule's head predicate (a query can be a goal again). Every grounding of a goal is a
+    proof of it, its unknown atoms the proof's atoms (a rule with one body atom records none). After the last step,
+    ``depth - 1`` rounds walk the proofs in the rules' order (``g.keras_rule_order``), a rule's step-1 goals' proofs
+    before its step-2 goals', ..., each proving its head if its atoms are proved by then. Keras walks a (rule, step)
+    block's goals in the order of a Python set, which varies with the string hash seed (so does its output, a few
+    groundings in thousands); here in atom order, one of the orders it can take. An atom's earliest proof (its
+    position in the walk) is found by propagation to a fixed point."""
+    if rule.numel() == 0:
+        return keep
+    pad, R = g.kb.padding_idx, g.kb.num_rules
+    rc = rule.clamp(min=0, max=R - 1)
+    valid = body[..., 0] != pad
+    unknown = valid & ~_Facts.get(g, base).facts.contains(body)                          # [T, M]
+    keys, inv = torch.unique(torch.cat([_key(seg, head, base).unsqueeze(1), _key(seg.unsqueeze(1), body, base)], 1),
+                             return_inverse=True)
+    hid, bid, n = inv[:, 0], inv[:, 1:], keys.shape[0]
+    at = torch.searchsorted(keys, qkey).clamp(max=max(n - 1, 0))
+    goals = [torch.zeros(n, dtype=torch.bool, device=rule.device)]
+    goals[0][at[keys[at] == qkey]] = True                                                # step 1: the queries
+    seen = goals[0].clone()
+    for _ in range(depth - 1):                     # step s + 1: the non-fact atoms of the groundings so far, less ...
+        found = keep & seen[hid]
+        new = unknown & found.unsqueeze(1) & ~(seen[bid] & (body[..., 0] == head[:, :1]))   # ... their rule's own
+        nxt = torch.zeros_like(seen)
+        nxt[bid[new]] = True
+        goals.append(nxt)
+        seen |= nxt
+    if depth < 2:
+        return (~unknown).all(1)
+    proof = keep & (g.kb.rule_lens.to(rule.device)[rc] >= 2)
+    order = getattr(g, "keras_rule_order", torch.arange(R, device=rule.device)).to(rule.device)[rc]
+    walk, rounds, never = R * depth * n, depth - 1, torch.iinfo(torch.long).max // 4
+    t = torch.full((n,), never, dtype=torch.long, device=rule.device)          # each atom's earliest proof
+    while True:
+        latest = torch.where(unknown, t[bid], -1).amax(1)                               # its atoms' latest proof
+        best = torch.full_like(latest, never)
+        for s in range(depth):
+            at = (order * depth + s) * n + hid                  # the walk: (rule, step) blocks, a block's goals in order
+            k = ((latest + 1 - at).clamp(min=0) + walk - 1) // walk                     # the first round after them
+            ok = proof & goals[s][hid] & (k < rounds)
+            best = torch.where(ok, torch.minimum(best, k * walk + at), best)
+        t_next = t.scatter_reduce(0, hid, best, reduce="amin")
+        if torch.equal(t_next, t):
+            break
+        t = t_next
+    return (~unknown | (t[bid] < never)).all(1)
+
+
+def _kept(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, base: int, depth: int, qkey: Tensor):
     """The groundings ``(rule, head [T, 3], body [T, M, 3], batch)`` whose atoms fit their rule's variable bindings (a
     repeated variable binds one constant) and, with fp_batch, whose body is proved within ``depth`` rounds of
     propagation from the facts (an atom is proved by a fact, or as the head of a grounding whose body was proved the
-    round before) — before canonicalising, on the raw groundings (repeats keep or drop together)."""
+    round before); with keras, as the keras-ns grounder prunes them (:func:`_keras_proved`; ``qkey``: the queries) —
+    before canonicalising, on the raw groundings (repeats keep or drop together)."""
     kb, pad, M, R = g.kb, g.kb.padding_idx, g.kb.M, g.kb.num_rules
     bt = kb.binding_tables(M, pad)
     rc = rule.clamp(min=0, max=R - 1)
@@ -302,6 +358,8 @@ def _kept(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, base: int, d
         for _ in range(max(1, depth)):
             proved = fact | HashSet.of_keys(head_key[proved.all(1) & keep]).contains_keys(body_key)
         keep &= proved.all(1)
+    elif g.filter_mode == "keras":
+        keep &= _keras_proved(g, rule, head, body, seg, keep, qkey, base, depth)
     return rule[keep], head[keep], body[keep], seg[keep]
 
 
@@ -323,7 +381,8 @@ def ground_many(g, queries: Tensor, query_mask: Tensor, chunk_size: Optional[int
     live = query_mask.reshape(-1) & (qs[:, 0] != pad)
     rule, head, body, seg = _ground_steps(g, qs[live], qseg[live], base, chunk_size, depth, stats)
 
-    rule, head, body, seg = _kept(g, rule, head, body, seg, base, depth)
+    qkey = torch.unique(_key(qseg[live], qs[live], base))
+    rule, head, body, seg = _kept(g, rule, head, body, seg, base, depth, qkey)
 
     # canonical firings: unique atoms (sorted by batch, then atom), unique firings (sorted by batch, rule, atoms)
     akey, ainv = torch.unique(_key(seg.unsqueeze(1), torch.cat([head.unsqueeze(1), body], 1), base),

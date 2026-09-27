@@ -342,13 +342,15 @@ def _build_rule_tensors(
 def _grounder_kb(fact_index: TensorFactIndex, rules: list, kb, *, fact_index_type: str,
                  max_facts_per_query: int):
     """The grounder library's ``KB``: the facts ``[F, 3]`` and the rules as template-variable tensors (rules sorted
-    by head predicate, as the grounder's rule index sorts them)."""
+    by head predicate, as the grounder's rule index sorts them), and the rules in that order (``CompiledRule``s,
+    with their index in ``rules``)."""
     from grounder.data import KB
     E = fact_index.num_entities
     dev = fact_index.fact_hashes.device
     rule_names = getattr(kb, "rule_names", None) or [None] * len(rules)
-    compiled = sorted((CompiledRule(r, kb.relation2id, name=name) for r, name in zip(rules, rule_names)),
-                      key=lambda cr: cr.head_pred_idx)
+    order = sorted(((i, CompiledRule(r, kb.relation2id, name=name))
+                    for i, (r, name) in enumerate(zip(rules, rule_names))), key=lambda ic: ic[1].head_pred_idx)
+    compiled = [cr for _, cr in order]
     max_body = max((cr.num_body for cr in compiled), default=1)
     rule_heads, rule_bodies, rule_lens, max_vars = _build_rule_tensors(
         compiled, E, max_body, dev, entity_to_idx=dict(kb.entity2id))
@@ -357,7 +359,7 @@ def _grounder_kb(fact_index: TensorFactIndex, rules: list, kb, *, fact_index_typ
               constant_no=E - 1,                   # entities are 0..E-1
               predicate_no=len(kb.relation2id), padding_idx=E + max_vars,
               device=torch.device(dev) if isinstance(dev, str) else dev,
-              fact_index_type=fact_index_type, max_facts_per_query=max_facts_per_query)
+              fact_index_type=fact_index_type, max_facts_per_query=max_facts_per_query), order
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -434,8 +436,12 @@ class RuleGrounder(nn.Module):
     ):
         super().__init__()
         from grounder.api.factory import make_grounder
-        kb_obj = _grounder_kb(fact_index, rules, kb, fact_index_type=fact_index_type,
-                              max_facts_per_query=max_facts_per_query)
+        kb_obj, order = _grounder_kb(fact_index, rules, kb, fact_index_type=fact_index_type,
+                                     max_facts_per_query=max_facts_per_query)
+        # a firing's rule_idx i is the rule rules[input_rule[i]]; its body columns are that rule's body atoms
+        # input_body[i] (the enumeration order)
+        self.input_rule: List[int] = [i for i, _ in order]
+        self.input_body: List[List[int]] = [list(cr.body_order) for _, cr in order]
 
         guided_scorer = None
         gtnorm = guided_tnorm
@@ -472,6 +478,14 @@ class RuleGrounder(nn.Module):
                           else int(chunk_size) if chunk_size > 0 else None)
         self._inner = make_grounder(kb_obj, config, layout=layout_knob,
                                     compile=compile_knob, chunk_size=grounder_chunk)
+        if config.filter == "keras":
+            for head, body in rules:
+                if len(body) > 1 and any(set(a[1:]) <= set(head[1:]) for a in body):
+                    # keras-ns takes such an atom, bound by the head alone, as known without looking it up
+                    raise NotImplementedError(f"the keras filter: a body atom of {head} :- {body} has only head "
+                                              f"variables")
+            # keras-ns walks the rules in their input order
+            self._inner.keras_rule_order = torch.tensor(self.input_rule, dtype=torch.long)
 
         self.fact_index = fact_index
         # Learned-budget provider (rides a list — never registered, so the
@@ -571,6 +585,9 @@ class RuleGrounder(nn.Module):
         if self.fast():
             # width <= 1 pbc: the fast path — the engine's firings, few host syncs, a compacted atom table
             rg = fast.ground(self._inner, queries, query_mask, chunk_size=self._inner._chunk_size)
+        elif self._inner.filter_mode == "keras":
+            raise NotImplementedError("the keras filter runs on the fast path only (an unguided width <= 1 pbc "
+                                      "grounder on the GPU)")
         else:
             # FIRINGS-only: the rule path consumes ONLY rule_groundings, and a
             # spec without PROOF_STATE lets the engine skip the final step's
@@ -676,14 +693,15 @@ def _build_backward_config(grounder_type: str, *, max_groundings: int,
 
     if res == "pbc":
         m_u = re.search(r"\.u(\d+)", grounder_type)
-        u = int(m_u.group(1)) if m_u else 0
+        keras = ".keras" in grounder_type      # keras-ns's BC_{w,d}: width w at every step, then its pruning
+        u = int(m_u.group(1)) if m_u else (width if keras else 0)
         # flat layout is selected via the grounder ctor (layout=); "join" provable-set →
         # the in-enumeration width prune (flat_prune), else the one-shot path.
         pbc = PBC(depth=depth, width=width, u=u,
                   max_groundings_per_rule=max_groundings,
                   flat_prune=(provable_set_method == "join"),
                   guided_topk=guided_topk, guided_tnorm=guided_tnorm)
-        return Backward(pbc, filter=("fp_batch" if u == 0 else "none"),
+        return Backward(pbc, filter=("keras" if keras else "fp_batch" if u == 0 else "none"),
                         guided_scorer=guided_scorer, **common)
 
     if guided_topk is not None:
