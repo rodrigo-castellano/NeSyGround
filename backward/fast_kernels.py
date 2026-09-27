@@ -266,14 +266,16 @@ def _probe3(table_ptr, key, live, LOG2T: tl.constexpr):
 @triton.jit
 def _last_stage(order_ptr, src_ptr, W, rule_ptr, n_ptr, goal_ptr, start_ptr, count_ptr, one_ptr, values_ptr, n_values,
                 arg_src_ptr, body_pred_ptr, n_body_ptr, known_ptr, hpm_ptr, P, table_ptr, base, pad, width,
-                out_row_ptr, out_val_ptr, counter_ptr, T,
+                out_row_ptr, out_val_ptr, counter_ptr, T, live_ptr, seg_ptr,
                 M: tl.constexpr, MP: tl.constexpr, U: tl.constexpr, HPM: tl.constexpr, LOG2T: tl.constexpr,
-                BLOCK: tl.constexpr, CYCLE: tl.constexpr = 1):
+                BLOCK: tl.constexpr, CYCLE: tl.constexpr = 1, LIVE: tl.constexpr = False,
+                LIVE_LOG2T: tl.constexpr = 4):
     """Rows ``order[pid * BLOCK : +BLOCK]`` (rows ordered by candidate count: a block's lanes walk as many): each
     walks its ``count`` candidates (``values[start + j]``, or one 0 with ``one``), ``U`` at a time, as the source
     column ``W`` (columns past it read 0); the kept (row, value) pairs are appended. A row's body atoms (``MP``, the
     body length's power of two) are read once; those without the candidate are tested once, the others per
-    candidate (``[BLOCK, U, MP]`` blocks: ``U`` probes in flight per row)."""
+    candidate (``[BLOCK, U, MP]`` blocks: ``U`` probes in flight per row). ``LIVE``: an unknown atom must also be in
+    the key set ``live`` (its key with the goal's batch ``seg[n]`` as the most significant digit)."""
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     live = i < T
     r = tl.load(order_ptr + i, mask=live, other=0)
@@ -311,6 +313,12 @@ def _last_stage(order_ptr, src_ptr, W, rule_ptr, n_ptr, goal_ptr, start_ptr, cou
     if HPM:                                        # an unknown atom must be provable
         unprovable = tl.load(hpm_ptr + tl.minimum(p, P - 1), mask=act, other=1) == 0
         bad_fixed = bad_fixed | (tl.max((fixed & ~exists_fixed & unprovable).to(tl.int32), 2) > 0)
+    if LIVE:                                       # ... and live
+        sg = tl.load(seg_ptr + tl.load(n_ptr + r64, mask=live, other=0).to(tl.int64), mask=live,
+                     other=0)[:, None, None]
+        unk = fixed & ~exists_fixed
+        live_fixed = _probe3(live_ptr, ((sg * base + p) * base + b0) * base + b1, unk, LIVE_LOG2T)
+        bad_fixed = bad_fixed | (tl.max((unk & ~live_fixed).to(tl.int32), 2) > 0)
     u = tl.arange(0, U)[None, :]
     j_end = tl.max(tl.where(live, count, 0), 0)
     j = 0
@@ -331,6 +339,9 @@ def _last_stage(order_ptr, src_ptr, W, rule_ptr, n_ptr, goal_ptr, start_ptr, cou
         bad = bad_fixed | (tl.max(goal_at.to(tl.int32), 2) > 0)
         if HPM:
             bad = bad | (tl.max((missing & unprovable).to(tl.int32), 2) > 0)
+        if LIVE:
+            live_at = _probe3(live_ptr, ((sg * base + p) * base + x0) * base + x1, missing, LIVE_LOG2T)
+            bad = bad | (tl.max((missing & ~live_at).to(tl.int32), 2) > 0)
         keep = on & ~bad & (unknown <= width)
         keep = tl.reshape(keep, [BLOCK * U])
         k = keep.to(tl.int32)
@@ -410,14 +421,16 @@ def live_count(src: Tensor, rule: Tensor, count: Tensor, arg_src: Tensor, body_p
 def last_stage(src: Tensor, rule: Tensor, n: Tensor, goals: Tensor, start: Tensor, count: Tensor, one: Tensor,
                values: Tensor, arg_src: Tensor, body_pred: Tensor, n_body: Tensor, known: Tensor,
                head_pred_mask: Optional[Tensor], facts: HashSet, pad: int, width: int, slot_count: Tensor, P: int,
-               E: int, cycle: str = "all") -> Tuple[Tensor, Tensor]:
+               E: int, cycle: str = "all", live_set: Optional[HashSet] = None,
+               seg: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
     """The kept ``(row, value)`` pairs of rows ``src [T, W]`` (rule ``rule [T]``, goal ``goals[n] [T, 3]``) whose
     source column ``W`` walks ``values[start : start + count]`` (``one``: a single 0); ``arg_src [R, M, 2]`` holds
     each body argument's source column (past ``W``: 0), ``known [R, M]`` the body atoms an enumeration drew from
     the facts (not probed). Rows that cannot keep a candidate (:func:`_live_count`, from the fact index's slot
     counts ``slot_count`` over ``P`` predicates and ``E`` entities) are not walked. ``cycle``: a grounding whose body
     holds its own goal is dropped (``"all"``), or only when that atom is not a fact (``"unknown"``: keras-ns, which
-    draws one body atom from the facts and rejects the goal among the others)."""
+    draws one body atom from the facts and rejects the goal among the others). ``live_set``: an unknown atom must also
+    be in this key set, keyed with its goal's batch ``seg [N]`` (``fast._key``)."""
     T, W = src.shape
     dev = src.device
     src, rule = src.contiguous(), rule.contiguous()
@@ -437,8 +450,11 @@ def last_stage(src: Tensor, rule: Tensor, n: Tensor, goals: Tensor, start: Tenso
             order, src, W, rule, n.contiguous(), goals.contiguous(), start.contiguous(), live,
             one.to(torch.int8).contiguous(), values, values.numel(), arg_src.contiguous(), body_pred.contiguous(),
             n_body.contiguous(), known8, hpm, hpm.numel(), facts.table, facts.base, pad, width, rows, vals, counter,
-            n_live, M=M, MP=triton.next_power_of_2(M), U=UNROLL, HPM=head_pred_mask is not None,
-            LOG2T=facts.log2t, BLOCK=BLOCK, CYCLE={"all": 1, "unknown": 2}[cycle])
+            n_live, live_set.table if live_set is not None else facts.table,
+            seg.contiguous() if live_set is not None else n,
+            M=M, MP=triton.next_power_of_2(M), U=UNROLL, HPM=head_pred_mask is not None,
+            LOG2T=facts.log2t, BLOCK=BLOCK, CYCLE={"all": 1, "unknown": 2}[cycle], LIVE=live_set is not None,
+            LIVE_LOG2T=live_set.log2t if live_set is not None else 4)
     k = int(counter.item())
     rows, vals = rows[:k], vals[:k]
     return rows.long(), vals.long()

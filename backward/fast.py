@@ -72,6 +72,7 @@ class _Facts:
             seen = fi.facts_idx
         self.facts = HashSet(fi.facts_idx, base)
         self.seen = self.facts if seen is fi.facts_idx else HashSet(seen, base)
+        self.seen_all = seen is fi.facts_idx or seen.shape[0] == torch.unique(fi.facts_idx, dim=0).shape[0]
 
     @staticmethod
     def get(g, base: int) -> "_Facts":
@@ -116,11 +117,10 @@ def _enumerated_atoms(g) -> Tensor:
     return known
 
 
-def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[Tensor], want_next: bool):
-    """One step over ``goals`` ``[N, 3]``: the kept groundings as (rule, goal row, body) and, with ``want_next``,
-    their unknown body atoms as (kept grounding, body slot). The free variables but the last are enumerated here;
-    the last one, with every test of the groundings, in :func:`~grounder.backward.fast_kernels.last_stage`."""
-    pad, M, V, dev = g.kb.padding_idx, g.kb.M, g.V, goals.device
+def _candidates(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[Tensor]):
+    """The rows of a step over ``goals`` ``[N, 3]`` whose last free variable :func:`_step` walks: ``(src, rule, n,
+    start, count, one)``, the free variables but the last enumerated."""
+    V = g.V
     n, r = torch.nonzero(g.pred_rule_mask[goals[:, 0]], as_tuple=True)       # the live (goal, rule) pairs
     rule = g.pred_rule_indices[goals[n, 0], r]
     src = goals[n, 1:]                                                          # [T, 2 + bound free vars]
@@ -154,10 +154,24 @@ def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[
         else:
             start, one = torch.zeros_like(rule), torch.ones_like(rule, dtype=torch.bool)
             count = one.long()
+    return src, rule, n, start, count, one
+
+
+def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[Tensor], want_next: bool,
+          cand=None, live=None, seg: Optional[Tensor] = None):
+    """One step over ``goals`` ``[N, 3]``: the kept groundings as (rule, goal row, body) and, with ``want_next``,
+    their unknown body atoms as (kept grounding, body slot). The free variables but the last are enumerated first
+    (:func:`_candidates`, or ``cand``); the last one, with every test of the groundings, in
+    :func:`~grounder.backward.fast_kernels.last_stage` (``live``: an unknown atom must also be in this key set, keyed
+    with its goal's batch ``seg``)."""
+    pad, M, V, dev = g.kb.padding_idx, g.kb.M, g.V, goals.device
+    src, rule, n, start, count, one = cand if cand is not None else _candidates(g, facts, goals, width, head_pred_mask)
+    arg_src = g.arg_source_dep.clamp(max=1 + V)
     rows, vals = last_stage(src, rule, n, goals, start, count, one, facts.values, arg_src, g.body_preds_dep,
                             g.num_body_atoms, _enumerated_atoms(g), head_pred_mask, facts.seen, pad, width,
                             facts.count, facts.P, facts.E,
-                            cycle="unknown" if getattr(g, "filter_mode", None) == "keras" else "all")
+                            cycle="unknown" if getattr(g, "filter_mode", None) == "keras" else "all", live_set=live,
+                            seg=seg)
     n, rule = n[rows], rule[rows]
     src = torch.cat([src[rows], vals.unsqueeze(1), src.new_zeros(rows.shape[0], 1 + V - src.shape[1])], 1)[:, :2 + V]
     args = src.unsqueeze(1).expand(-1, M, -1).gather(-1, arg_src[rule])
@@ -254,6 +268,34 @@ def _provable_next(g, facts: _Facts, s: Tensor, r: Tensor, n: Tensor, b: Tensor,
     return r[keep], n[keep], b[keep], (new[row[ok]], slot[ok])
 
 
+KERAS_CLOSURE_MIN_ROWS = 1 << 18       # below it (training batches, Countries) writing every candidate costs less
+
+
+def _keras_last_step(g, facts: _Facts, goals: Tensor, seg: Tensor, width: int, head_pred_mask: Optional[Tensor],
+                     heads: List[Tensor], bodies: List[Tensor], segs: List[Tensor], base: int):
+    """The keras filter's last step over ``goals`` (batches ``seg``), grounding only what :func:`_keras_provable`
+    keeps: its groundings whose unknown atom lies in the least fixed point of the provable atoms (reached from the
+    all-fact groundings of every step), which the step finds by grounding again as the set grows (Kleene iteration
+    from the empty set: few rounds, each writing few groundings, instead of the millions a keras step considers).
+    ``heads`` / ``bodies`` / ``segs``: the earlier steps' groundings."""
+    cand = _candidates(g, facts, goals, width, head_pred_mask)
+    if cand[1].shape[0] < KERAS_CLOSURE_MIN_ROWS:      # few candidates: writing them all costs less than the passes
+        return _step(g, facts, goals, width, head_pred_mask, False, cand=cand)[:3]
+    head, body, bseg = torch.cat(heads), torch.cat(bodies), torch.cat(segs)
+    row, slot = torch.nonzero((body[..., 0] != g.kb.padding_idx) & ~facts.facts.contains(body), as_tuple=True)
+    ukey, hkey = _key(bseg[row], body[row, slot], base), _key(bseg, head, base)
+    proved = hkey.new_zeros(0)
+    while True:
+        live = HashSet.of_keys(proved)
+        r, n, b, _ = _step(g, facts, goals, width, head_pred_mask, False, cand=cand, live=live, seg=seg)
+        ok = torch.ones_like(hkey, dtype=torch.bool)
+        ok[row[~live.contains_keys(ukey)]] = False
+        grown = torch.unique(torch.cat([hkey[ok], _key(seg[n], goals[n], base)]))
+        if grown.shape[0] == proved.shape[0]:
+            return r, n, b
+        proved = grown
+
+
 def _ground_steps(g, goals: Tensor, seg: Tensor, base: int, chunk_size: Optional[int], depth: int,
                   stats: Optional[list]):
     """Every depth's kept groundings of the (batch-tagged) query atoms: ``(rule [T], head [T, 3], body [T, M, 3],
@@ -261,6 +303,9 @@ def _ground_steps(g, goals: Tensor, seg: Tensor, base: int, chunk_size: Optional
     facts = _Facts.get(g, base)
     rules, heads, bodies, segs = [], [], [], []
     step = chunk_size if chunk_size and chunk_size > 0 else max(goals.shape[0], 1)
+    # the keras filter's last step grounds only what it can prove, with every goal in one chunk (a chunk's are not
+    # all) and a fact table holding every fact (an atom it misses would count as unknown)
+    keras_last = g.filter_mode == "keras" and g.width <= 1 and step >= goals.shape[0] and facts.seen_all
     for start in range(0, goals.shape[0], step):
         key = _key(seg[start:start + step], goals[start:start + step], base)
         prior = []                                      # each step's goals
@@ -271,8 +316,12 @@ def _ground_steps(g, goals: Tensor, seg: Tensor, base: int, chunk_size: Optional
             key = torch.unique(key)
             prior.append(key)
             s, atoms = _decode(key, base)
-            r, n, b, nxt = _step(g, facts, atoms, g.w_last_depth if last else g.width,
-                                 None if last and g.filter_mode != "keras" else g.head_pred_mask, not last)
+            width = g.w_last_depth if last else g.width
+            hpm = None if last and g.filter_mode != "keras" else g.head_pred_mask
+            if last and d > 0 and keras_last:
+                (r, n, b), nxt = _keras_last_step(g, facts, atoms, s, width, hpm, heads, bodies, segs, base), None
+            else:
+                r, n, b, nxt = _step(g, facts, atoms, width, hpm, not last)
             if d == depth - 2 and g.filter_mode == "fp_batch" and nxt[0].numel():
                 r, n, b, nxt = _provable_next(g, facts, s, r, n, b, nxt, torch.cat(prior), base)
             if stats is not None:
