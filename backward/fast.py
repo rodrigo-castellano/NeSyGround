@@ -17,8 +17,8 @@ grounding (width, cycle, head-predicate prune; existence through a fact hash set
 the rejected candidates (most of them) never reach memory. With width <= 1 a kept grounding has at most one unknown
 atom, the next step's goal; a (goal, rule) row none of whose candidates can be kept (a body atom with no fact on its
 bound side, ...: ``fast_kernels.live_count``) is not walked. With fp_batch, the step before the last keeps only the
-groundings whose unknown atom can still be proved (a fact, a goal some rule could ground at the last step, or an
-earlier step's goal), so the last step grounds only those. The groundings are then filtered by the rules' variable
+groundings whose unknown atom can still be proved (a fact, an earlier step's goal, or a goal some rule could ground at
+the last step: ``fast_kernels.live_atoms``), so the last step grounds only those. The groundings are then filtered by the rules' variable
 bindings and (fp_batch) pruned to the provable ones (``depth`` rounds of Kleene propagation from the facts, over hash
 sets of the raw groundings), canonicalised (unique atoms and firings, sorted), and the queries pinned into the atom
 table.
@@ -30,7 +30,7 @@ from typing import List, Optional
 import torch
 from torch import Tensor
 
-from grounder.backward.fast_kernels import HashSet, expand, last_stage, live_count
+from grounder.backward.fast_kernels import HashSet, expand, last_stage, live_atoms
 from grounder.base.types import Layout, RuleGroundings
 from grounder.data.fact_index.inverted import InvertedFactIndex
 
@@ -162,17 +162,40 @@ def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[
     return g._variant_to_orig_t[rule], n, body, nxt
 
 
-def _live_goals(g, facts: _Facts, goals: Tensor, width: int) -> Tensor:
-    """``[N]`` bool: whether some rule could ground each goal ``[N, 3]`` with at most ``width`` unknown body atoms
-    (:func:`~grounder.backward.fast_kernels.live_count` on its (goal, rule) pairs, every free variable unbound)."""
-    n, r = torch.nonzero(g.pred_rule_mask[goals[:, 0]], as_tuple=True)
-    rule = g.pred_rule_indices[goals[n, 0], r]
-    live = live_count(goals[n, 1:], rule, torch.ones_like(rule), g.arg_source_dep.clamp(max=1 + g.V),
-                      g.body_preds_dep, g.num_body_atoms, _enumerated_atoms(g), None, facts.seen, width, facts.count,
-                      facts.P, facts.E, skip_known=False)
-    out = torch.zeros(goals.shape[0], dtype=torch.bool, device=goals.device)
-    out[n[live > 0]] = True
-    return out
+def _live_tables(g, facts: _Facts):
+    """``(ok_s, ok_o)`` ``[R, E + 1]`` bool, per rule (variant) and entity: every body atom with the head's subject
+    (``ok_s``; object: ``ok_o``) and a free variable has a fact of its predicate on that side (column ``E``: an
+    entity with no facts; a body atom whose predicate has none fails both); cached on the grounder."""
+    got = getattr(g, "_fast_live_tables", None)
+    if got is None:
+        P, E, V = facts.P, facts.E, g.V
+        arg, pred = g.arg_source_dep.clamp(max=1 + V), g.body_preds_dep                    # [R, M, 2], [R, M]
+        active = torch.arange(pred.shape[1], device=pred.device) < g.num_body_atoms.unsqueeze(1)
+        by_s = torch.cat([facts.count[:P * E].view(P, E) > 0, torch.zeros(P, 1, dtype=torch.bool,
+                                                                          device=pred.device)], 1)   # [P, E + 1]
+        by_o = torch.cat([facts.count[P * E:].view(P, E) > 0, torch.zeros(P, 1, dtype=torch.bool,
+                                                                          device=pred.device)], 1)
+        R = pred.shape[0]
+        ok = [torch.ones(R, E + 1, dtype=torch.bool, device=pred.device) for _ in range(2)]
+        for m in range(pred.shape[1]):
+            a0, a1, q = arg[:, m, 0], arg[:, m, 1], pred[:, m]
+            known = q < P
+            qc = q.clamp(max=P - 1)
+            for side, own in ((0, ok[0]), (1, ok[1])):
+                subj = active[:, m] & (a0 == side) & (a1 >= 2)          # (own, free): facts with it as subject
+                obj = active[:, m] & (a0 >= 2) & (a1 == side)           # (free, own): as object
+                own &= ~subj.unsqueeze(1) | (by_s[qc] & known.unsqueeze(1))
+                own &= ~obj.unsqueeze(1) | (by_o[qc] & known.unsqueeze(1))
+        got = g._fast_live_tables = (ok[0].to(torch.int8).contiguous(), ok[1].to(torch.int8).contiguous())
+    return got
+
+
+def _live_goals(g, facts: _Facts, goals: Tensor) -> Tensor:
+    """``[N]`` bool: whether some rule could ground each goal ``[N, 3]`` at the last step (width 0: every body atom a
+    fact) — :func:`~grounder.backward.fast_kernels.live_atoms` on per-rule tables."""
+    ok_s, ok_o = _live_tables(g, facts)
+    return live_atoms(goals, g.pred_rule_mask, g.pred_rule_indices, ok_s, ok_o, g.arg_source_dep.clamp(max=1 + g.V),
+                      g.body_preds_dep, g.num_body_atoms, facts.seen)
 
 
 def _key(seg: Tensor, atoms: Tensor, base: int) -> Tensor:
@@ -215,8 +238,10 @@ def _provable_next(g, facts: _Facts, s: Tensor, r: Tensor, n: Tensor, b: Tensor,
     row, slot = nxt
     atoms = b[row, slot]
     key = _key(s[n[row]], atoms, base)
-    ok = facts.facts.contains(atoms) | torch.isin(key, prior)
-    ok |= _live_goals(g, facts, atoms, g.w_last_depth)
+    ok = HashSet.of_keys(prior).contains_keys(key)
+    if facts.seen is not facts.facts:                  # an unknown atom (not seen) may still be a fact
+        ok |= facts.facts.contains(atoms)
+    ok |= _live_goals(g, facts, atoms)
     keep = torch.ones(r.shape[0], dtype=torch.bool, device=r.device)
     keep[row[~ok]] = False
     new = torch.cumsum(keep, 0) - 1

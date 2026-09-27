@@ -323,13 +323,61 @@ def _last_stage(order_ptr, src_ptr, W, rule_ptr, n_ptr, goal_ptr, start_ptr, cou
         bad = bad_fixed | (tl.max((test & (p == g0) & (x0 == g1) & (x1 == g2)).to(tl.int32), 2) > 0)
         if HPM:
             bad = bad | (tl.max((missing & unprovable).to(tl.int32), 2) > 0)
-        keep = tl.reshape(on & ~bad & (unknown <= width), [BLOCK * U])
+        keep = on & ~bad & (unknown <= width)
+        keep = tl.reshape(keep, [BLOCK * U])
         k = keep.to(tl.int32)
         at = tl.atomic_add(counter_ptr, tl.sum(k, 0)) + tl.cumsum(k, 0) - k
         tl.store(out_row_ptr + at, tl.reshape(r[:, None] + tl.zeros([BLOCK, U], dtype=tl.int32), [BLOCK * U]),
                  mask=keep)
         tl.store(out_val_ptr + at, tl.reshape(v.to(tl.int32), [BLOCK * U]), mask=keep)
         j += U
+
+
+@triton.jit
+def _live_atoms(atoms_ptr, n, rmask_ptr, ridx_ptr, PR, RMAX, ok_s_ptr, ok_o_ptr, E, arg_src_ptr, body_pred_ptr,
+                n_body_ptr, table_ptr, base, out_ptr, M: tl.constexpr, LOG2T: tl.constexpr, BLOCK: tl.constexpr):
+    """Whether some rule of each atom's predicate could ground it with every body atom a fact (:func:`live_atoms`)."""
+    i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    live = i < n
+    p = tl.load(atoms_ptr + i * 3, mask=live, other=0)
+    s = tl.load(atoms_ptr + i * 3 + 1, mask=live, other=0)
+    o = tl.load(atoms_ptr + i * 3 + 2, mask=live, other=0)
+    pc = tl.minimum(p, PR - 1).to(tl.int64)
+    se, oe = tl.minimum(s, E).to(tl.int64), tl.minimum(o, E).to(tl.int64)
+    res = live & (p < 0)                                                    # all False
+    for j in range(RMAX):
+        ok = live & (p < PR) & (tl.load(rmask_ptr + pc * RMAX + j, mask=live, other=0) != 0)
+        r = tl.load(ridx_ptr + pc * RMAX + j, mask=ok, other=0).to(tl.int64)
+        n_body = tl.load(n_body_ptr + r, mask=ok, other=0)
+        ok = ok & (n_body > 0) & (tl.load(ok_s_ptr + r * (E + 1) + se, mask=ok, other=0) != 0) \
+            & (tl.load(ok_o_ptr + r * (E + 1) + oe, mask=ok, other=0) != 0)
+        for m in tl.static_range(M):
+            a0 = tl.load(arg_src_ptr + (r * M + m) * 2, mask=ok, other=2)
+            a1 = tl.load(arg_src_ptr + (r * M + m) * 2 + 1, mask=ok, other=2)
+            q = tl.load(body_pred_ptr + r * M + m, mask=ok, other=0)
+            both = ok & (m < n_body) & (a0 < 2) & (a1 < 2)                      # both arguments the atom's own
+            x0 = tl.where(a0 == 0, s, o)
+            x1 = tl.where(a1 == 0, s, o)
+            ok = ok & (~both | _probe(table_ptr, (q * base + x0) * base + x1, both, LOG2T))
+        res = res | ok
+    tl.store(out_ptr + i, res.to(tl.int8), mask=live)
+
+
+def live_atoms(atoms: Tensor, rule_mask: Tensor, rule_idx: Tensor, ok_s: Tensor, ok_o: Tensor, arg_src: Tensor,
+               body_pred: Tensor, n_body: Tensor, facts: HashSet) -> Tensor:
+    """``[N]`` bool: whether some rule (of ``rule_idx [P, RMAX]`` where ``rule_mask``) could ground each atom
+    ``(p, s, o)`` of ``atoms [N, 3]`` with every body atom a fact — the necessary tests of :func:`_live_count` at width
+    0 with every free variable unbound, from per-rule tables: ``ok_s [R, E + 1]`` / ``ok_o`` (every body atom with the
+    head's subject / object and a free variable has a fact on that side for that entity; column ``E``: an entity with
+    no facts), and a probe of the body atoms whose arguments are both the head's."""
+    out = torch.empty(atoms.shape[0], dtype=torch.int8, device=atoms.device)
+    if atoms.shape[0]:
+        PR, RMAX = rule_mask.shape
+        _live_atoms[(triton.cdiv(atoms.shape[0], 1024),)](
+            atoms.contiguous(), atoms.shape[0], rule_mask.to(torch.int8).contiguous(), rule_idx.contiguous(), PR, RMAX,
+            ok_s, ok_o, ok_s.shape[1] - 1, arg_src.contiguous(), body_pred.contiguous(), n_body.contiguous(),
+            facts.table, facts.base, out, M=body_pred.shape[1], LOG2T=facts.log2t, BLOCK=1024)
+    return out.bool()
 
 
 def live_count(src: Tensor, rule: Tensor, count: Tensor, arg_src: Tensor, body_pred: Tensor, n_body: Tensor,
@@ -382,4 +430,5 @@ def last_stage(src: Tensor, rule: Tensor, n: Tensor, goals: Tensor, start: Tenso
             n_live, M=M, MP=triton.next_power_of_2(M), U=UNROLL, HPM=head_pred_mask is not None,
             LOG2T=facts.log2t, BLOCK=BLOCK)
     k = int(counter.item())
-    return rows[:k].long(), vals[:k].long()
+    rows, vals = rows[:k], vals[:k]
+    return rows.long(), vals.long()
