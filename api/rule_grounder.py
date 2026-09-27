@@ -479,16 +479,19 @@ class RuleGrounder(nn.Module):
         self._inner = make_grounder(kb_obj, config, layout=layout_knob,
                                     compile=compile_knob, chunk_size=grounder_chunk)
         if config.filter == "keras":
-            for head, body in rules:
-                if len(body) > 1 and any(set(a[1:]) <= set(head[1:]) for a in body):
-                    # keras-ns takes such an atom, bound by the head alone, as known without looking it up
-                    raise NotImplementedError(f"the keras filter: a body atom of {head} :- {body} has only head "
-                                              f"variables")
             # keras-ns walks the rules in their input order, depth - 1 rounds (the IJCAI-25 code) or ``.r<N>`` rounds
             # (the later keras-ns of XAI-25 / NeSy-25 walks depth rounds: ``enum.keras.w1.d2.r2.flat``)
             self._inner.keras_rule_order = torch.tensor(self.input_rule, dtype=torch.long)
             m_r = re.search(r"\.r(\d+)(?:\.|$)", grounder_type)
             self._inner.keras_rounds = int(m_r.group(1)) if m_r else None
+            for head, body in rules:
+                if (len(body) > 1 and any(set(a[1:]) <= set(head[1:]) for a in body)
+                        and (self._inner.keras_rounds or depth - 1)):
+                    # keras-ns takes such an atom, bound by the head alone, as known without looking it up; with no
+                    # proof rounds (IJCAI-25's depth 1: FB15k-237's AMIE rules) its pruning keeps a grounding only
+                    # when every body atom is a fact, as here
+                    raise NotImplementedError(f"the keras filter: a body atom of {head} :- {body} has only head "
+                                              f"variables")
 
         self.fact_index = fact_index
         # Learned-budget provider (rides a list — never registered, so the
@@ -725,7 +728,8 @@ def create_grounder(grounder_type: str, *, fact_index, rules, kb, max_groundings
     """A grounder from a type string like ``enum.fp_batch.w1.d2.flat`` behind a :class:`RuleGrounder`.
 
     ``max_states`` caps the grounder's state budget; ``chunk_size`` is its query chunking (0 = one chunk, >0
-    explicit, <0 the library's auto-budget — see ``cfg.grounder_chunk_size``).
+    explicit, <0 the library's auto-budget — see ``cfg.grounder_chunk_size``). The grounder enumerates at most
+    ``fact_index.max_facts_per_query`` facts per (predicate, entity), as the fact index.
     """
     # SLD/RTF use the arg-key fact index; PBC uses the default block-sparse.
     fact_index_type = ("arg_key" if grounder_type.startswith(_PROLOG_PREFIXES + _RTF_PREFIXES)
@@ -735,4 +739,5 @@ def create_grounder(grounder_type: str, *, fact_index, rules, kb, max_groundings
         max_groundings=max_groundings, max_total_groundings=max_total_groundings,
         provable_set_method=provable_set_method, compile_mode=compile_mode, max_states=max_states,
         fact_index_type=fact_index_type, chunk_size=chunk_size,
-        guided_topk=guided_topk, guided_tnorm=guided_tnorm, guided_kge=guided_kge)
+        guided_topk=guided_topk, guided_tnorm=guided_tnorm, guided_kge=guided_kge,
+        max_facts_per_query=getattr(fact_index, "max_facts_per_query", 64))

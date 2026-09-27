@@ -1352,9 +1352,9 @@
   "proved_queries": 1203,
   "queries": 2924,
   "raw": [
-   1433
+   1789
   ],
-  "seconds": 0.03,
+  "seconds": 1.11,
   "sha": "42b2231f619db464"
  },
  "wn18rr:test:enum.keras.w1.d1.flat": {
@@ -1412,18 +1412,18 @@
   "raw": [
    123292
   ],
-  "seconds": 0.04,
+  "seconds": 0.02,
   "sha": "42b2231f619db464"
  },
  "wn18rr:test:enum.keras.w1.d2.flat": {
   "atoms": 5711,
-  "firings": 3056,
+  "firings": 3089,
   "goals": [
    2924,
    121790
   ],
   "per_rule": [
-   129,
+   162,
    331,
    42,
    334,
@@ -1470,20 +1470,20 @@
   "queries": 2924,
   "raw": [
    123292,
-   528278
+   1976
   ],
   "seconds": 0.06,
-  "sha": "e29578f2a37ccd36"
+  "sha": "ef6162cfde256293"
  },
  "wn18rr:test:enum.keras.w1.d2.r2.flat": {
   "atoms": 5719,
-  "firings": 3067,
+  "firings": 3100,
   "goals": [
    2924,
    121790
   ],
   "per_rule": [
-   129,
+   162,
    331,
    42,
    336,
@@ -1530,21 +1530,21 @@
   "queries": 2924,
   "raw": [
    123292,
-   528278
+   1976
   ],
   "seconds": 0.06,
-  "sha": "b601f9930c069200"
+  "sha": "87bdeea5c57e2781"
  },
  "wn18rr:test:enum.keras.w1.d3.flat": {
   "atoms": 7349,
-  "firings": 6144,
+  "firings": 6179,
   "goals": [
    2924,
    121790,
-   321409
+   321447
   ],
   "per_rule": [
-   402,
+   437,
    1071,
    43,
    1102,
@@ -1591,22 +1591,22 @@
   "queries": 2924,
   "raw": [
    123292,
-   528278,
-   1177938
+   528316,
+   4308
   ],
-  "seconds": 0.09,
-  "sha": "40bf55ec0c506a02"
+  "seconds": 0.08,
+  "sha": "47f3f9adaf347980"
  },
  "wn18rr:test:enum.keras.w1.d3.r3.flat": {
   "atoms": 7357,
-  "firings": 6168,
+  "firings": 6203,
   "goals": [
    2924,
    121790,
-   321409
+   321447
   ],
   "per_rule": [
-   404,
+   439,
    1076,
    43,
    1108,
@@ -1653,10 +1653,10 @@
   "queries": 2924,
   "raw": [
    123292,
-   528278,
-   1177938
+   528316,
+   4308
   ],
-  "seconds": 0.09,
-  "sha": "1e1a749c5f38d259"
+  "seconds": 0.1,
+  "sha": "0a99dc98c5f0036e"
  }
 }

@@ -174,7 +174,8 @@ def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[
                             cycle="unknown" if getattr(g, "filter_mode", None) == "keras" else "all", live_set=live,
                             seg=seg)
     n, rule = n[rows], rule[rows]
-    src = torch.cat([src[rows], vals.unsqueeze(1), src.new_zeros(rows.shape[0], 1 + V - src.shape[1])], 1)[:, :2 + V]
+    pad_cols = src.new_zeros(rows.shape[0], max(1 + V - src.shape[1], 0))       # (none when no rule has a free var)
+    src = torch.cat([src[rows], vals.unsqueeze(1), pad_cols], 1)[:, :2 + V]
     args = src.unsqueeze(1).expand(-1, M, -1).gather(-1, arg_src[rule])
     body = torch.cat([g.body_preds_dep[rule].unsqueeze(-1), args], -1)            # [K, M, 3]
     active = torch.arange(M, device=dev) < g.num_body_atoms[rule].unsqueeze(1)
@@ -374,11 +375,11 @@ def _keras_proved(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, keep
         nxt[bid[new]] = True
         goals.append(nxt)
         seen |= nxt
-    if depth < 2:
+    rounds = getattr(g, "keras_rounds", None) or depth - 1
+    if rounds < 1:              # (IJCAI-25's depth 1: no walk, so every body atom a fact)
         return (~unknown).all(1)
     proof = keep & (g.kb.rule_lens.to(rule.device)[rc] >= 2)
     order = getattr(g, "keras_rule_order", torch.arange(R, device=rule.device)).to(rule.device)[rc]
-    rounds = getattr(g, "keras_rounds", None) or depth - 1
     walk, never = R * depth * n, torch.iinfo(torch.long).max // 4
     t = torch.full((n,), never, dtype=torch.long, device=rule.device)          # each atom's earliest proof
     while True:

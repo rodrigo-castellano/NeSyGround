@@ -221,11 +221,11 @@ def _absent(p, x0, x1, bound0, bound1, active, slot_count_ptr, PF, EF, table_ptr
 def _live_count(src_ptr, W, rule_ptr, count_ptr, arg_src_ptr, body_pred_ptr, n_body_ptr, known_ptr, hpm_ptr, P,
                 slot_count_ptr, PF, EF, table_ptr, base, width, out_ptr, T,
                 M: tl.constexpr, HPM: tl.constexpr, SKIP_KNOWN: tl.constexpr, LOG2T: tl.constexpr,
-                BLOCK: tl.constexpr):
+                BLOCK: tl.constexpr, ONE_UNTESTED: tl.constexpr = False):
     """Each row's candidate count, or 0 when none of its candidates can be kept: more body atoms than ``width`` are
     surely unknown (:func:`_absent`), or one of them has an unprovable predicate. Columns ``>= W`` of a row are free.
     ``SKIP_KNOWN``: the atoms an enumeration draws from the facts are not tested (their variable is enumerated: a fact
-    whatever it takes)."""
+    whatever it takes). ``ONE_UNTESTED``: a one-body rule's row is kept untested (keras-ns)."""
     i = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     live = i < T
     rule = tl.load(rule_ptr + i, mask=live, other=0).to(tl.int64)
@@ -246,7 +246,10 @@ def _live_count(src_ptr, W, rule_ptr, count_ptr, arg_src_ptr, body_pred_ptr, n_b
         if HPM:
             bad = bad | (absent & (tl.load(hpm_ptr + tl.minimum(p, P - 1), mask=absent, other=1) == 0))
     count = tl.load(count_ptr + i, mask=live, other=0)
-    tl.store(out_ptr + i, tl.where(bad | (unknown > width), 0, count), mask=live)
+    drop = bad | (unknown > width)
+    if ONE_UNTESTED:
+        drop = drop & (n_body != 1)
+    tl.store(out_ptr + i, tl.where(drop, 0, count), mask=live)
 
 
 @triton.jit
@@ -304,15 +307,21 @@ def _last_stage(order_ptr, src_ptr, W, rule_ptr, n_ptr, goal_ptr, start_ptr, cou
     unknown_fixed = tl.sum((fixed & ~exists_fixed).to(tl.int32), 2)                         # [BLOCK, 1]
     bad_fixed = (live & (n_body <= 0))[:, None]
     # a body atom that is the goal itself (CYCLE 1: always dropped; 2, keras-ns's: unless it is a fact, the only way
-    # its grounding keeps the goal: as the atom drawn from the facts)
+    # its grounding keeps the goal: as the atom drawn from the facts, so once: a second such atom drops it)
     goal_fixed = fixed & (p == g0) & (b0 == g1) & (b1 == g2)
     if CYCLE == 2:
+        untested = (n_body == 1)[:, None, None]    # keras-ns adds a one-body rule's grounding untested
+        goal_fixed = goal_fixed & ~untested
+        n_goal_fixed = tl.sum(goal_fixed.to(tl.int32), 2)                                    # [BLOCK, 1]
         goal_fixed = goal_fixed & ~exists_fixed
     bad_fixed = bad_fixed | (tl.max(goal_fixed.to(tl.int32), 2) > 0)
     varying = act & uses_v
     if HPM:                                        # an unknown atom must be provable
         unprovable = tl.load(hpm_ptr + tl.minimum(p, P - 1), mask=act, other=1) == 0
-        bad_fixed = bad_fixed | (tl.max((fixed & ~exists_fixed & unprovable).to(tl.int32), 2) > 0)
+        unknown_unprovable = fixed & ~exists_fixed & unprovable
+        if CYCLE == 2:
+            unknown_unprovable = unknown_unprovable & ~untested
+        bad_fixed = bad_fixed | (tl.max(unknown_unprovable.to(tl.int32), 2) > 0)
     if LIVE:                                       # ... and live
         sg = tl.load(seg_ptr + tl.load(n_ptr + r64, mask=live, other=0).to(tl.int64), mask=live,
                      other=0)[:, None, None]
@@ -335,14 +344,20 @@ def _last_stage(order_ptr, src_ptr, W, rule_ptr, n_ptr, goal_ptr, start_ptr, cou
         unknown = unknown_fixed + tl.sum(missing.to(tl.int32), 2)
         goal_at = test & (p == g0) & (x0 == g1) & (x1 == g2)
         if CYCLE == 2:
+            twice = n_goal_fixed + tl.sum(goal_at.to(tl.int32), 2) > 1
             goal_at = goal_at & ~exists
         bad = bad_fixed | (tl.max(goal_at.to(tl.int32), 2) > 0)
+        if CYCLE == 2:
+            bad = bad | twice
         if HPM:
             bad = bad | (tl.max((missing & unprovable).to(tl.int32), 2) > 0)
         if LIVE:
             live_at = _probe3(live_ptr, ((sg * base + p) * base + x0) * base + x1, missing, LIVE_LOG2T)
             bad = bad | (tl.max((missing & ~live_at).to(tl.int32), 2) > 0)
-        keep = on & ~bad & (unknown <= width)
+        fits = unknown <= width
+        if CYCLE == 2:
+            fits = fits | (n_body == 1)[:, None]
+        keep = on & ~bad & fits
         keep = tl.reshape(keep, [BLOCK * U])
         k = keep.to(tl.int32)
         at = tl.atomic_add(counter_ptr, tl.sum(k, 0)) + tl.cumsum(k, 0) - k
@@ -401,9 +416,9 @@ def live_atoms(atoms: Tensor, rule_mask: Tensor, rule_idx: Tensor, ok_s: Tensor,
 
 def live_count(src: Tensor, rule: Tensor, count: Tensor, arg_src: Tensor, body_pred: Tensor, n_body: Tensor,
                known: Tensor, head_pred_mask: Optional[Tensor], facts: HashSet, width: int, slot_count: Tensor, P: int,
-               E: int, *, skip_known: bool) -> Tensor:
+               E: int, *, skip_known: bool, one_untested: bool = False) -> Tensor:
     """``[T]`` int32: each row's ``count``, or 0 when no grounding of it can be kept (:func:`_live_count`; columns
-    ``>= W`` of ``src [T, W]`` free)."""
+    ``>= W`` of ``src [T, W]`` free; ``one_untested``: a one-body rule's rows are kept)."""
     T, W = src.shape
     live = torch.empty(T, dtype=torch.int32, device=src.device)
     if T:
@@ -414,7 +429,7 @@ def live_count(src: Tensor, rule: Tensor, count: Tensor, arg_src: Tensor, body_p
                                              known.to(torch.int8).contiguous(), hpm, hpm.numel(), slot_count, P, E,
                                              facts.table, facts.base, width, live, T, M=body_pred.shape[1],
                                              HPM=head_pred_mask is not None, SKIP_KNOWN=skip_known,
-                                             LOG2T=facts.log2t, BLOCK=1024)
+                                             LOG2T=facts.log2t, BLOCK=1024, ONE_UNTESTED=one_untested)
     return live
 
 
@@ -428,14 +443,15 @@ def last_stage(src: Tensor, rule: Tensor, n: Tensor, goals: Tensor, start: Tenso
     each body argument's source column (past ``W``: 0), ``known [R, M]`` the body atoms an enumeration drew from
     the facts (not probed). Rows that cannot keep a candidate (:func:`_live_count`, from the fact index's slot
     counts ``slot_count`` over ``P`` predicates and ``E`` entities) are not walked. ``cycle``: a grounding whose body
-    holds its own goal is dropped (``"all"``), or only when that atom is not a fact (``"unknown"``: keras-ns, which
-    draws one body atom from the facts and rejects the goal among the others). ``live_set``: an unknown atom must also
-    be in this key set, keyed with its goal's batch ``seg [N]`` (``fast._key``)."""
+    holds its own goal is dropped (``"all"``), or only when that atom is not a fact or holds it twice (``"unknown"``:
+    keras-ns, which draws one body atom from the facts and rejects the goal among the others; it adds a one-body rule's
+    grounding with no test at all, its proof walk alone decides). ``live_set``: an unknown atom must also be in this
+    key set, keyed with its goal's batch ``seg [N]`` (``fast._key``)."""
     T, W = src.shape
     dev = src.device
     src, rule = src.contiguous(), rule.contiguous()
     live = live_count(src, rule, count, arg_src, body_pred, n_body, known, head_pred_mask, facts, width, slot_count, P,
-                      E, skip_known=True)
+                      E, skip_known=True, one_untested=cycle == "unknown")
     total, n_live = torch.stack([live.sum(), (live > 0).sum()]).tolist() if T else (0, 0)
     known8, M = known.to(torch.int8).contiguous(), body_pred.shape[1]
     hpm = (head_pred_mask.to(torch.int8) if head_pred_mask is not None

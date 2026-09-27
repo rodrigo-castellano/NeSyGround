@@ -19,11 +19,11 @@ FACTS = [(1, A, B), (1, B, A), (0, A, Z), (1, B, C)]                    # nb(a, 
 RULES = [(("loc", "X", "Z"), [("nb", "X", "Y"), ("nb", "Y", "K"), ("loc", "K", "Z")])]
 
 
-def _groundings(grounder_type: str, queries):
+def _groundings(grounder_type: str, queries, facts=FACTS, rules=RULES):
     vocab = SimpleNamespace(relation2id={p: i for i, p in enumerate(PREDS)}, entity2id={f"e{i}": i for i in range(4)},
-                            rule_names=["r0"])
-    fi = TensorFactIndex(FACTS, num_predicates=len(PREDS), num_entities=4, device=DEV, max_facts_per_query=8)
-    rg = create_grounder(grounder_type, fact_index=fi, rules=RULES, kb=vocab, max_groundings=32,
+                            rule_names=[f"r{i}" for i in range(len(rules))])
+    fi = TensorFactIndex(facts, num_predicates=len(PREDS), num_entities=4, device=DEV, max_facts_per_query=8)
+    rg = create_grounder(grounder_type, fact_index=fi, rules=rules, kb=vocab, max_groundings=32,
                          max_total_groundings=64, provable_set_method="spmm", device=DEV)
     q = torch.tensor(queries, device=DEV)
     out = rg.run_bc(q, torch.ones(len(q), dtype=torch.bool, device=DEV))
@@ -44,6 +44,38 @@ def test_keras_keeps_a_body_holding_its_head_only_as_a_fact():
     assert cycle not in default                                        # the default drops every such grounding
     _, keras_w1 = _groundings("enum.keras.w1.d1.flat", [unknown_head])
     assert all(unknown_head not in body for head, body in keras_w1 if head == unknown_head)
+
+
+def test_keras_drops_a_body_holding_its_head_twice():
+    """Only one body atom is drawn from the facts: a second atom equal to the query is checked like any other and
+    rejected, so a grounding whose body holds its (fact) head twice never survives (FB15k-237's self-loop queries)."""
+    loop = (1, A, A)
+    rules = [(("nb", "X", "Y"), [("nb", "X", "K"), ("nb", "K", "Y")])]
+    _, keras = _groundings("enum.keras.w0.d1.flat", [loop], facts=FACTS + [loop], rules=rules)
+    assert keras == {(loop, ((1, A, B), (1, B, A)))}                   # not nb(a, a), nb(a, a)
+
+
+def test_keras_head_only_body_atoms_need_every_atom_a_fact_at_depth_one():
+    """A body atom bound by the head alone is known to keras-ns without a lookup; with no proof rounds (IJCAI-25's
+    depth 1) its pruning still keeps only all-fact bodies. Deeper, the grounder refuses such rules."""
+    rules = [(("nb", "X", "Y"), [("nb", "Y", "X"), ("loc", "X", "Y")])]
+    facts = FACTS + [(0, B, A)]                                        # loc(b, a): nb(a, b)'s second atom not a fact
+    _, keras = _groundings("enum.keras.w0.d1.flat", [(1, A, B), (1, B, A)], facts=facts, rules=rules)
+    assert keras == {((1, B, A), ((1, A, B), (0, B, A)))}
+    with pytest.raises(NotImplementedError):
+        _groundings("enum.keras.w1.d2.flat", [(1, A, B)], facts=facts, rules=rules)
+
+
+def test_keras_one_round_at_depth_one_keeps_a_one_body_atom_the_batch_proves():
+    """keras-ns adds a one-body rule's grounding untested; the later keras-ns (XAI-25, NeSy-25) walks one proof round
+    at depth 1 (``.r1``), so the grounding survives when a grounding of the same batch proves its non-fact atom; with
+    no round (IJCAI-25) only all-fact bodies do."""
+    rules = [(("nb", "X", "Y"), [("nb", "Y", "X")]), (("nb", "X", "Y"), [("nb", "X", "K"), ("nb", "K", "Y")])]
+    chain = ((1, A, C), ((1, A, B), (1, B, C)))                    # nb(a, c): proved by nb(a, b), nb(b, c)
+    flip = ((1, C, A), ((1, A, C),))                               # nb(c, a) :- nb(a, c), not a fact
+    unpadded = lambda out: {(h, tuple(a for a in b if a[0] < len(PREDS))) for h, b in out[1]}      # noqa: E731
+    assert unpadded(_groundings("enum.keras.w0.d1.r1.flat", [(1, A, C), (1, C, A)], rules=rules)) == {chain, flip}
+    assert unpadded(_groundings("enum.keras.w0.d1.flat", [(1, A, C), (1, C, A)], rules=rules)) == {chain}
 
 
 @pytest.mark.parametrize("grounder_type, rounds", [("enum.keras.w1.d2.flat", None), ("enum.keras.w1.d2.r2.flat", 2)])
