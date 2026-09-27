@@ -15,9 +15,13 @@ groundings) are deduplicated; the live (goal, rule) pairs enumerate their free v
 last free variable is enumerated in a fused kernel (``fast_kernels.last_stage``) that also tests every candidate
 grounding (width, cycle, head-predicate prune; existence through a fact hash set) and writes only the kept ones, so
 the rejected candidates (most of them) never reach memory. With width <= 1 a kept grounding has at most one unknown
-atom, the next step's goal. The firings are then canonicalised (unique atoms and firings, sorted), filtered by the
-rules' variable bindings, pruned to the provable ones (fp_batch: ``depth`` rounds of Kleene propagation from the
-facts), and the queries pinned into the atom table.
+atom, the next step's goal; a (goal, rule) row none of whose candidates can be kept (a body atom with no fact on its
+bound side, ...: ``fast_kernels.live_count``) is not walked. With fp_batch, the step before the last keeps only the
+groundings whose unknown atom can still be proved (a fact, a goal some rule could ground at the last step, or an
+earlier step's goal), so the last step grounds only those. The groundings are then filtered by the rules' variable
+bindings and (fp_batch) pruned to the provable ones (``depth`` rounds of Kleene propagation from the facts, over hash
+sets of the raw groundings), canonicalised (unique atoms and firings, sorted), and the queries pinned into the atom
+table.
 """
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ from typing import List, Optional
 import torch
 from torch import Tensor
 
-from grounder.backward.fast_kernels import HashSet, expand, last_stage
+from grounder.backward.fast_kernels import HashSet, expand, last_stage, live_count
 from grounder.base.types import Layout, RuleGroundings
 from grounder.data.fact_index.inverted import InvertedFactIndex
 
@@ -118,6 +122,7 @@ def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[
     no_free = ~g.has_free[rule]
     enumerated = [fv for fv in range(V) if g._fv_any_valid[fv]]
     last = enumerated[-1] if enumerated else V
+    arg_src = g.arg_source_dep.clamp(max=1 + V)                    # the source columns: head args, free variables
     for fv in range(last):
         if not g._fv_any_valid[fv]:
             src = torch.cat([src, src.new_zeros(src.shape[0], 1)], 1)
@@ -130,7 +135,8 @@ def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[
             src, rule, n, start, count, one = expand(
                 src, rule, n, start, count, one, facts.values, g.fv_enum_bound_src[:, last], g.fv_enum_pred[:, last],
                 g.fv_enum_direction[:, last], ~g.has_free | ~g.fv_enum_valid[:, last], facts.start, facts.count,
-                facts.P, facts.E)
+                facts.P, facts.E, arg_src, g.body_preds_dep, g.num_body_atoms, _enumerated_atoms(g), head_pred_mask,
+                facts.seen, width)
             break
         row, value = facts.enumerate(g.fv_enum_pred[rule, fv], bound, g.fv_enum_direction[rule, fv], one)
         n, rule, no_free = n[row], rule[row], no_free[row]
@@ -143,9 +149,9 @@ def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[
         else:
             start, one = torch.zeros_like(rule), torch.ones_like(rule, dtype=torch.bool)
             count = one.long()
-    arg_src = g.arg_source_dep.clamp(max=1 + V)                    # the source columns: head args, free variables
     rows, vals = last_stage(src, rule, n, goals, start, count, one, facts.values, arg_src, g.body_preds_dep,
-                            g.num_body_atoms, _enumerated_atoms(g), head_pred_mask, facts.seen, pad, width)
+                            g.num_body_atoms, _enumerated_atoms(g), head_pred_mask, facts.seen, pad, width,
+                            facts.count, facts.P, facts.E)
     n, rule = n[rows], rule[rows]
     src = torch.cat([src[rows], vals.unsqueeze(1), src.new_zeros(rows.shape[0], 1 + V - src.shape[1])], 1)[:, :2 + V]
     args = src.unsqueeze(1).expand(-1, M, -1).gather(-1, arg_src[rule])
@@ -154,6 +160,19 @@ def _step(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[
     body = body.masked_fill(~active.unsqueeze(-1), pad)
     nxt = torch.nonzero(active & ~facts.seen.contains(body), as_tuple=True) if want_next else None
     return g._variant_to_orig_t[rule], n, body, nxt
+
+
+def _live_goals(g, facts: _Facts, goals: Tensor, width: int) -> Tensor:
+    """``[N]`` bool: whether some rule could ground each goal ``[N, 3]`` with at most ``width`` unknown body atoms
+    (:func:`~grounder.backward.fast_kernels.live_count` on its (goal, rule) pairs, every free variable unbound)."""
+    n, r = torch.nonzero(g.pred_rule_mask[goals[:, 0]], as_tuple=True)
+    rule = g.pred_rule_indices[goals[n, 0], r]
+    live = live_count(goals[n, 1:], rule, torch.ones_like(rule), g.arg_source_dep.clamp(max=1 + g.V),
+                      g.body_preds_dep, g.num_body_atoms, _enumerated_atoms(g), None, facts.seen, width, facts.count,
+                      facts.P, facts.E, skip_known=False)
+    out = torch.zeros(goals.shape[0], dtype=torch.bool, device=goals.device)
+    out[n[live > 0]] = True
+    return out
 
 
 def _key(seg: Tensor, atoms: Tensor, base: int) -> Tensor:
@@ -188,6 +207,22 @@ def _decode(key: Tensor, base: int):
     return key // base ** 3, torch.stack([key // (base * base) % base, key // base % base, key % base], -1)
 
 
+def _provable_next(g, facts: _Facts, s: Tensor, r: Tensor, n: Tensor, b: Tensor, nxt, prior: Tensor, base: int):
+    """The groundings of the step before the last, less those whose unknown atom cannot be proved, so fp_batch would
+    drop them: the atom is not a fact, no rule could ground it at the last step (width ``w_last_depth``), and it is no
+    goal of an earlier step (its only groundings would be the last step's). Their unknown atoms are the last step's
+    goals, so it grounds only atoms that can be proved; the kept firings are fp_batch's."""
+    row, slot = nxt
+    atoms = b[row, slot]
+    key = _key(s[n[row]], atoms, base)
+    ok = facts.facts.contains(atoms) | torch.isin(key, prior)
+    ok |= _live_goals(g, facts, atoms, g.w_last_depth)
+    keep = torch.ones(r.shape[0], dtype=torch.bool, device=r.device)
+    keep[row[~ok]] = False
+    new = torch.cumsum(keep, 0) - 1
+    return r[keep], n[keep], b[keep], (new[row[ok]], slot[ok])
+
+
 def _ground_steps(g, goals: Tensor, seg: Tensor, base: int, chunk_size: Optional[int], depth: int,
                   stats: Optional[list]):
     """Every depth's kept groundings of the (batch-tagged) query atoms: ``(rule [T], head [T, 3], body [T, M, 3],
@@ -197,13 +232,18 @@ def _ground_steps(g, goals: Tensor, seg: Tensor, base: int, chunk_size: Optional
     step = chunk_size if chunk_size and chunk_size > 0 else max(goals.shape[0], 1)
     for start in range(0, goals.shape[0], step):
         key = _key(seg[start:start + step], goals[start:start + step], base)
+        prior = []                                      # each step's goals
         for d in range(depth):
             if key.shape[0] == 0:
                 break
             last = d == depth - 1
-            s, atoms = _decode(torch.unique(key), base)
+            key = torch.unique(key)
+            prior.append(key)
+            s, atoms = _decode(key, base)
             r, n, b, nxt = _step(g, facts, atoms, g.w_last_depth if last else g.width,
                                  None if last else g.head_pred_mask, not last)
+            if d == depth - 2 and g.filter_mode == "fp_batch" and nxt[0].numel():
+                r, n, b, nxt = _provable_next(g, facts, s, r, n, b, nxt, torch.cat(prior), base)
             if stats is not None:
                 stats.append((d, int(atoms.shape[0]), int(r.shape[0])))
             rules.append(r)
@@ -217,6 +257,27 @@ def _ground_steps(g, goals: Tensor, seg: Tensor, base: int, chunk_size: Optional
         z = goals.new_zeros(0)
         return z, goals.new_zeros(0, 3), goals.new_zeros(0, g.kb.M, 3), z
     return torch.cat(rules), torch.cat(heads), torch.cat(bodies), torch.cat(segs)
+
+
+def _kept(g, rule: Tensor, head: Tensor, body: Tensor, seg: Tensor, base: int, depth: int):
+    """The groundings ``(rule, head [T, 3], body [T, M, 3], batch)`` whose atoms fit their rule's variable bindings (a
+    repeated variable binds one constant) and, with fp_batch, whose body is proved within ``depth`` rounds of
+    propagation from the facts (an atom is proved by a fact, or as the head of a grounding whose body was proved the
+    round before) — before canonicalising, on the raw groundings (repeats keep or drop together)."""
+    kb, pad, M, R = g.kb, g.kb.padding_idx, g.kb.M, g.kb.num_rules
+    bt = kb.binding_tables(M, pad)
+    rc = rule.clamp(min=0, max=R - 1)
+    ent = torch.cat([head.unsqueeze(1), body], 1)[..., 1:].reshape(-1, 2 * (M + 1))
+    keep = ((rule >= 0) & (rule < R) & (head[:, 0] == bt["head_pred"][rc]) & (body[..., 0] == bt["body_pred"][rc]).all(1)
+            & ((ent == ent.gather(1, bt["canon_src"][rc])) | ~bt["slot_active"][rc]).all(1))
+    if g.filter_mode == "fp_batch":
+        fact = _Facts.get(g, base).facts.contains(body) | (body[..., 0] == pad)        # [T, M]
+        head_key, body_key = _key(seg, head, base), _key(seg.unsqueeze(1), body, base)
+        proved = fact
+        for _ in range(max(1, depth)):
+            proved = fact | HashSet.of_keys(head_key[proved.all(1) & keep]).contains_keys(body_key)
+        keep &= proved.all(1)
+    return rule[keep], head[keep], body[keep], seg[keep]
 
 
 @torch.no_grad()
@@ -237,45 +298,21 @@ def ground_many(g, queries: Tensor, query_mask: Tensor, chunk_size: Optional[int
     live = query_mask.reshape(-1) & (qs[:, 0] != pad)
     rule, head, body, seg = _ground_steps(g, qs[live], qseg[live], base, chunk_size, depth, stats)
 
+    rule, head, body, seg = _kept(g, rule, head, body, seg, base, depth)
+
     # canonical firings: unique atoms (sorted by batch, then atom), unique firings (sorted by batch, rule, atoms)
     akey, ainv = torch.unique(_key(seg.unsqueeze(1), torch.cat([head.unsqueeze(1), body], 1), base),
                               return_inverse=True)                                  # ainv [T, 1 + M]
     aseg, table = _decode(akey, base)
     start = torch.searchsorted(aseg, torch.arange(S + 1, device=dev))              # each batch's first atom
     local = ainv - start[seg].unsqueeze(1)
-    rule = torch.where(rule < 0, torch.full_like(rule, R), rule)
     A = max(int(start.diff().max()), 1) if S > 1 else max(int(akey.shape[0]), 1)     # atoms per batch
-    fseg, rule, *local = _unique_rows([seg, rule, *local.unbind(1)], [S, R + 1] + [A] * (M + 1))
-    local = torch.stack(local, 1)
-    idx = local + start[fseg].unsqueeze(1)                                          # [F, 1 + M] global atom rows
+    fseg, rule, *local = _unique_rows([seg, rule, *local.unbind(1)], [S, R] + [A] * (M + 1))
+    idx = torch.stack(local, 1) + start[fseg].unsqueeze(1)                          # [F, 1 + M] global atom rows
 
-    # the rules' variable bindings (a repeated variable binds one constant)
-    bt = kb.binding_tables(M, pad)
-    rc = rule.clamp(max=R - 1)
-    fatoms = table[idx]                                                             # [F, 1 + M, 3]
-    ent = fatoms[..., 1:].reshape(-1, 2 * (M + 1))
-    keep = ((rule < R) & (fatoms[:, 0, 0] == bt["head_pred"][rc]) & (fatoms[:, 1:, 0] == bt["body_pred"][rc]).all(1)
-            & ((ent == ent.gather(1, bt["canon_src"][rc])) | ~bt["slot_active"][rc]).all(1))
-
-    # fp_batch: keep the firings whose body is proved within depth rounds from the facts
-    if g.filter_mode == "fp_batch":
-        proved = (_Facts.get(g, base).facts.contains(table) | (table[:, 0] == pad)).to(torch.int8)
-        body_idx, head_idx = idx[:, 1:], idx[:, 0]
-        for _ in range(max(1, depth)):
-            fired = ((proved[body_idx] == 1).all(1) & keep).to(torch.int8)
-            proved = torch.maximum(proved, torch.zeros_like(proved).scatter_reduce_(
-                0, head_idx, fired, reduce="amax", include_self=False))
-        keep &= (proved[body_idx] == 1).all(1)
-    fseg, rule, idx = fseg[keep], rule[keep], idx[keep]
-
-    # the atom table compacted to the kept firings' atoms, then every query pinned (new ones appended, sorted)
-    used = torch.zeros(table.shape[0], dtype=torch.bool, device=dev)
-    used[idx.reshape(-1)] = True
-    new = torch.cumsum(used, 0) - 1
-    akey, aseg, table = akey[used], aseg[used], table[used]
-    idx = new[idx]
+    # every query pinned into the atom table (new ones appended, sorted)
     body_valid = table[idx[:, 1:], 0] != pad
-    pstart = torch.searchsorted(aseg, torch.arange(S + 1, device=dev))
+    pstart = start
     qkey = _key(qseg, qs, base)
     at = torch.searchsorted(akey, qkey).clamp(max=max(akey.numel() - 1, 0))
     in_pool = (akey[at] == qkey) if akey.numel() else torch.zeros_like(qkey, dtype=torch.bool)
