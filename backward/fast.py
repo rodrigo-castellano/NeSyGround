@@ -20,12 +20,13 @@ rejected candidates (most of them) never reach memory. A kept grounding's unknow
 next step's goals; a (goal, rule) row none of whose candidates can be kept (a body atom with no fact on its bound side,
 ...: ``fast_kernels.live_count``) is not walked. With fp_batch, the step before the last keeps only the groundings
 whose unknown atom can still be proved (a fact, an earlier step's goal, or a goal some rule could ground at the last
-step: ``fast_kernels.live_atoms``), so the last step grounds only those. The groundings are then filtered by the rules'
-variable bindings and pruned: fp_batch to the provable ones (``depth`` rounds of Kleene propagation from the facts,
-over hash sets of the raw groundings); keras first to those whose unknown atom can be proved at all (the least fixed
-point from the all-fact groundings: :func:`_keras_provable`, a few thousand of the millions a keras step writes), then
-by keras-ns's proof walk. They are canonicalised (unique atoms and firings, sorted), and the queries pinned into the
-atom table.
+step: ``fast_kernels.live_atoms``), so the last step grounds only those. With keras on a large pool, the last step
+writes only the groundings whose unknown atoms can be proved at all (:func:`_keras_last_step`). The groundings are then
+filtered by the rules' variable bindings and pruned: fp_batch to the provable ones (``depth`` rounds of Kleene
+propagation from the facts, over hash sets of the raw groundings); keras first to those whose unknown atom can be
+proved at all (the least fixed point from the all-fact groundings: :func:`_keras_provable`, a few thousand of the
+millions a keras step writes), then by keras-ns's proof walk. They are canonicalised (unique atoms and firings,
+sorted), and the queries pinned into the atom table.
 """
 from __future__ import annotations
 
