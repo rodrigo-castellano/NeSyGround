@@ -13,7 +13,7 @@ from typing import ClassVar, FrozenSet, Optional, Protocol, runtime_checkable
 
 from torch import Tensor
 
-from grounder.forward.api import Closure
+from grounder.types import Closure
 from grounder.base.types import CompletedTreeFirings, GoalState, RuleGroundings
 
 

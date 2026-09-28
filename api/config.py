@@ -1,10 +1,7 @@
 """Typed grounder configs — the config TYPE selects the grounder family.
 
-Two top-level configs, each dispatched by ``make_grounder`` on its TYPE:
-
-  - ``Backward(resolution, …)`` — backward chaining; ``resolution`` is one of the
-    typed resolutions ``PBC`` / ``SLD`` (depth lives ON the resolution).
-  - ``Forward(depth, …)``       — forward chaining (closure to fixpoint).
+``Backward(resolution, …)`` — backward chaining; ``resolution`` is one of the
+typed resolutions ``PBC`` / ``SLD`` (depth lives ON the resolution).
 
 There is no Resolution enum, no string grammar, and no per-leaf ``filter()``: the
 filter is derived ONCE from the resolution (``PBC`` with ``u==0`` → fp_batch, else
@@ -93,23 +90,4 @@ class Backward:
         return self.resolution.depth
 
 
-@dataclass(frozen=True, kw_only=True)
-class Forward:
-    """Forward chaining grounder (no soundness filter — computes a closure)."""
-
-    depth: int
-    method: str = "spmm"            # spmm | staged (ForwardMethod axis)
-    join_algo: str = "staged"       # staged | chunked | leapfrog (StagedMethod sub-axis)
-
-    def __post_init__(self) -> None:
-        if self.depth < 1:
-            raise ConfigError(f"depth must be >= 1, got {self.depth}")
-        if self.method not in ("spmm", "staged"):
-            raise ConfigError(f"method must be 'spmm' or 'staged', got {self.method!r}")
-        if self.join_algo not in ("staged", "chunked", "leapfrog"):
-            raise ConfigError(
-                f"join_algo must be 'staged', 'chunked', or 'leapfrog', "
-                f"got {self.join_algo!r}")
-
-
-__all__ = ["SLD", "PBC", "Resolution", "Backward", "Forward"]
+__all__ = ["SLD", "PBC", "Resolution", "Backward"]

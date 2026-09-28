@@ -23,7 +23,8 @@ import torch.nn as nn
 from torch import Tensor
 
 from grounder.sld.resolve import resolve_facts, resolve_rules
-from grounder.sld.state import Proofs, Trail, compact, drop_facts, harvest, pack, pack_children, prove_mask, rename
+from grounder.sld.state import Trail, compact, drop_facts, harvest, pack, pack_children, prove_mask, rename
+from grounder.types import Proofs
 
 
 class SLD(nn.Module):

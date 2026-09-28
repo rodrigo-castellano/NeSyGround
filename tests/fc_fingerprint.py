@@ -1,9 +1,8 @@
 """FC closure-fingerprint oracle — byte-identity gate for every FC-touching step.
 
-Builds the ``ForwardGrounder`` per cell (CPU, real predicate range), runs the
-closure, and freezes ``(sha over sorted closure hashes, n_provable)`` per
-(dataset, method) against ``tests/baselines/fc_fingerprint.json``. Mirrors
-``fingerprint_new.py`` for the backward side.
+Runs ``Forward`` per cell (CPU) and checks ``(sha over the sorted closure
+hashes p * E**2 + s * E + o, n_provable)`` per (dataset, method) against
+``tests/baselines/fc_fingerprint.json``.
 
 OOM caveat (documented): FC on wn18rr at full depth is a transitive-closure
 blow-up (60GB runaway). This oracle uses ONLY small closures — family +
@@ -24,8 +23,8 @@ from pathlib import Path
 
 import torch
 
-from grounder.data.dataset import KGDataset
-from grounder.api.forward import ForwardGrounder
+from grounder.forward import Forward
+from grounder.kb import KB, is_variable, parse_rules, parse_triples
 
 _HERE = Path(__file__).resolve().parent
 _BASELINE = (_HERE / "baselines" / "fc_fingerprint.json")
@@ -41,10 +40,6 @@ _MATRIX = [
     ("countries_s2", "staged", {"depth": 10}),
     ("countries_s2", "spmm", {"depth": 3}),
     ("countries_s2", "staged", {"depth": 3}),
-    # leapfrog (worst-case-optimal join) must match the staged closure exactly.
-    ("family", "staged", {"depth": 10, "join_algo": "leapfrog"}),
-    ("countries_s2", "staged", {"depth": 10, "join_algo": "leapfrog"}),
-    ("countries_s2", "staged", {"depth": 3, "join_algo": "leapfrog"}),
 ]
 
 
@@ -63,39 +58,38 @@ def _cell_key(dataset, method, cfg) -> str:
     return f"{dataset}|{method}|d{cfg['depth']}{suffix}"
 
 
-def _old_closure_facts(hashes: torch.Tensor, n_provable: int, E: int) -> torch.Tensor:
-    """The frozen reference hash decode for the Closure.facts() A/B."""
-    if n_provable == 0:
-        return torch.empty(0, 3, dtype=torch.long, device=hashes.device)
-    E2 = E * E
-    pred = hashes // E2
-    rem = hashes % E2
-    return torch.stack([pred, rem // E, rem % E], dim=1)
+def _dataset(path: Path, rules_file: str):
+    """``(facts [F, 3], heads, bodies, lens, E, pad)`` with the ids the recorded fingerprints use: every name sorted,
+    1-based; variables after the entities; ``pad = entities + variables + 10``; ``E = entities + 1``."""
+    read = lambda f: sorted(parse_triples(path / f)) if (path / f).is_file() else []  # noqa: E731
+    facts = read("facts.txt") or read("train.txt")
+    rules = sorted(parse_rules(path / rules_file))
+    atoms = facts + [t for s in ("train", "valid", "test") for t in read(f"{s}.txt")]
+    atoms += [a for head, body in rules for a in [head] + body]
+    preds = {p: i + 1 for i, p in enumerate(sorted({a[0] for a in atoms}))}
+    ents = sorted({x for a in atoms for x in a[1:] if not is_variable(x)} | {x for t in facts for x in t[1:]})
+    ent = {e: i + 1 for i, e in enumerate(ents)}
+    var = {v: len(ent) + 1 + i for i, v in enumerate(sorted({x for a in atoms for x in a[1:] if is_variable(x)}))}
+    pad = len(ent) + len(var) + 10
+    idx = lambda x: var.get(x, ent.get(x, pad))  # noqa: E731
+    M = max(len(b) for _, b in rules)
+    heads = torch.tensor([[preds[h[0]], idx(h[1]), idx(h[2])] for h, _ in rules])
+    bodies = torch.tensor([[[preds[a[0]], idx(a[1]), idx(a[2])] for a in b] + [[pad] * 3] * (M - len(b))
+                           for _, b in rules])
+    lens = torch.tensor([len(b) for _, b in rules])
+    facts_t = torch.tensor([[preds[p], ent[a], ent[b]] for p, a, b in facts])
+    return facts_t, heads, bodies, lens, len(ent) + 1, pad
 
 
 def compute_fingerprint(dataset, method, cfg, *, data_root) -> dict:
-    ds_path = Path(data_root).expanduser() / dataset
     rules_file = _RULES_FILE.get(dataset, "rules.txt")
-    ds = KGDataset(str(ds_path), device="cpu", rules_file=rules_file)
-    kb = ds.build_kb(max_facts_per_query=4096, fact_index_type="block_sparse")
-
-    g = ForwardGrounder(kb, method=method, depth=cfg["depth"],
-                        join_algo=cfg.get("join_algo", "staged"))
-    with torch.no_grad():
-        closure = g.ground()                     # the single verb -> Closure
-        hashes, n_provable = closure.hashes, int(closure.n_provable)
-
-    # Closure.facts() must decode EXACTLY as the reference decode does.
-    new_facts = closure.facts()
-    old_facts = _old_closure_facts(hashes, n_provable, int(g._num_entities))
-    assert new_facts.shape == old_facts.shape and torch.equal(new_facts, old_facts), (
-        f"{dataset}|{method}|d{cfg['depth']}: Closure.facts() != old closure_facts()")
-    assert int(closure.n_provable) == int(n_provable)
-
-    fp = _canonical_fingerprint(hashes, n_provable)
-    fp.update(dataset=dataset, method=method, cfg=cfg, rules=rules_file,
-              num_entities=int(g._num_entities),
-              num_predicates=int(g._num_predicates))
+    facts, heads, bodies, lens, E, pad = _dataset(Path(data_root).expanduser() / dataset, rules_file)
+    kb = KB(facts, heads, bodies, lens, E=E, pad=pad)
+    atoms = Forward(kb, depth=cfg["depth"], method="spmm" if method == "spmm" else "join").closure().atoms
+    # the recorded hashes: p * E**2 + s * E + o, sorted
+    hashes = (atoms[:, 0] * E * E + atoms[:, 1] * E + atoms[:, 2]).sort()[0]
+    fp = _canonical_fingerprint(hashes, len(atoms))
+    fp.update(dataset=dataset, method=method, cfg=cfg, rules=rules_file, num_entities=E, num_predicates=kb.P)
     return fp
 
 

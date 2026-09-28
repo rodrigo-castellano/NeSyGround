@@ -3,7 +3,7 @@
 ``_StagesMixin`` owns the per-rule join evaluation: the full join at step 0
 (``_apply_rule``) and one semi-naive anchored term at step t>0
 (``_apply_rule_anchored``), plus the shared stage loops (``_run_stages`` /
-``_run_stages_anchored``) and their ``staged`` vs ``chunked`` dispatchers. The
+``_run_stages_anchored``). The
 methods reference engine state (``self._pred_facts``, ``self._base_ps_off``,
 ``self._constant_no``, …) set up by ``FCDynamic.__init__``.
 """
@@ -14,12 +14,12 @@ from typing import Dict, List, Optional
 import torch
 from torch import Tensor
 
-from grounder.data.rule_index import RulePattern
-from grounder.forward.staged.joins import (
+from grounder.kb import RulePattern
+from grounder.forward.join.joins import (
     _pred_pairs_from_ps, _ps_expand, _po_expand,
     _ps_expand_combined, _po_expand_combined,
 )
-from grounder.forward.staged.plan import _compute_frontiers
+from grounder.forward.join.plan import _compute_frontiers
 
 
 class _StagesMixin:
@@ -58,10 +58,6 @@ class _StagesMixin:
         provable_hashes: Tensor,
     ) -> Optional[Tensor]:
         """Full staged ragged join: all stages use base ∪ provable."""
-        if self.join_algo == "leapfrog":
-            return self._apply_rule_lftj(
-                cr, ordered_bps,
-                prov_ps_off, prov_ps_vals, prov_po_off, prov_po_vals, provable_hashes)
         E, E2 = self.E, self.E * self.E
         m = cr.num_body
 
@@ -120,15 +116,6 @@ class _StagesMixin:
         E, E2 = self.E, self.E * self.E
         m = cr.num_body
         new_anchor_k = join_order.index(anchor_k)
-
-        if self.join_algo == "leapfrog":
-            return self._apply_rule_lftj(
-                cr, ordered_bps,
-                prov_ps_off, prov_ps_vals, prov_po_off, prov_po_vals, provable_hashes,
-                anchor_j=new_anchor_k,
-                delta_ps_off=delta_ps_off, delta_ps_vals=delta_ps_vals,
-                delta_po_off=delta_po_off, delta_po_vals=delta_po_vals,
-                delta_hashes=delta_hashes)
 
         bp0 = ordered_bps[0]
         pred0 = bp0["pred_idx"]
@@ -201,9 +188,7 @@ class _StagesMixin:
                     return in_f | (vp & (provable_hashes[cp] == qh))
                 return in_f
 
-        # Run stages 1..m-1, dispatched by join_algo. Chunking the
-        # post-stage-0 partial keeps ``_apply_rule_anchored``'s peak
-        # memory bounded on big closures (wn18rr step ≥ 1).
+        # Run stages 1..m-1.
         return self._run_stages_anchored_dispatch(
             cr, partial, frontiers, ordered_bps, m,
             ps_look, po_look, case_a_found, E, E2)
@@ -212,33 +197,12 @@ class _StagesMixin:
         self, cr, partial, frontiers, ordered_bps, m,
         ps_look, po_look, case_a_found, E, E2,
     ) -> Optional[Tensor]:
-        """Dispatch entry for the anchored stage loop.
-
-        ``staged`` runs once over the full partial; ``chunked`` slices
-        it. Same closure either way; chunked bounds peak memory.
-        """
+        """The anchored stage loop over the partial bindings (none: no heads)."""
         if not partial:
             return None
         n = next(iter(partial.values())).shape[0]
         if n == 0:
             return None
-        # ``chunked`` slices the post-stage-0 partial so peak memory stays
-        # bounded on big closures (wn18rr step ≥ 1).
-        if self.join_algo == "chunked":
-            chunk = self.join_chunk_size or 100_000
-            if n > chunk:
-                head_chunks: List[Tensor] = []
-                for start in range(0, n, chunk):
-                    end = min(start + chunk, n)
-                    sliced = {v: t[start:end] for v, t in partial.items()}
-                    h = self._run_stages_anchored(
-                        cr, sliced, frontiers, ordered_bps, m,
-                        ps_look, po_look, case_a_found, E, E2)
-                    if h is not None and h.numel() > 0:
-                        head_chunks.append(h)
-                if not head_chunks:
-                    return None
-                return torch.cat(head_chunks)
         return self._run_stages_anchored(
             cr, partial, frontiers, ordered_bps, m,
             ps_look, po_look, case_a_found, E, E2)
@@ -247,11 +211,7 @@ class _StagesMixin:
         self, cr, partial, frontiers, ordered_bps, m,
         ps_look, po_look, case_a_found, E, E2,
     ) -> Optional[Tensor]:
-        """Anchored stage loop (stages 1..m-1) for one chunk of the
-        partial bindings tensor. Same logic as the original inline
-        loop in ``_apply_rule_anchored`` — extracted so the chunked
-        dispatcher can call it per slice.
-        """
+        """Anchored stage loop (stages 1..m-1) over the partial bindings."""
         for k in range(1, m):
             bpk = ordered_bps[k]
             pred_k = bpk["pred_idx"]
@@ -312,33 +272,12 @@ class _StagesMixin:
         self, cr, partial, frontiers, ps_look, po_look,
         provable_hashes, E, E2, ordered_bps=None,
     ) -> Optional[Tensor]:
-        """Stage-loop entry — dispatches by ``self.join_algo``.
-
-        ``staged`` runs the entire partial through the stage loop in
-        one go (the original behaviour). ``chunked`` slices the
-        post-stage-0 partial into ``join_chunk_size`` rows and runs
-        stages 1..m-1 per slice — same closure, bounded peak memory.
-        """
+        """The stage loop over the partial bindings (none: no heads)."""
         if not partial:
             return None
         n = next(iter(partial.values())).shape[0]
         if n == 0:
             return None
-        if self.join_algo == "chunked":
-            chunk = self.join_chunk_size or 100_000
-            if n > chunk:
-                head_chunks: List[Tensor] = []
-                for start in range(0, n, chunk):
-                    end = min(start + chunk, n)
-                    sliced = {v: t[start:end] for v, t in partial.items()}
-                    h = self._run_stages(
-                        cr, sliced, frontiers, ps_look, po_look,
-                        provable_hashes, E, E2, ordered_bps)
-                    if h is not None and h.numel() > 0:
-                        head_chunks.append(h)
-                if not head_chunks:
-                    return None
-                return torch.cat(head_chunks)
         return self._run_stages(
             cr, partial, frontiers, ps_look, po_look,
             provable_hashes, E, E2, ordered_bps)

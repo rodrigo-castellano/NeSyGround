@@ -17,10 +17,9 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.data.rule_index import RulePattern
-from grounder.forward.staged.joins import _build_atom_index
-from grounder.forward.staged.leapfrog import LeapfrogMixin
-from grounder.forward.staged.stages import _StagesMixin
+from grounder.kb import RulePattern
+from grounder.forward.join.joins import _build_atom_index
+from grounder.forward.join.stages import _StagesMixin
 
 
 def _sorted_merge(a: Tensor, b: Tensor) -> Tensor:
@@ -32,13 +31,13 @@ def _sorted_merge(a: Tensor, b: Tensor) -> Tensor:
     return torch.cat([a, b.to(a.device)]).unique()
 
 
-class FCDynamic(LeapfrogMixin, _StagesMixin, nn.Module):
+class FCDynamic(_StagesMixin, nn.Module):
     """CPU forward chaining — staged ragged join, truly semi-naive.
 
     Handles all connected rule types including non-chain (fork) rules.
 
     Args:
-        compiled_rules: List of RulePattern from grounder/compilation.py.
+        compiled_rules: the rules' ``RulePattern`` s.
         facts_idx: [F, 3] raw fact triples (pred, subj, obj).
         num_entities: Total number of entities.
         num_predicates: Total number of predicates.
@@ -52,38 +51,8 @@ class FCDynamic(LeapfrogMixin, _StagesMixin, nn.Module):
         num_entities: int,
         num_predicates: int,
         device: str = "cpu",
-        *,
-        join_algo: str = "staged",
-        join_chunk_size: int = 0,
     ) -> None:
-        """
-        ``join_algo``:
-          * ``'staged'`` (default) — naive staged ragged join, the
-            original implementation. Per-stage intermediate is
-            ``|partial| × fan-out`` which can blow memory on
-            high-fan-out KBs.
-          * ``'chunked'`` — same staged algorithm, but process the
-            partial-bindings tensor in slices of size
-            ``join_chunk_size``. Bounds peak memory per stage at the
-            cost of more Python iterations. Same closure as
-            ``'staged'`` (verified by smoke tests).
-          * ``'leapfrog'`` — variable-elimination join (``staged/leapfrog.py``).
-            Same closure as ``'staged'``; currently NO perf/memory advantage
-            (expand-then-filter; the worst-case-optimal intersection core is
-            not yet implemented). Opt-in.
-
-        ``join_chunk_size`` (only used by ``'chunked'``): rows per
-        chunk in the partial-bindings slicer. ``0`` means
-        "auto" — pick a chunk that fits ~1 GiB at the worst-case
-        stage fan-out. Typical: 100k–1M.
-        """
         super().__init__()
-        if join_algo not in ("staged", "chunked", "leapfrog"):
-            raise ValueError(
-                f"join_algo must be 'staged', 'chunked', or 'leapfrog'; "
-                f"got {join_algo!r}")
-        self.join_algo = join_algo
-        self.join_chunk_size = int(join_chunk_size)
         self.compiled_rules = compiled_rules
         dev = str(device)
         self.device_str = dev
@@ -193,7 +162,7 @@ class FCDynamic(LeapfrogMixin, _StagesMixin, nn.Module):
         # Translate ``pred_idx`` to the compact predicate space so the
         # internal lookups (offset arrays, fact hashes) stay
         # bounded by ``P_compact`` instead of ``num_predicates``.
-        from grounder.forward.staged.plan import _compute_join_order
+        from grounder.forward.join.plan import _compute_join_order
         self._join_orders: List[List[int]] = []
         self._ordered_bps: List[list] = []
         self._head_pred_compact: List[int] = []
@@ -231,7 +200,7 @@ class FCDynamic(LeapfrogMixin, _StagesMixin, nn.Module):
 
     # ── Main loop ─────────────────────────────────────────────────────
 
-    def run(self, depth: int) -> Tuple[Tensor, int]:
+    def run(self, depth: int, verbose: bool = False) -> Tuple[Tensor, int]:
         t0 = time.time()
         E, P = self.E, self.P
         E2 = E * E
@@ -278,8 +247,8 @@ class FCDynamic(LeapfrogMixin, _StagesMixin, nn.Module):
                 break
 
             provable_hashes = _sorted_merge(provable_hashes, added)
-            print(f"    FC step {step}: +{added.numel()} atoms "
-                  f"(total {provable_hashes.numel()})")
+            if verbose:
+                print(f"    FC step {step}: +{added.numel()} atoms (total {provable_hashes.numel()})")
 
             delta_hashes = added
             delta_ps_off, delta_ps_vals, delta_po_off, delta_po_vals = \
@@ -289,7 +258,8 @@ class FCDynamic(LeapfrogMixin, _StagesMixin, nn.Module):
 
         n_provable = provable_hashes.numel()
         elapsed = time.time() - t0
-        print(f"  FC complete: {n_provable} provable atoms ({elapsed:.2f}s)")
+        if verbose:
+            print(f"  FC complete: {n_provable} provable atoms ({elapsed:.2f}s)")
         if n_provable > 0:
             # ``provable_hashes`` is in compact predicate space —
             # decompact to original space before returning so callers

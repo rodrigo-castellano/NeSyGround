@@ -18,6 +18,7 @@ from torch import Tensor
 
 from grounder.ops import key
 from grounder.sld.resolve import substitute
+from grounder.types import Proofs
 
 
 class Packed(NamedTuple):
@@ -176,23 +177,6 @@ class Trail(NamedTuple):
         return Trail(body, rule, head, count)
 
 
-class Proofs(NamedTuple):
-    """Per query, at most ``P`` completed proofs: their trails and which slots hold one (``mask``)."""
-    body: Tensor        # [Q, P, D, M, W]
-    rule: Tensor        # [Q, P, D]
-    head: Tensor        # [Q, P, D, W]
-    count: Tensor       # [Q, P, D] each depth's body length
-    mask: Tensor        # [Q, P]
-
-    @staticmethod
-    def empty(B: int, P: int, D: int, M: int, W: int, pad: int, device) -> "Proofs":
-        return Proofs(torch.zeros(B, P, D, M, W, dtype=torch.long, device=device),
-                      torch.full((B, P, D), -1, dtype=torch.long, device=device),
-                      torch.full((B, P, D, W), pad, dtype=torch.long, device=device),
-                      torch.zeros(B, P, D, dtype=torch.long, device=device),
-                      torch.zeros(B, P, dtype=torch.bool, device=device))
-
-
 _PRIMES = (1_000_003, 999_983, 999_979, 999_961, 999_959, 999_953, 999_931)
 
 
@@ -249,5 +233,4 @@ def prove_mask(kb, proofs: Proofs, rounds: int) -> Tensor:
     return (proved.view(B, N, D) | ~head_on).all(-1) & mask
 
 
-__all__ = ["Packed", "pack", "pack_children", "drop_facts", "compact", "rename", "Trail", "Proofs", "harvest",
-           "prove_mask"]
+__all__ = ["Packed", "pack", "pack_children", "drop_facts", "compact", "rename", "Trail", "harvest", "prove_mask"]

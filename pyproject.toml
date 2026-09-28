@@ -30,7 +30,7 @@ packages = [
     "grounder.backward",
     "grounder.forward",
     "grounder.forward.spmm",
-    "grounder.forward.staged",
+    "grounder.forward.join",
     "grounder.resolution",
     "grounder.resolution.pbc",
     "grounder.data",
@@ -49,7 +49,7 @@ packages = [
 "grounder.backward" = "backward"
 "grounder.forward" = "forward"
 "grounder.forward.spmm" = "forward/spmm"
-"grounder.forward.staged" = "forward/staged"
+"grounder.forward.join" = "forward/join"
 "grounder.resolution" = "resolution"
 "grounder.resolution.pbc" = "resolution/pbc"
 "grounder.data" = "data"
