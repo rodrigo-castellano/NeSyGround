@@ -1,13 +1,13 @@
-"""BackwardGrounder — query-directed proof search (sld / rtf / pbc).
+"""BackwardGrounder — query-directed proof search (sld / pbc).
 
 The backward shell: reads its typed ``Backward`` config, wires the per-resolution
-setup (``init_mgu`` for sld/rtf, ``build_tables`` for pbc), fixes the shared static
+setup (``init_mgu`` for sld, ``build_tables`` for pbc), fixes the shared static
 layout (G, A, S, Y_q), and drives the depth loop via ``backward.loop.run_backward``.
 The single runtime verb is ``ground(request)``; ``request.output_spec`` selects
 which tiers are produced (and what the engine collects).
 
   pbc      → BC_{w,d,u}: all_anchors forced, filter fp_batch when u=0.
-  sld/rtf  → plain backward chaining, filter none.
+  sld      → plain backward chaining, filter none.
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from grounder.api.config import Backward, PBC, RTF, SLD
+from grounder.api.config import Backward, PBC, SLD
 from grounder.core import BackwardResult, GroundRequest, OutputSpec, Tier
 from grounder.data.kb import KB
 from grounder.backward.loop import run_backward
@@ -50,7 +50,7 @@ def _validate(config: Backward, layout: str, compile: str) -> None:
 
 
 class BackwardGrounder(nn.Module):
-    """Unified backward-chaining grounder (sld / rtf / pbc), built from a ``Backward`` config."""
+    """Unified backward-chaining grounder (sld / pbc), built from a ``Backward`` config."""
 
     def __init__(self, kb: KB, config: Backward, *, layout: str = "auto",
                  compile: str = "off", chunk_size: Optional[int] = None,
@@ -63,12 +63,12 @@ class BackwardGrounder(nn.Module):
         self.kb = kb
         self.num_rules = kb.num_rules
 
-        # ── resolution family (sld / rtf / pbc) ──
+        # ── resolution family (sld / pbc) ──
         res = config.resolution
         pbc = res if isinstance(res, PBC) else None
-        self.resolution = "pbc" if pbc else "rtf" if isinstance(res, RTF) else "sld"
+        self.resolution = "pbc" if pbc else "sld"
 
-        # ── PBC-only knobs (inert defaults for sld/rtf) ──
+        # ── PBC-only knobs (inert defaults for sld) ──
         self.width = pbc.width if pbc else 1
         self.w_last_depth = pbc.u if pbc else 0
         self._cartesian_product = pbc.cartesian_product if pbc else False
@@ -151,14 +151,14 @@ class BackwardGrounder(nn.Module):
 
     def _init_resolution(self, *, max_children: int,
                          max_total_groundings: int, max_groundings_per_rule: Optional[int]) -> None:
-        """Dispatch to the resolution layer's grounder-setup — ``init_mgu`` (sld/rtf) /
+        """Dispatch to the resolution layer's grounder-setup — ``init_mgu`` (sld) /
         ``build_tables`` (pbc) own the budget computation AND the wiring (buffers +
         scalars + S-bump) onto self. S is already set; flat-vs-dense is exec-resolved."""
         from grounder.resolution.mgu import init_mgu
         from grounder.resolution.pbc import build_tables
         kw = dict(max_children=max_children, max_total_groundings=max_total_groundings,
                   max_groundings_per_rule=max_groundings_per_rule)
-        if self.resolution in ("sld", "rtf"):
+        if self.resolution == "sld":
             init_mgu(self, **kw)
         elif self.resolution == "pbc":
             build_tables(self, **kw)

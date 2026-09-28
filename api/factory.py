@@ -1,14 +1,14 @@
 """Grounder factory — ONE construction entry: ``make_grounder(kb, config, …)``.
 
 Dispatches on the config TYPE (no string grammar, no BC/FC fork):
-  Backward(resolution=PBC|SLD|RTF, …) -> BackwardGrounder
+  Backward(resolution=PBC|SLD, …) -> BackwardGrounder
   Forward(depth, …)                   -> ForwardGrounder
-Exec knobs (layout/compile/chunk_size/transforms) ride here; everything else
+Exec knobs (layout/compile/chunk_size) ride here; everything else
 lives on the typed config.
 """
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Optional
 
 import torch.nn as nn
 
@@ -24,18 +24,8 @@ def make_grounder(
     layout: str = "auto",
     compile: str = "off",
     chunk_size: Optional[int] = None,
-    transforms: Sequence = (),
 ) -> nn.Module:
-    """Build the family grounder over ``kb`` by dispatching on ``type(config)``.
-
-    A non-empty ``transforms`` (AXIS 4) wraps the base grounder in a ``Pipeline``;
-    ``transforms=()`` is byte-identical to the bare grounder (identity discipline).
-    """
-    if transforms:
-        from grounder.core import Pipeline
-        base = make_grounder(kb, config, layout=layout, compile=compile,
-                             chunk_size=chunk_size)
-        return Pipeline(transforms, base)
+    """Build the family grounder over ``kb`` by dispatching on ``type(config)``."""
     if isinstance(config, Backward):
         return BackwardGrounder(kb, config, layout=layout, compile=compile,
                                 chunk_size=chunk_size)

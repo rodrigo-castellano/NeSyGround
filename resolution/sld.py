@@ -19,7 +19,6 @@ from grounder.resolution.mgu import empty_rule_results, resolve_facts, resolve_r
 from grounder.base.types import FlatResolvedChildren, Layout, ResolvedChildren
 
 if TYPE_CHECKING:
-    from grounder.nesy.hooks import ResolutionFactHook, ResolutionRuleHook
     from grounder.resolution.api import ResolveRequest
 
 
@@ -28,8 +27,8 @@ def _resolve_facts_and_rules(
     next_var: Tensor, fact_index, facts_idx: Tensor, rule_index, enc: Encoding,
     K_f: int, K_r: int, max_vars_per_rule: int, num_rules: int,
     excluded_queries: Optional[Tensor],
-    fact_hook: Optional["ResolutionFactHook"],
-    rule_hook: Optional["ResolutionRuleHook"],
+    fact_hook: Optional[object],
+    rule_hook: Optional[object],
 ):
     """Shared SLD prelude: resolve facts ∥ rules (+ hooks); dense keeps the
     grounding-body tensors, flat discards them. 9-tuple of fact/rule results."""
@@ -76,8 +75,8 @@ def resolve_sld(
     max_vars_per_rule: int,
     num_rules: int,
     excluded_queries: Optional[Tensor] = None,
-    fact_hook: Optional["ResolutionFactHook"] = None,
-    rule_hook: Optional["ResolutionRuleHook"] = None,
+    fact_hook: Optional[object] = None,
+    rule_hook: Optional[object] = None,
 ) -> ResolvedChildren:
     """SLD: resolve facts and rules in parallel → dense ResolvedChildren."""
     (fact_goals, fact_grounding_body, fact_success, fact_subs,
@@ -111,8 +110,8 @@ def resolve_sld_flat(
     top_rule_idx: Tensor,      # [B, G]
     body_count: Tensor,        # [B, G, D] or [B, G]
     excluded_queries: Optional[Tensor] = None,
-    fact_hook: Optional["ResolutionFactHook"] = None,
-    rule_hook: Optional["ResolutionRuleHook"] = None,
+    fact_hook: Optional[object] = None,
+    rule_hook: Optional[object] = None,
     collect_evidence: bool = True,
 ) -> FlatResolvedChildren:
     """SLD flat: same facts/rules MGU as resolve_sld, flattened facts-then-rules."""

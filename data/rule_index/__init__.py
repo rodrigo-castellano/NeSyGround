@@ -1,6 +1,6 @@
 """Rule index package — sorted storage + (for pbc) binding tables.
 
-    create(..., resolution="sld"|"rtf")  -> SldRuleIndex  (segment lookup)
+    create(..., resolution="sld")        -> SldRuleIndex  (segment lookup)
     create(..., resolution="pbc")        -> PbcRuleIndex  (+ binding tables)
 
 The KB builds the resolution-agnostic SldRuleIndex; the pbc resolver builds its
@@ -21,7 +21,7 @@ from grounder.data.rule_index.pattern import (
 from grounder.data.rule_index.pbc import PbcRuleIndex
 from grounder.data.rule_index.sld import SldRuleIndex
 
-Resolution = Literal["sld", "rtf", "pbc"]
+Resolution = Literal["sld", "pbc"]
 
 
 def create(
@@ -40,7 +40,7 @@ def create(
     order_seed: int = 42,
 ) -> RuleIndex:
     """Build the rule index for ``resolution`` (the only public constructor)."""
-    if resolution in ("sld", "rtf"):
+    if resolution == "sld":
         return SldRuleIndex(rules_heads_idx, rules_bodies_idx, rule_lens,
                             predicate_no=predicate_no, padding_idx=padding_idx,
                             device=device, order=order, order_seed=order_seed)
@@ -54,7 +54,7 @@ def create(
                             constant_no=constant_no, num_predicates=P,
                             predicate_no=predicate_no, padding_idx=padding_idx,
                             device=device, all_anchors=all_anchors)
-    raise ValueError(f"Unknown resolution: {resolution!r}. Choose from sld | rtf | pbc")
+    raise ValueError(f"Unknown resolution: {resolution!r}. Choose from sld | pbc")
 
 
 __all__ = [

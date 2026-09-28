@@ -3,7 +3,7 @@
 Two top-level configs, each dispatched by ``make_grounder`` on its TYPE:
 
   - ``Backward(resolution, …)`` — backward chaining; ``resolution`` is one of the
-    typed resolutions ``PBC`` / ``SLD`` / ``RTF`` (depth lives ON the resolution).
+    typed resolutions ``PBC`` / ``SLD`` (depth lives ON the resolution).
   - ``Forward(depth, …)``       — forward chaining (closure to fixpoint).
 
 There is no Resolution enum, no string grammar, and no per-leaf ``filter()``: the
@@ -24,17 +24,6 @@ from grounder.base.errors import ConfigError
 @dataclass(frozen=True, kw_only=True)
 class SLD:
     """Plain backward chaining, SLD resolution (fact + rule)."""
-
-    depth: int
-
-    def __post_init__(self) -> None:
-        if self.depth < 1:
-            raise ConfigError(f"depth must be >= 1, got {self.depth}")
-
-
-@dataclass(frozen=True, kw_only=True)
-class RTF:
-    """Plain backward chaining, Rule-Then-Fact resolution."""
 
     depth: int
 
@@ -71,12 +60,12 @@ class PBC:
                 f"guided_tnorm must be min|product, got {self.guided_tnorm!r}")
 
 
-Resolution = Union[SLD, RTF, PBC]
+Resolution = Union[SLD, PBC]
 
 
 @dataclass(frozen=True)
 class Backward:
-    """Backward-chaining grounder config — ``resolution`` selects sld/rtf/pbc.
+    """Backward-chaining grounder config — ``resolution`` selects sld/pbc.
 
     Carries the shared backward knobs; PBC-specific knobs live on ``PBC``. The
     soundness ``filter`` is derived from the resolution unless given explicitly.
@@ -91,7 +80,7 @@ class Backward:
     bump_s_to_k: bool = True
     max_atoms: Optional[int] = None             # caps L
     max_goals: Optional[int] = None            # caps G (default 256)
-    max_children: Optional[int] = None           # caps K; None → 550 (sld/rtf) | max_groundings_per_query (pbc)
+    max_children: Optional[int] = None           # caps K; None → 550 (sld) | max_groundings_per_query (pbc)
     standardization: object = None
     filter: Optional[str] = None                # None → derived from resolution
     hooks: Optional[List] = None
@@ -123,4 +112,4 @@ class Forward:
                 f"got {self.join_algo!r}")
 
 
-__all__ = ["SLD", "RTF", "PBC", "Resolution", "Backward", "Forward"]
+__all__ = ["SLD", "PBC", "Resolution", "Backward", "Forward"]

@@ -15,17 +15,12 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 # The repo root IS the `grounder` package: __init__.py and the modules
-# (factory.py, types.py, utils.py, config.py, glossary.py, errors.py,
-# shapes.py) sit at the root, and the subpackages (backward/, forward/,
-# resolution/, data/, core/, execution/, transform/, filters/, nesy/,
-# grounder/, memo/, contracts/) are siblings. We map "grounder" -> "." and
-# each subpackage explicitly so consumers can `import grounder` and
-# `from grounder.forward.grounder import ForwardGrounder` after a normal
-# `pip install`.
+# sit at the root and the subpackages are siblings. We map "grounder" -> "."
+# and each subpackage explicitly so consumers can `import grounder` after a
+# normal `pip install`.
 [tool.setuptools]
 # ``grounder`` maps to the repo root ("."), so root modules (core.py) are
-# auto-included as ``grounder.core``. The redesign layout is api/base/vocab +
-# core.py (no core/ or grounder/ dirs — those were the pre-redesign layout).
+# auto-included as ``grounder.core``.
 packages = [
     "grounder",
     "grounder.api",
@@ -41,12 +36,7 @@ packages = [
     "grounder.data.fact_index",
     "grounder.data.rule_index",
     "grounder.execution",
-    "grounder.transform",
     "grounder.filters",
-    "grounder.nesy",
-    "grounder.memo",
-    "grounder.contracts",
-    "grounder.analysis",
 ]
 
 [tool.setuptools.package-dir]
@@ -64,9 +54,4 @@ packages = [
 "grounder.data.fact_index" = "data/fact_index"
 "grounder.data.rule_index" = "data/rule_index"
 "grounder.execution" = "execution"
-"grounder.transform" = "transform"
 "grounder.filters" = "filters"
-"grounder.nesy" = "nesy"
-"grounder.memo" = "memo"
-"grounder.contracts" = "contracts"
-"grounder.analysis" = "analysis"

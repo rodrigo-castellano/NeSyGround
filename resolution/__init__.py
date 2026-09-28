@@ -1,14 +1,13 @@
-"""Resolution layer — unification primitives + the three resolution algorithms.
+"""Resolution layer — unification primitives + the two resolution algorithms.
 
   primitives  — unify_one_to_one, apply_substitutions (leaf MGU)
   standardize — derived-state variable renaming (offset | canonical)
-  mgu         — resolve_facts / resolve_rules (shared by sld/rtf)
+  mgu         — resolve_facts / resolve_rules (sld)
   sld         — resolve_sld  (fact ∥ rule)
-  rtf         — resolve_rtf  (rule → fact cascade)
   pbc         — Parametrized Backward Chaining candidate generation (see pbc/)
 
 The AXIS-1 seam (Resolver Protocol + ResolveRequest) lives in ``api.py``; the
-concrete SldResolver/RtfResolver/PbcResolver wrap the function pairs in their own
+concrete SldResolver/PbcResolver wrap the function pairs in their own
 module. The registry table (RESOLVERS) lives with the family shells (grounder/).
 """
 from __future__ import annotations
@@ -20,7 +19,6 @@ from grounder.resolution.mgu import (
 )
 from grounder.resolution.pbc import PbcResolver, build_plan, build_tables, resolve_step
 from grounder.resolution.primitives import apply_substitutions, unify_one_to_one
-from grounder.resolution.rtf import RtfResolver, resolve_rtf
 from grounder.resolution.sld import SldResolver, resolve_sld
 from grounder.resolution.standardize import (
     StandardizationConfig, build_standardize_fn,
@@ -30,9 +28,9 @@ from grounder.resolution.standardize import (
 __all__ = [
     "unify_one_to_one", "apply_substitutions",
     "resolve_facts", "resolve_rules", "empty_rule_results", "init_mgu",
-    "resolve_sld", "resolve_rtf",
+    "resolve_sld",
     "pbc", "build_tables", "build_plan", "resolve_step",
-    "Resolver", "ResolveRequest", "SldResolver", "RtfResolver", "PbcResolver",
+    "Resolver", "ResolveRequest", "SldResolver", "PbcResolver",
     "StandardizationConfig", "build_standardize_fn",
     "standardize_vars_offset", "standardize_vars_canonical",
 ]

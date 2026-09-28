@@ -649,11 +649,10 @@ _COMPILE_ALIAS = {
     "default": "graph", "reduce-overhead": "graph", "max-autotune": "graph",
 }
 
-# SLD / RTF resolution strategies need the arg-key fact index + the child cap
+# SLD resolution needs the arg-key fact index + the child cap
 # (_K_MAX → Backward.max_children).
 _K_MAX = 10000
 _PROLOG_PREFIXES = ("sld.",)
-_RTF_PREFIXES = ("rtf.",)
 
 
 def parse_grounder_type(grounder_type: str) -> Tuple[int, int]:
@@ -668,11 +667,9 @@ def parse_grounder_type(grounder_type: str) -> Tuple[int, int]:
 
 
 def _parse_resolution(grounder_type: str) -> str:
-    """``'pbc'`` (enum/pbc), ``'sld'``, or ``'rtf'`` from the type string."""
+    """``'pbc'`` (enum/pbc) or ``'sld'`` from the type string."""
     if grounder_type.startswith(_PROLOG_PREFIXES):
         return "sld"
-    if grounder_type.startswith(_RTF_PREFIXES):
-        return "rtf"
     return "pbc"   # enum.* / pbc.*
 
 
@@ -688,9 +685,9 @@ def _build_backward_config(grounder_type: str, *, max_groundings: int,
     Y_r); ``max_total_groundings`` → ``Backward.max_groundings_per_query`` (Y_q
     budget); ``.prune``/``.fp_batch`` → ``filter='fp_batch'`` (PBC u=0 auto-derives
     it, but SLD does not — pass it explicitly or pruning is silently lost);
-    ``_K_MAX`` → ``Backward.max_children`` (sld/rtf only).
+    ``_K_MAX`` → ``Backward.max_children`` (sld only).
     """
-    from grounder.api.config import PBC, RTF, SLD, Backward
+    from grounder.api.config import PBC, SLD, Backward
     width, depth = parse_grounder_type(grounder_type)
     res = _parse_resolution(grounder_type)
     common = dict(max_groundings_per_query=max_total_groundings, prune_facts=True)
@@ -714,8 +711,6 @@ def _build_backward_config(grounder_type: str, *, max_groundings: int,
         raise ValueError(
             f"guided grounding requires an enum/pbc grounder, got {grounder_type!r}")
     common["max_children"] = k_max
-    if res == "rtf":
-        return Backward(RTF(depth=depth), filter="none", **common)
     # sld: '.prune'/'.fp_batch' → fp_batch filter (else none).
     has_prune = (".prune" in grounder_type) or (".fp_batch" in grounder_type)
     return Backward(SLD(depth=depth), filter=("fp_batch" if has_prune else "none"), **common)
@@ -731,8 +726,8 @@ def create_grounder(grounder_type: str, *, fact_index, rules, kb, max_groundings
     explicit, <0 the library's auto-budget — see ``cfg.grounder_chunk_size``). The grounder enumerates at most
     ``fact_index.max_facts_per_query`` facts per (predicate, entity), as the fact index.
     """
-    # SLD/RTF use the arg-key fact index; PBC uses the default block-sparse.
-    fact_index_type = ("arg_key" if grounder_type.startswith(_PROLOG_PREFIXES + _RTF_PREFIXES)
+    # SLD uses the arg-key fact index; PBC uses the default block-sparse.
+    fact_index_type = ("arg_key" if grounder_type.startswith(_PROLOG_PREFIXES)
                        else "block_sparse")
     return RuleGrounder(
         grounder_type, fact_index, rules, kb, device=device,

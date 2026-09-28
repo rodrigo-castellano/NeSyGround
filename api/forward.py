@@ -2,7 +2,7 @@
 
 Runs ``run_forward_chaining`` over the KB's rules+facts and returns the derived
 closure as a ``Closure`` (hashes / n / E) via the single verb ``ground``; the
-closure triples are read off the result (``kb.with_closure(g.ground().facts())``).
+closure triples are read off the result (``g.ground().facts()``).
 FC operates over the REAL predicate range (max id in facts/rules + 1), not the
 loader's inflated ``predicate_no`` (which would build thousands of empty matrices).
 
@@ -58,11 +58,6 @@ class ForwardGrounder(nn.Module):
     def producible_tiers(self) -> FrozenSet[Tier]:
         """FC produces a ``Closure``, not BC tiers."""
         return frozenset()
-
-    def rebound(self, kb: KB) -> "ForwardGrounder":
-        """Re-snapshot over a rewritten KB (transforms); same method/depth/join."""
-        return ForwardGrounder(kb, method=self.method, depth=self.depth,
-                               join_algo=self.join_algo)
 
 
 __all__ = ["ForwardGrounder"]

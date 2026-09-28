@@ -3,10 +3,10 @@
 The top-level ``grounder.*`` names consumers import:
 
     from grounder import make_grounder, BackwardGrounder, KB
-    from grounder import Backward, Forward, PBC, SLD, RTF
+    from grounder import Backward, Forward, PBC, SLD
     g = make_grounder(kb, Backward(PBC(depth=2, width=1)))
 """
-from grounder.api.config import Backward, Forward, PBC, RTF, SLD
+from grounder.api.config import Backward, Forward, PBC, SLD
 from grounder.data import KB, KGDataset, Encoding
 from grounder.api.factory import make_grounder
 from grounder.api import BackwardGrounder
@@ -16,7 +16,7 @@ from grounder.base.types import CompletedTreeFirings, GoalState, RuleGroundings
 __all__ = [
     "make_grounder",
     "BackwardGrounder",
-    "Backward", "Forward", "PBC", "SLD", "RTF",
+    "Backward", "Forward", "PBC", "SLD",
     "KB", "KGDataset", "Encoding",
     "BackwardResult", "CompletedTreeFirings", "GoalState", "RuleGroundings",
 ]
