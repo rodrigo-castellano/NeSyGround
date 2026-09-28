@@ -26,6 +26,7 @@ packages = [
     "grounder.api",
     "grounder.base",
     "grounder.vocab",
+    "grounder.sld",
     "grounder.backward",
     "grounder.forward",
     "grounder.forward.spmm",
@@ -44,6 +45,7 @@ packages = [
 "grounder.api" = "api"
 "grounder.base" = "base"
 "grounder.vocab" = "vocab"
+"grounder.sld" = "sld"
 "grounder.backward" = "backward"
 "grounder.forward" = "forward"
 "grounder.forward.spmm" = "forward/spmm"
