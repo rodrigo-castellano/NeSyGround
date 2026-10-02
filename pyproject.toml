@@ -27,6 +27,7 @@ packages = [
     "grounder.base",
     "grounder.vocab",
     "grounder.sld",
+    "grounder.pbc",
     "grounder.backward",
     "grounder.forward",
     "grounder.forward.spmm",
@@ -46,6 +47,7 @@ packages = [
 "grounder.base" = "base"
 "grounder.vocab" = "vocab"
 "grounder.sld" = "sld"
+"grounder.pbc" = "pbc"
 "grounder.backward" = "backward"
 "grounder.forward" = "forward"
 "grounder.forward.spmm" = "forward/spmm"

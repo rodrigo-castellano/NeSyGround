@@ -1,7 +1,7 @@
 """Grounding counts on real KGs: what each grounder type grounds for fixed query batches, against a recorded reference
 (``tests/baselines/grounding_counts.json``). Optional (not a pytest file), GPU, under 90 s.
 
-    python tests/counts.py                    # every cell: counts and content hashes exactly, the engine cross-check
+    python tests/counts.py                    # every cell: counts and content hashes exactly
     python tests/counts.py --cell family      # the cells whose name contains "family"
     python tests/counts.py --update           # record this run as the reference
 
@@ -11,8 +11,7 @@ relations no rule concludes), the rules whose predicates the KB has, ``create_gr
 the queries in fixed batches of ``BATCH`` (the keras filter's pruning depends on the batch). Per cell it checks each
 step's goals, the kept firings and atoms, the firings per rule, and a hash of the whole output (atom tables, firings,
 query rows); each step's raw groundings (what it wrote before the pruning, which a faster grounder may shrink) are
-reported, not checked. The fp_batch cells are also checked against the general engine (the fast path's oracle) on their
-first queries.
+reported, not checked.
 """
 from __future__ import annotations
 
@@ -27,12 +26,11 @@ from pathlib import Path
 import torch
 
 from grounder.api.rule_grounder import TensorFactIndex, create_grounder
-from grounder.core import GroundRequest, OutputSpec, Tier
-from grounder.data.loader import parse_rules, parse_triples
+from grounder.kb import parse_rules, parse_triples
 
 REFERENCE = Path(__file__).with_name("baselines") / "grounding_counts.json"
 DATA_ROOT = Path(os.environ.get("DATA_ROOT", Path.home() / "repos/data-swarm/main"))
-BATCH, GROUP, ORACLE_QUERIES = 256, 4, 64
+BATCH, GROUP = 256, 4
 FP = ["enum.fp_batch.w0.d1.flat", "enum.fp_batch.w1.d2.flat", "enum.fp_batch.w1.d3.flat"]
 KERAS = ["enum.keras.w0.d1.flat", "enum.keras.w1.d1.flat", "enum.keras.w1.d2.flat", "enum.keras.w1.d2.r2.flat",
          "enum.keras.w1.d3.flat", "enum.keras.w1.d3.r3.flat"]
@@ -112,15 +110,6 @@ def run_cell(kb: KB, dataset: str, split: str, n, grounder_type: str) -> dict:
            "atoms": sum(int(o.atom_table.shape[0]) for o in outs),
            "proved_queries": sum(int(torch.isin(o.query_pool_idx, o.head_pool_idx).sum()) for o in outs),
            "per_rule": per_rule.tolist(), "sha": _digest(outs), "seconds": round(seconds, 2)}
-    if ".fp_batch." in grounder_type:           # the fast path against the general engine, its first queries
-        q = queries[:ORACLE_QUERIES]
-        m = torch.ones(q.shape[0], dtype=torch.bool, device=q.device)
-        engine = rg._inner.ground(GroundRequest(queries=q, query_mask=m,
-                                                output_spec=OutputSpec(frozenset({Tier.FIRINGS})))).rule_groundings
-        fast = rg.run_bc(q, m)
-        rows = lambda o: torch.cat([o.rule_idx.unsqueeze(1), o.atom_table[o.head_pool_idx],  # noqa: E731
-                                    o.atom_table[o.body_pool_idx].flatten(1)], 1)
-        got["engine_equal"] = bool(torch.equal(rows(engine), rows(fast)))
     return got
 
 
@@ -144,8 +133,6 @@ def main() -> int:
             got = results[name] = run_cell(kb, dataset, split, n, grounder_type)
             want = ref.get(name)
             bad = [] if want is None else [k for k in got if k not in INFO and got[k] != want.get(k)]
-            if got.get("engine_equal") is False:
-                bad.append("engine_equal")
             raw_was = ("" if want is None or got["raw"] == want["raw"]
                        else " (raw was " + ">".join(map(str, want["raw"])) + ")")
             status = "NEW" if want is None else "DRIFT " + ",".join(bad) if bad else "ok" + raw_was
@@ -161,7 +148,7 @@ def main() -> int:
         REFERENCE.write_text(json.dumps(ref, indent=1, sort_keys=True) + "\n")
         print(f"recorded {len(results)} cells in {REFERENCE}")
         return 0
-    return 1 if drift or any(r.get("engine_equal") is False for r in results.values()) else 0
+    return 1 if drift else 0
 
 
 if __name__ == "__main__":

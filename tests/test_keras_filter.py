@@ -78,21 +78,46 @@ def test_keras_one_round_at_depth_one_keeps_a_one_body_atom_the_batch_proves():
     assert unpadded(_groundings("enum.keras.w0.d1.flat", [(1, A, C), (1, C, A)], rules=rules)) == {chain}
 
 
+RANDOM_PREDS = ["p0", "p1", "p2", "p3", "p4"]
+RANDOM_RULES = [
+    (("p2", "X", "Y"), [("p0", "X", "Z"), ("p1", "Z", "Y")]),                       # a chain: one free variable
+    (("p3", "X", "Y"), [("p2", "Y", "X")]),                                        # one body atom, no free variable
+    (("p4", "X", "Y"), [("p0", "X", "Z"), ("p0", "Z", "W"), ("p1", "W", "Y")]),    # two free variables
+    (("p1", "X", "Y"), [("p3", "X", "Y"), ("p0", "Y", "Z")]),                       # a free variable only in the body
+    (("p2", "X", "Y"), [("p2", "Y", "X")]),                                        # recursive
+]
+
+
+def _setup(seed: int = 0, E: int = 30, F: int = 160):
+    """A random KB over ``RANDOM_PREDS``: ``(fact index, vocabulary, queries)`` (facts and random atoms)."""
+    g = torch.Generator().manual_seed(seed)
+    facts = torch.unique(torch.stack([torch.randint(0, len(RANDOM_PREDS), (F,), generator=g),
+                                      torch.randint(0, E, (F,), generator=g),
+                                      torch.randint(0, E, (F,), generator=g)], 1), dim=0)
+    vocab = SimpleNamespace(relation2id={p: i for i, p in enumerate(RANDOM_PREDS)},
+                            entity2id={f"e{i}": i for i in range(E)})
+    fi = TensorFactIndex([tuple(f) for f in facts.tolist()], num_predicates=len(RANDOM_PREDS), num_entities=E,
+                         device=DEV)
+    queries = torch.cat([facts[:40], torch.stack([torch.randint(0, len(RANDOM_PREDS), (60,), generator=g),
+                                                  torch.randint(0, E, (60,), generator=g),
+                                                  torch.randint(0, E, (60,), generator=g)], 1)]).to(DEV)
+    return fi, vocab, queries
+
+
 @pytest.mark.parametrize("grounder_type, rounds", [("enum.keras.w1.d2.flat", None), ("enum.keras.w1.d2.r2.flat", 2)])
 def test_keras_walk_rounds_parse(grounder_type, rounds):
     """``.r<N>``: the proof walk's rounds (the later keras-ns walks depth rounds, the IJCAI-25 code depth - 1)."""
     rg, _ = _groundings(grounder_type, [(0, A, Z)])
-    assert rg._inner.keras_rounds == rounds
+    assert rg.pbc.rounds == rounds
 
 
 @pytest.mark.parametrize("grounder_type", ["enum.keras.w1.d2.flat", "enum.keras.w1.d3.flat", "enum.keras.w1.d3.r3.flat"])
 @pytest.mark.parametrize("seed", [0, 1, 2])
 def test_keras_prefilter_keeps_the_walks_output(grounder_type, seed, monkeypatch):
-    """Dropping the groundings no chain from the all-fact ones can prove (``fast._keras_provable``) before keras-ns's
+    """Dropping the groundings no chain from the all-fact ones can prove (``engine._keras_provable``) before keras-ns's
     proof walk changes nothing it outputs: recursive and one-body rules, several batches at once."""
-    from grounder.backward import fast
-    from test_fast import RULES, _setup
-    rules = [(h, b) for h, b in RULES if len(b) == 1 or all(set(a[1:]) - set(h[1:]) for a in b)]   # keras's
+    from grounder.pbc import engine as fast
+    rules = [(h, b) for h, b in RANDOM_RULES if len(b) == 1 or all(set(a[1:]) - set(h[1:]) for a in b)]   # keras's
     fi, vocab, queries = _setup(seed)
     vocab.rule_names = [f"r{i}" for i in range(len(rules))]
     rg = create_grounder(grounder_type, fact_index=fi, rules=rules, kb=vocab, max_groundings=32,
@@ -101,8 +126,8 @@ def test_keras_prefilter_keeps_the_walks_output(grounder_type, seed, monkeypatch
     mask = torch.rand(qs.shape[:2], generator=torch.Generator().manual_seed(seed)).to(DEV) < 0.9
     outs, sizes, provable = {}, [], fast._keras_provable
 
-    def counted(g, rule, *args):
-        out = provable(g, rule, *args)
+    def counted(g, facts, rule, *args):
+        out = provable(g, facts, rule, *args)
         sizes.append((int(rule.shape[0]), int(out[0].shape[0])))
         return out
     monkeypatch.setattr(fast, "_keras_provable", counted)

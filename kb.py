@@ -259,11 +259,14 @@ class Facts:
 class Rules:
     """The rules, ``heads [R, W]``, ``bodies [R, M, W]`` (padded with ``pad``), ``lens [R]``: a rule's id is its
     position. Indexed by head predicate: ``by_pred`` lists the rules sorted by it (stable) and ``pred_offsets`` the
-    slice of each; ``order [R]`` the index each rule had in the input (``KB.from_strings`` sorts them)."""
+    slice of each; ``order [R]`` the index each rule had in the input and ``body_order[r]`` the input position of each
+    of its body atoms (``KB.from_strings`` sorts the rules and each body)."""
 
-    def __init__(self, heads: Tensor, bodies: Tensor, lens: Tensor, *, P: int, order: Optional[Tensor] = None) -> None:
+    def __init__(self, heads: Tensor, bodies: Tensor, lens: Tensor, *, P: int, order: Optional[Tensor] = None,
+                 body_order: Optional[List[List[int]]] = None) -> None:
         self.heads, self.bodies, self.lens = heads, bodies, lens
         self.order = order if order is not None else torch.arange(len(heads), device=heads.device)
+        self.body_order = body_order if body_order is not None else [list(range(int(n))) for n in lens]
         self.by_pred, self.pred_offsets = _csr(heads[:, 0], P)
         self.max_per_pred = max(int(self.pred_offsets.diff().max()), 1)
 
@@ -290,7 +293,8 @@ class KB:
     least the largest predicate id of the facts and rules + 1. Immutable."""
 
     def __init__(self, facts: Tensor, heads: Tensor, bodies: Tensor, lens: Tensor, *, E: int, pad: int,
-                 P: Optional[int] = None, device=None, order: Optional[Tensor] = None) -> None:
+                 P: Optional[int] = None, device=None, order: Optional[Tensor] = None,
+                 body_order: Optional[List[List[int]]] = None) -> None:
         device = torch.device(device) if device is not None else facts.device
         facts, heads, bodies, lens = (t.to(device=device, dtype=torch.long) for t in (facts, heads, bodies, lens))
         if len(facts) == 0 or len(heads) == 0:
@@ -301,35 +305,37 @@ class KB:
         ids = torch.cat([facts.reshape(-1), heads.reshape(-1), bodies.reshape(-1)])
         self.base = max(self.E, self.P, self.pad + 1, int(ids.max()) + 1) + 1        # above every id
         self.facts = Facts(facts, P=self.P, base=self.base)
-        self.rules = Rules(heads, bodies, lens, P=self.P, order=None if order is None else order.to(device))
+        self.rules = Rules(heads, bodies, lens, P=self.P, order=None if order is None else order.to(device),
+                           body_order=body_order)
         self.W, self.M = facts.shape[1], int(lens.max())
 
     @classmethod
-    def from_strings(cls, facts: Sequence[Tuple[int, int, int]], rules: Sequence[Rule], entity2id: Dict[str, int],
+    def from_strings(cls, facts, rules: Sequence[Rule], entity2id: Dict[str, int],
                      relation2id: Dict[str, int], device=None) -> "KB":
-        """A KB of ``(r, h, t)`` fact ids and ``(head, body)`` string rules. The rules are sorted by head predicate
+        """A KB of ``(r, h, t)`` fact ids (``[F, 3]`` or tuples) and ``(head, body)`` string rules. The rules are sorted by head predicate
         (stable; ``rules.order``: each one's input index); each rule's body atoms take the dependency order from its head
         variables; its head variables are ids ``E`` and ``E + 1``, its free variables ``E + 2 + i`` in name order; a
         constant argument is its entity id; ``pad = E + 2 + the most free variables``."""
         E = len(entity2id)
         order = sorted(range(len(rules)), key=lambda i: relation2id[rules[i][0][0]])
-        heads, bodies, n_free = [], [], 0
+        heads, bodies, orders, n_free = [], [], [], 0
         for head, body in (rules[i] for i in order):
             hv = (head[1], head[2])
             free = sorted({a for atom in body for a in atom[1:]} - set(hv))
             ids = {hv[0]: E, hv[1]: E + 1, **{v: E + 2 + i for i, v in enumerate(free)}}
-            known, rest, order = set(hv), list(range(len(body))), []
+            known, rest, body_ord = set(hv), list(range(len(body))), []
             while rest:                                    # the dependency order
                 nxt = next((i for i in rest if body[i][1] in known or body[i][2] in known), None)
                 for i in (rest if nxt is None else [nxt]):
-                    order.append(i)
+                    body_ord.append(i)
                     known |= set(body[i][1:])
                 rest = [] if nxt is None else [i for i in rest if i != nxt]
 
             def arg(a):
                 return entity2id[a] if not is_variable(a) and a in entity2id else ids[a]
             heads.append([relation2id[head[0]], E, E + 1])
-            bodies.append([[relation2id[body[i][0]], arg(body[i][1]), arg(body[i][2])] for i in order])
+            orders.append(body_ord)
+            bodies.append([[relation2id[body[i][0]], arg(body[i][1]), arg(body[i][2])] for i in body_ord])
             n_free = max(n_free, len(free))
         pad = E + 2 + n_free
         M = max(len(b) for b in bodies)
@@ -337,9 +343,9 @@ class KB:
         for r, b in enumerate(bodies):
             body_t[r, :len(b)] = torch.tensor(b)
         lens = torch.tensor([len(b) for b in bodies])
-        fact_t = torch.tensor(list(facts), dtype=torch.long).reshape(-1, 3)
+        fact_t = (facts if isinstance(facts, Tensor) else torch.tensor(list(facts))).long().reshape(-1, 3)
         return cls(fact_t, torch.tensor(heads), body_t, lens, E=E, pad=pad, P=len(relation2id), device=device,
-                   order=torch.tensor(order))
+                   order=torch.tensor(order), body_order=orders)
 
     def patterns(self) -> List[RulePattern]:
         """The rules' binding analysis."""
