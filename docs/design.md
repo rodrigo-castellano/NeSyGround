@@ -6,7 +6,7 @@ set of operations:
 
 | class | technique | goals | runs |
 |---|---|---|---|
-| `PBC` | parametrized backward chaining, BC_{w,d} (IJCAI-25) | ground atoms | compiled: static shapes, CUDA graph |
+| `PBC` | parametrized backward chaining, BC_{w,d} (IJCAI-25) | ground atoms | Triton kernels on the actual sizes, streamed |
 | `SLD` | SLD resolution | proof states (conjunctions with variables) | eager (static shapes) |
 | `Forward` | semi-naive forward chaining | none: data-directed | eager |
 
@@ -164,26 +164,27 @@ fp_batch is forward chaining over the grounded rules; PBC and SLD call one imple
 Technique-owned: unification, substitution, renaming, packing (SLD); anchor variants, the fused kernel, the width test,
 the keras walk, sizing (PBC); the matrix ops and joins (Forward).
 
-## PBC: compiled, no caps, exact about explosion
+## PBC: no caps, bounded memory per step, exact about explosion
 
 - **No truncation.** No fact cap, no per-rule, per-query, per-step or children cap: every lookup is enumerated in full.
-- **Static shapes.** A call's buffers are sized for its worst case: `goals per call × worst case per goal`, per size
-  bucket (a power of 2 of the goals), allocated once and reused. Counts live on the device; kernels walk what is live
-  (persistent / grid-stride), so the work follows the actual counts, not the buffers. The step loop is captured in a
-  CUDA graph per bucket; one host sync after it; the canonical output is built on the actual sizes.
-- **Sizing** (`sizing.py`, at construction, from the rule variants and the fact index): a multi-type branching model
-  over the goals, as `docs/grounding_limits.md` in torch-ns, but over the grounder's own enumeration — every anchor
-  variant; at a width-0 last step the kept groundings of a rule are the all-fact ones, the same set whichever variant
-  finds them, so one variant is enumerated there and the cheapest variant bounds them; next goals only of predicates
-  some rule concludes. Worst lookups are typed: from an entity that a lookup of `q` on side `s` reached, the largest
-  lookup over those entities. Bytes use the engine's real bytes per goal and per grounding slot.
-- **Calls** are split across pools, never within one (the prune is per pool). A pool that does not fit raises; one goal
-  that does not fit raises the paper's error:
-
-      BC_{1,3} on FB15k-237 does not fit: one goal can keep <N> groundings (the worst case of its rules and facts),
-      <X> GB > <Y> GB free.
-
-- With a `Guide(k)`, a goal's successors are bounded by k × width: `sizing` reports both.
+- **Actual sizes.** The Triton kernels take their sizes at run time; the glue is eager. A step allocates what its goals
+  produce, never a worst-case buffer, so what fits is what the data needs.
+- **Streamed steps** (`engine.py`): a step holds a bounded slice of its work at a time, and the result is the same as
+  in one piece. Goals go in chunks of about `ROWS` (goal, variant) rows; the expansion before the last free variable
+  in groups of `ROWS` rows; one launch of the fused kernel keeps at most `WALK` candidates (its output buffers); kept
+  groundings become bodies `ROWS` at a time. Only the kept groundings outlive a chunk.
+- **Dropping early, exactly.** fp_batch: the step before the last keeps only the groundings whose unknown atom can still
+  be proved (a goal so far, or one a width-0 last step can ground). keras (width ≤ 1): a step writing more than
+  `KERAS_STORE_ROWS` groundings, and the last step unless it is small, is grounded again in each Kleene round of the
+  provable atoms' least fixed point, writing only what the keras prune can keep. On WN18RR a query side's step 2 has
+  ~10^8 goals and keeps ~10^4 groundings.
+- **Sizing** (`sizing.py`, from the rule variants and the fact index): the worst case, reported, not allocated — a
+  multi-type branching model over the goals, as `docs/grounding_limits.md` in torch-ns, but over the grounder's own
+  enumeration (every anchor variant; at a width-0 step one variant, the cheapest; next goals only of predicates some
+  rule concludes). It states what no call can exceed; the measured distribution states what calls of a protocol need.
+- **Calls** are split across pools, never within one (the prune is per pool). A pool that does not fit runs out of
+  memory: the caller splits its calls, not a pool.
+- With a `Guide(k)`, a goal's successors are bounded by k × width.
 
 ## SLD
 
