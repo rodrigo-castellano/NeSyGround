@@ -10,101 +10,65 @@ This file defines repository-wide guidance for the `grounder` repository.
 
 ## Project Overview
 
-NeSyGround is a compiled, fixed-shape grounding library for neuro-symbolic reasoning. It provides backward-chaining resolution, filtering, KB indexing, and optional neural/KGE hooks in a form that stays compatible with `torch.compile` and CUDA-graph-friendly execution.
+grounder is a library of grounding techniques for neural-symbolic reasoning: given facts, rules and queries, it
+produces the rule groundings a reasoner scores. One class per technique, one data model (`kb.py`), one output type
+(`types.py`): `PBC` (parametrized backward chaining, BC_{w,d}), `SLD` (SLD resolution) and `Forward` (forward
+chaining). No caps: every lookup is enumerated in full, and a call whose output does not fit runs out of memory (the
+explosion is the point the RL papers make). `docs/design.md` is the design reference.
 
-## BC_{w,d,u} grounders: paper parametrization
+## BC_{w,d,u}: the papers' parametrization
 
-The `enum` BC family is parametrized by **`(w, d, u)`** matching the paper / keras-ns notation:
+- `w` — the width: at most `w` body atoms of a kept grounding are not facts.
+- `d` — the depth: grounding steps (each grounds the previous step's unknown body atoms).
+- `u` — whether unknown leaves may remain after the last step. The papers use **u = false**: what is not proved is
+  pruned. `PBC.parse` types: `enum.keras.wW.dD.flat` (keras-ns's prune, the papers' protocol) and
+  `enum.fp_batch.wW.dD.flat` (fp_batch); BC_{0,1,0} = BC_{1,1,0}.
 
-- `w` — `max_unknown_fact_count` at intermediate proof steps.
-- `d` — `num_steps` (proof depth).
-- `u` — `max_unknown_fact_count_last_step` (last-depth cap). The paper convention is **`u=0`**: every leaf body atom must be a fact. The IJCAI '25 experiments use this everywhere.
+### keras (the papers' protocol)
 
-Use `grounder.factory.make_bcwd(kb, w, d, u=0, ...)` (or the type-string shorthand `bcWD` / `bcWDuU`) to build a fully-configured BC grounder. Internal mapping: `u` → `BCGrounder.w_last_depth`.
+The IJCAI-25 code (`PhD-papers/ijcai25_grounding_methods/repro/src_paper`, `BuildGrounder` with `backward_W_D`) builds
+keras-ns's `ApproximateBackwardChainingGrounder` with width `W` at **every** step, the last one included
+(`max_unknown_fact_count_last_step=W`), `prune_incomplete_proofs=True` and no per-rule cap. `enum.keras.wW.dD` does
+the same: width `W` at every step, then keras-ns's proof walk (`D - 1` rounds; `.r<N>` sets them: the later keras-ns
+of XAI-25 / NeSy-25 walks `D`), its one-body rules (added untested, the walk decides), its cycle rule and its goals.
+(keras-ns-swarm's own `grounder_factory.py` sets the last step's width to 0: not what the paper ran.)
 
-### Default filter depends on `u`
+Parity: every grounding equal to keras-ns's on whole query sets — WN18RR test and 20k training queries at BC01 and
+BC12, FB15k-237 at BC01, Countries S2/S3 at BC21/22/23 (loss, gradients and the Adam step too), Family and WN18RR
+batches at BC01 — and `tests/counts.py` holds those semantics. keras-ns walks a (rule, step) block's goals in a
+Python set's order, so its own output varies with the hash seed (a few groundings in thousands); here in atom order,
+one of the orders it can take. Not compared with keras-ns directly: depth 3 on Family / WN18RR / FB15k-237, YAGO3-10.
 
-When `filter` is omitted, both `BCGrounder.__init__` and `make_bcwd` derive it from `u`:
+### fp_batch
 
-| `u` | default filter | matches keras-ns |
-|-----|----------------|------------------|
-| `u=0` (paper) | `fp_batch` | `prune_incomplete_proofs=True` (Kleene fixed-point pruning over the rule-application set) |
-| `u>0` (rare)  | `none`     | `prune_incomplete_proofs=False` (admit unknown leaves; downstream scorer weights them) |
-
-With `u=0` and the implied `fp_batch`, `out.rule_groundings` matches keras rule-by-rule. Note that under the paper convention `bc{0}{1}` and `bc{1}{1}` produce **identical output** — at depth 1 the only step *is* the last step, and `u=0` caps unknown leaves to 0 regardless of `w`.
-
-### Other forced defaults
-
-- `all_anchors=True` is forced for `enum` in `BCGrounder.__init__` even if the caller passes `False`. Anchoring only on the first body atom misses bindings keras finds when iterating each body position as anchor — for `nb(X,Y), loc(Y,Z) → loc(X,Z)`, anchoring on `loc` admits Y values where `nb(X,Y)` is unknown but `loc(Y,Z)` is fact (and vice versa). The dedup pipeline uses `_variant_to_orig` so the K_r anchor variants of the same logical rule application collapse to a single entry.
-- `flat_intermediate=True` is the `make_bcwd` default — zero grounding loss when V≥2; falls through to the dense path for V<2.
+The last step's width is 0 (every leaf a fact), then the groundings whose body is proved within `d` rounds of
+propagation from the facts. Differs from keras where an unknown atom is proved through another chain.
 
 ### Paper rule sets
 
-Some datasets ship two rule files. The paper / IJCAI '25 numbers use the smaller, hand-curated set:
-
-| dataset | paper rules | extended set | notes |
-|---|---|---|---|
-| `family` | `rules_old.txt` (47 rules) | `rules.txt` (143 rules) | Use `KGDataset(..., rules_file='rules_old.txt')` to reproduce paper grounding counts. The 143-rule set is an automated expansion that blows up `K_r` and OOMs on large query batches with `cartesian_product=True`. |
-
-### Known parity quirk: keras 1-body shortcut
-
-For 1-body rules (e.g. symmetry `also_see(y,x) → also_see(x,y)`), keras-ns's `approximate_backward_chaining_grounding_one_rule` takes a shortcut that bypasses the `max_unknown_fact_count` cap entirely (line ~70: `if len(rule.body) == 1: new_ground_atoms.add(...); continue`). It then relies on `PruneIncompleteProofs` to drop apps whose body atoms aren't proved by other rules.
-
-Torch's enum applies the width filter uniformly to 1-body rules, so when `u=0` and the body atom isn't a fact, torch drops the app. Keras's prune may resurrect these via mutual chains (other rules independently deriving the head, then the symmetric body atom is "proved" via that chain).
-
-This causes an over-count in keras vs torch on datasets with 1-body symmetry rules and reciprocal test pairs (`also_see(A,B)` and `also_see(B,A)` both queried). The gap **amplifies through depths** because `PruneIncompleteProofs` admits more atoms via the shortcut at each iteration. On wn18rr 50 queries: bc01 +2, bc12 +100 (entirely localised to r2 = `hypernym ← der_form(x,z), der_form(z,y)` whose body atoms lean on the der_form symmetry), bc13 +60. Per the paper convention `u=0`, torch is the strict / correct behaviour; keras is the lenient one.
-
-## V≥1 flat resolution path
-
-`_resolve_enum_step_flat` is enabled for `V >= 1` (was V≥2 before 2026-04-30). Two coupled fixes were needed to make V=1 datasets correct on this path:
-
-1. `_PatternVariant` propagates `_orig_body_patterns` / `_orig_body_pred_indices` from the base `RulePattern`. Without this, anchor variants carry *anchor-permuted* body order in `arg_source_dep` / `body_preds_dep`, so logically-equivalent apps don't share a key under the terminal `(orig_rule_idx, head, sorted_body)` dedup.
-2. `_enumerate_cartesian_flat` applies `active_mask` to all rule slots (not just the slot-0 carve-out for `~has_free` rules). Padded K_r positions (rule_idx clamped to 0 because the predicate has fewer than K_r matching variants) used to leak candidates that got recorded as spurious apps under wrong heads.
-
-Effect on the parity sweep (50 queries, GPU, default config):
-
-| Dataset | bc01 | bc12 | bc13 | bc12 speedup | bc13 speedup |
-|---|---|---|---|---|---|
-| ablation_d2 | ✓ 0 | ✓ 118 | ✓ 377 | 0.30× | 0.33× |
-| ablation_d3 | ✓ 0 | ✓ 0 | ✓ 252 | 0.14× | 0.27× |
-| countries_s2 | ✓ 67 | ✓ 119 | ✓ 165 | 0.28× | 0.36× |
-| countries_s3 | ✓ 42 | ✓ 783 | ✓ 3349 | **10.79×** | **2.73×** |
-| family rules_old | ✓ 195 | ✓ 610 | ✓ 787 | 1.16× | **2.24×** |
-| wn18rr | -2 (1-body quirk) | -100 (1-body quirk amplified) | -60 (1-body quirk amplified) | 0.60× | 0.66× |
-
-16/18 cells full parity. The 3 wn18rr cells trace entirely to the 1-body keras shortcut amplification documented above. Small-workload cells (ablation, countries_s2) are slower than keras because the flat path runs eager (the compiled step-fast-path is gated off when `flat_intermediate=True`); for medium+ workloads (countries_s3, family bc13) torch beats keras-ns substantially.
+Family: the paper uses the 47 hand-curated rules — `rules.txt` in data-swarm (`rules_old.txt` is the same set;
+`rules_new.txt`, 143 rules, is an automated expansion).
 
 ## Architecture
 
-Current package ownership:
-
-- `grounder/data/`: dataset loading, KB construction, fact/rule indexing
-- `grounder/bc/`: backward-chaining execution
-- `grounder/fc/`: forward-chaining execution
-- `grounder/resolution/`: unification primitives, SLD, RTF, enumeration, standardization
-- `grounder/filters/`: search and soundness filters plus hooks
-- `grounder/nesy/`: neural/KGE scoring helpers and hooks
-- `grounder/factory.py`: grounder construction entry point
-- `grounder/types.py`, `grounder/utils.py`: shared types and utilities
-- `grounder/analysis/`: comparison, gold-standard, and depth-generation scripts
-- `grounder/tests/`: unit and regression tests
-- `grounder/docs/`: package documentation
+- `kb.py`: parsing, rule compilation (anchor variants), `Facts`, `Rules`, `KB`
+- `ops.py`, `types.py`: keys, decoding, grouping; `Groundings`, `Proofs`, `Closure`
+- `pbc/`: `PBC` — `tables.py` (per-variant tables), `kernels.py` (Triton: fact hash set, the fused last stage),
+  `engine.py` (the steps, streamed; the prunes; the canonical output), `guide.py` (`Guide`), `sizing.py` (worst case)
+- `sld/`: `SLD` — `resolve.py` (unify, substitute, lookups), `state.py` (pack, compact, rename, trail, harvest)
+- `forward/`: `Forward` — `spmm/` (semi-naive sparse matmul), `join/` (staged join), `router.py`
+- `api/rule_grounder.py`: the adapter torch-ns calls (`create_grounder`, `RuleGrounder`)
+- `docs/`: `design.md`
+- `tests/`: unit and regression tests
+- Still present, to be deleted once consumers move: the old general engine (`backward/`, `resolution/`,
+  `execution/`, `filters/`, `data/`, `base/`, `core.py`, `vocab/`)
 
 ## Running Experiments
 
 This repository is primarily a library, not a training entry point.
 
-Use it in three ways:
-
-- run focused grounder tests from this directory
-- run grounder analysis scripts such as:
-
-```bash
-cd /path/to/grounder
-python -m grounder.analysis.compare_groundings --help
-```
-
-Do not add standalone training scripts to `grounder/` unless they are genuinely grounder-specific analysis tools.
+Use it from its consumers (torch-ns: `PBC` through `api/rule_grounder.py`; probfol-llm: `SLD`, `Forward`) and run
+its tests from this directory. Do not add training scripts here.
 
 ## Logging Experiments
 
@@ -121,23 +85,27 @@ Do not add standalone training scripts to `grounder/` unless they are genuinely 
 
 ```
 tests/
-├── test_rule_grounder.py    rule compilation, grounder-type parsing, a two-hop proof (toy KB)
-├── test_fast.py             backward.fast (the width <= 1 fast path torch-ns runs) against the general engine
-├── test_keras_filter.py     the keras filter (keras-ns's BC_{w,d}): its cycle rule and its proof-walk rounds
+├── test_pbc.py              PBC on Countries S3 / Family: Full, the guide, chunked steps change nothing
+├── test_pbc_oracle.py       PBC (fp_batch) against a brute-force reference on random KBs
+├── test_keras_filter.py     the keras prune (keras-ns's BC_{w,d}): its cycle rule, one-body rules, walk rounds
+├── test_rule_grounder.py    the torch-ns adapter (create_grounder, RuleGrounder)
+├── test_sld.py              SLD's derive / prove on toy KBs
 ├── counts.py                optional: grounding counts on real KGs against baselines/grounding_counts.json
-└── *_ab.py, *fingerprint*.py  older A/B and fingerprint harnesses (some import modules that no longer exist)
+├── probfol_record.py        optional: probfol-llm's SLD / FC calls against their recorded outputs
+├── fc_fingerprint.py        optional: forward chaining's closures against baselines
+└── guided_ab.py             older guided harness (imports the old engine)
 ```
 
 ```bash
-python -m pytest tests/ -q          # the suite (GPU: the fast path is Triton)
+python -m pytest tests/ -q          # the suite (GPU: PBC's kernels are Triton)
 python tests/counts.py              # optional, < 90 s: Family / WN18RR / Countries S3 test queries (and a Family
                                     # train slice) x fp_batch and keras grounders at depths 1-3, in batches of 256:
                                     # each step's goals, the kept firings, atoms, firings per rule and an output
-                                    # hash exactly; the fp_batch cells also against the general engine
+                                    # hash exactly
 python tests/counts.py --update     # re-record after an intended change of what is grounded
 ```
 
-Run `tests/counts.py` whenever grounding semantics, filters, the fast path or dataset loading may have changed; an
+Run `tests/counts.py` whenever grounding semantics, the prunes, PBC's engine or dataset loading may have changed; an
 optimisation must leave every checked field unchanged (it may shrink the raw groundings a step writes, which the
 script reports but does not check).
 
@@ -167,12 +135,10 @@ Modification discipline:
 
 Placement rules:
 
-- data loading, KB wiring, indexing: `grounder/data/`
-- resolution, substitutions, standardization, search expansion: `grounder/resolution/`
-- backward/forward execution loops: `grounder/bc/`, `grounder/fc/`
-- filter logic and hooks: `grounder/filters/`
-- neural or KGE-assisted scoring: `grounder/nesy/`
-- one-off comparison and reporting scripts: `grounder/analysis/`
+- parsing, rule compilation, fact and rule indexes: `kb.py`
+- shared tensor operations and output types: `ops.py`, `types.py`
+- a technique's steps, prunes and kernels: its package (`pbc/`, `sld/`, `forward/`)
+- models that guide grounding: outside this repo, through `pbc.Guide`'s `Scorer`
 
 ## Naming Convention
 
@@ -205,9 +171,8 @@ Public API aliases (for backward compatibility with experiments/model.py):
 
 ## Coding Standards
 
-- Keep tensors statically shaped wherever code is intended for compiled execution.
-- Avoid `.item()` and Python data-dependent branching inside compiled forward/step paths.
-- Compile a single step, not an entire multi-depth loop.
+- PBC's kernels (Triton) take their sizes at run time; size buffers from actual counts, never from a worst case.
+- Keep host syncs (`.item()`, `.tolist()`) to one per chunk or kernel launch; none per row.
 - Add type hints to function signatures.
 - Document important tensor shapes with comments using the standard symbols above (e.g. `[B, S, G, 3]`).
 - Prefer vectorized tensor code over Python loops in hot paths.
@@ -217,7 +182,7 @@ Public API aliases (for backward compatibility with experiments/model.py):
 
 - Never revert or restore files without explicit user permission.
 - Fix bugs forward; do not hide them with clamps or silent fallbacks.
-- If a path is meant to run in `torch.compile` / CUDA-graph-friendly mode, solve the root issue there instead of silently switching to a slower dynamic path.
+- Never truncate (no fact, rule, step or children caps in PBC): bound a step's memory by streaming its work in chunks, and keep the output identical to the unchunked one.
 - Keep timing-sensitive tests and benchmarks sequential.
 - Use a git worktree when you need to compare with an older commit.
 - Keep mirrored grounder copies synchronized when the intent is shared behavior across repos.
@@ -228,7 +193,7 @@ Public API aliases (for backward compatibility with experiments/model.py):
 ## Verification Checklist
 
 - any code change: `python -m pytest tests/ -q`.
-- grounding semantics, filters or the fast path changed: `python tests/counts.py` (exact counts and hashes).
+- grounding semantics, the prunes or PBC's engine changed: `python tests/counts.py` (exact counts and hashes).
 - before commit: both, then torch-ns's gate (`python tests/gate.py` there: a Family BC12 run end to end).
 - mirrored change intended: sync the other grounder copy or checkout and rerun its relevant tests
 - before any commit: the `check-editable-pins` pre-commit hook runs automatically (if installed) and blocks the commit if the `torch-kge-kernels` SHA pin in `pyproject.toml` has drifted from the editable install or points at an unpushed HEAD. To run it manually: `python scripts/check_editable_pins.py`.
