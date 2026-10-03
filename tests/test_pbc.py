@@ -62,3 +62,16 @@ def test_guide(name):
         assert _rows(few) <= plain and capture and all(bool((c["kept"] | ~c["exempt"]).all()) for c in capture)
         again = PBC(kb, depth=3, width=1, prune=prune, guide=Guide(_Score(), k=1)).ground(q)
         assert _rows(again) == _rows(few)                       # deterministic
+
+
+@pytest.mark.parametrize("name", ["countries_s3", "family"])
+@pytest.mark.parametrize("prune", ["fp_batch", "keras"])
+def test_chunked_steps_change_nothing(name, prune, monkeypatch):
+    """A step walks its candidate rows in chunks (``engine.ROWS``): tiny chunks give the same groundings."""
+    from grounder.pbc import engine
+    kb, q = _kb(name)
+    whole = PBC(kb, depth=3, width=1, prune=prune).ground(q[:256])
+    monkeypatch.setattr(engine, "ROWS", 37)
+    chunked = PBC(kb, depth=3, width=1, prune=prune).ground(q[:256])
+    for a, b in zip(whole, chunked):
+        assert torch.equal(a, b)

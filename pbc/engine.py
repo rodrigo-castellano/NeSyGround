@@ -18,6 +18,7 @@ what grounding it alone gives.
 """
 from __future__ import annotations
 
+import itertools
 from typing import List, Optional
 
 import torch
@@ -88,9 +89,12 @@ def _cheapest_variant(g, facts: FactTable, goals: Tensor, n: Tensor, rule: Tenso
     return n[keep], rule[keep]
 
 
+ROWS = 1 << 24       # the most candidate rows a step holds at once: it runs in chunks of goals and of rows
+
+
 def _candidates(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[Tensor]):
-    """The rows of a step over ``goals`` ``[N, 3]`` whose last free variable ``_step`` walks: ``(src, variant, n,
-    start, count, one)``, the free variables but the last enumerated."""
+    """The rows of a step over ``goals`` ``[N, 3]`` whose last free variable ``_last`` walks, in chunks of at most
+    ``ROWS`` rows: ``(src, variant, n, start, count, one)`` each, the free variables but the last enumerated."""
     t, V = g.tables, g.tables.V
     n, r = torch.nonzero(t.by_pred_mask[goals[:, 0]], as_tuple=True)        # the live (goal, variant) pairs
     rule = t.by_pred[goals[n, 0], r]
@@ -109,46 +113,73 @@ def _candidates(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[
         one = no_free | ~t.fv_valid[rule, fv]            # a variant without it keeps its row once
         if fv == last - 1 and not facts.every:  # the variable before the last: one kernel, with the last one's slices
             start, count = facts.slots(t.fv_pred[rule, fv], bound, t.fv_dir[rule, fv], one)
-            src, rule, n, start, count, one = expand(
-                src, rule, n, start, count, one, facts.values, t.fv_src[:, last], t.fv_pred[:, last],
-                t.fv_dir[:, last], ~t.has_free | ~t.fv_valid[:, last], facts.start, facts.count, facts.P, facts.E,
-                arg_src, t.body_pred, t.n_body, g.enumerated, heads, facts.seen, width)
-            break
+            # rows grouped so that each group expands to at most ROWS rows (a row larger than that alone)
+            group = (count.cumsum(0) - count) // ROWS
+            ends = torch.searchsorted(group, torch.arange(int(group[-1]) + 1 if group.numel() else 0,
+                                                          device=group.device), right=True).tolist()
+            a = 0
+            for b in ends:
+                yield expand(src[a:b], rule[a:b], n[a:b], start[a:b], count[a:b], one[a:b], facts.values,
+                             t.fv_src[:, last], t.fv_pred[:, last], t.fv_dir[:, last],
+                             ~t.has_free | ~t.fv_valid[:, last], facts.start, facts.count, facts.P, facts.E,
+                             arg_src, t.body_pred, t.n_body, g.enumerated, heads, facts.seen, width)
+                a = b
+            return
         row, value = facts.enumerate(t.fv_pred[rule, fv], bound, t.fv_dir[rule, fv], one)
         n, rule, no_free = n[row], rule[row], no_free[row]
         src = torch.cat([src[row], value.unsqueeze(1)], 1)
+    if last < V:
+        bound = src.gather(1, t.fv_src[rule, last].clamp(max=src.shape[1] - 1).unsqueeze(1)).squeeze(1)
+        one = no_free | ~t.fv_valid[rule, last]
+        start, count = facts.slots(t.fv_pred[rule, last], bound, t.fv_dir[rule, last], one)
     else:
-        if last < V:
-            bound = src.gather(1, t.fv_src[rule, last].clamp(max=src.shape[1] - 1).unsqueeze(1)).squeeze(1)
-            one = no_free | ~t.fv_valid[rule, last]
-            start, count = facts.slots(t.fv_pred[rule, last], bound, t.fv_dir[rule, last], one)
-        else:
-            start, one = torch.zeros_like(rule), torch.ones_like(rule, dtype=torch.bool)
-            count = one.long()
-    return src, rule, n, start, count, one
+        start, one = torch.zeros_like(rule), torch.ones_like(rule, dtype=torch.bool)
+        count = one.long()
+    yield src, rule, n, start, count, one
+
+
+def _chunks(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[Tensor]):
+    """``(first goal, cand)``: a step's candidate rows, a chunk of goals at a time (each goal's variants at most
+    ``ROWS`` rows), each chunk's rows in chunks of at most ``ROWS`` (``_candidates``; ``n`` local to the chunk)."""
+    per = max(1, ROWS // max(g.tables.by_pred.shape[1], 1))
+    for s in range(0, goals.shape[0], per):
+        for cand in _candidates(g, facts, goals[s:s + per], width, heads):
+            yield s, cand
 
 
 def _step(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[Tensor], want_next: bool,
-          cand=None, live=None, pool: Optional[Tensor] = None):
+          cands=None, live=None, pool: Optional[Tensor] = None):
     """One step over ``goals`` ``[N, 3]``: the kept groundings as (rule, goal row, body) and, with ``want_next``,
-    their unknown body atoms as (kept grounding, body slot). The free variables but the last are enumerated first
-    (``_candidates``, or ``cand``); the last one, with every test of the groundings, in ``kernels.last_stage``
-    (``live``: an unknown atom must also be in this key set, keyed with its goal's ``pool``)."""
+    their unknown body atoms as (kept grounding, body slot). The candidate rows (``_chunks``, or ``cands``) are walked a
+    chunk at a time: the last free variable, with every test of the groundings, in ``kernels.last_stage`` (``live``:
+    an unknown atom must also be in this key set, keyed with its goal's ``pool``). Only the kept groundings of a chunk
+    outlive it."""
     t, pad, M, V = g.tables, g.kb.pad, g.tables.M, g.tables.V
-    src, rule, n, start, count, one = cand if cand is not None else _candidates(g, facts, goals, width, heads)
+    per = max(1, ROWS // max(t.by_pred.shape[1], 1))
     arg_src = t.arg_src.clamp(max=1 + V)
-    rows, vals = last_stage(src, rule, n, goals, start, count, one, facts.values, arg_src, t.body_pred, t.n_body,
-                            g.enumerated, heads, facts.seen, pad, width, facts.count, facts.P, facts.E,
-                            cycle="unknown" if g.prune == "keras" else "all", live_set=live, seg=pool)
-    n, rule = n[rows], rule[rows]
-    pad_cols = src.new_zeros(rows.shape[0], max(1 + V - src.shape[1], 0))       # (none when no rule has a free var)
-    src = torch.cat([src[rows], vals.unsqueeze(1), pad_cols], 1)[:, :2 + V]
-    args = src.unsqueeze(1).expand(-1, M, -1).gather(-1, arg_src[rule])
-    body = torch.cat([t.body_pred[rule].unsqueeze(-1), args], -1)                 # [K, M, 3]
-    active = torch.arange(M, device=goals.device) < t.n_body[rule].unsqueeze(1)
-    body = body.masked_fill(~active.unsqueeze(-1), pad)
-    nxt = torch.nonzero(active & ~facts.seen.contains(body), as_tuple=True) if want_next else None
-    return t.rule[rule], n, body, nxt
+    rules, ns, bodies = [], [], []
+    for s, (src, rule, n, start, count, one) in (cands if cands is not None else _chunks(g, facts, goals, width,
+                                                                                         heads)):
+        chunk = goals[s:s + per]
+        rows, vals = last_stage(src, rule, n, chunk, start, count, one, facts.values, arg_src, t.body_pred, t.n_body,
+                                g.enumerated, heads, facts.seen, pad, width, facts.count, facts.P, facts.E,
+                                cycle="unknown" if g.prune == "keras" else "all", live_set=live,
+                                seg=None if pool is None else pool[s:s + per])
+        n, rule = n[rows], rule[rows]
+        pad_cols = src.new_zeros(rows.shape[0], max(1 + V - src.shape[1], 0))   # (none when no rule has a free var)
+        src = torch.cat([src[rows], vals.unsqueeze(1), pad_cols], 1)[:, :2 + V]
+        args = src.unsqueeze(1).expand(-1, M, -1).gather(-1, arg_src[rule])
+        body = torch.cat([t.body_pred[rule].unsqueeze(-1), args], -1)             # [K, M, 3]
+        active = torch.arange(M, device=goals.device) < t.n_body[rule].unsqueeze(1)
+        rules.append(t.rule[rule])
+        ns.append(n + s)
+        bodies.append(body.masked_fill(~active.unsqueeze(-1), pad))
+    if not rules:
+        z = goals.new_zeros(0)
+        return z, z, goals.new_zeros(0, M, 3), ((z, z) if want_next else None)
+    body = torch.cat(bodies) if len(bodies) > 1 else bodies[0]
+    nxt = torch.nonzero((body[..., 0] != pad) & ~facts.seen.contains(body), as_tuple=True) if want_next else None
+    return torch.cat(rules), torch.cat(ns), body, nxt
 
 
 def _live_tables(g, facts: FactTable):
@@ -212,16 +243,19 @@ def _keras_last_step(g, facts: FactTable, goals: Tensor, pool: Tensor, width: in
     groundings whose unknown atom lies in the least fixed point of the provable atoms (reached from the all-fact
     groundings of every step), found by grounding again as the set grows (Kleene iteration from the empty set).
     ``atoms`` / ``bodies`` / ``pools``: the earlier steps' groundings' heads, bodies and pools."""
-    cand = _candidates(g, facts, goals, width, heads)
-    if cand[1].shape[0] < KERAS_CLOSURE_MIN_ROWS:      # few candidates: writing them all costs less than the passes
-        return _step(g, facts, goals, width, heads, False, cand=cand)[:3]
+    gen = _chunks(g, facts, goals, width, heads)
+    first = list(itertools.islice(gen, 2))
+    cands = first if len(first) == 1 else None          # one chunk: reused by every round; more: made again each round
+    if cands is not None and cands[0][1][1].shape[0] < KERAS_CLOSURE_MIN_ROWS:   # few: writing them all costs less
+        return _step(g, facts, goals, width, heads, False, cands=cands)[:3]
+    del first, gen
     head, body, bpool = torch.cat(atoms), torch.cat(bodies), torch.cat(pools)
     row, slot = torch.nonzero((body[..., 0] != g.kb.pad) & ~facts.facts.contains(body), as_tuple=True)
     ukey, hkey = key(body[row, slot], base, bpool[row]), key(head, base, bpool)
     proved = hkey.new_zeros(0)
     while True:
         live = HashSet.of_keys(proved)
-        r, n, b, _ = _step(g, facts, goals, width, heads, False, cand=cand, live=live, pool=pool)
+        r, n, b, _ = _step(g, facts, goals, width, heads, False, cands=cands, live=live, pool=pool)
         ok = torch.ones_like(hkey, dtype=torch.bool)
         ok[row[~live.contains_keys(ukey)]] = False
         grown = torch.unique(torch.cat([hkey[ok], key(goals[n], base, pool[n])]))
