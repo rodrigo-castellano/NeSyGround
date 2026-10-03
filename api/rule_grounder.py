@@ -1,6 +1,6 @@
-"""torch-ns's entry point until it calls ``grounder.pbc.PBC`` directly: ``create_grounder`` builds a PBC grounder from
-string rules and a type string, and ``RuleGrounder.run_bc_many`` returns each pool's groundings as a ``RuleGroundings``
-(the old field names).
+"""torch-ns's entry point until it calls the grounders directly: ``create_grounder`` builds a PBC grounder (or, for a
+``closure`` type, forward chaining's witnesses: ``Forward.ground``) from string rules and a type string, and
+``RuleGrounder.run_bc_many`` returns each pool's groundings as a ``RuleGroundings`` (the old field names).
 
     fact_index = TensorFactIndex(facts, num_predicates, num_entities, device=...)
     grounder = create_grounder("enum.fp_batch.w1.d2.flat", fact_index=fact_index, rules=rules, kb=vocab, device=...)
@@ -16,6 +16,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from grounder.base.types import RuleGroundings
+from grounder.forward import Forward
 from grounder.kb import KB
 from grounder.pbc import PBC
 
@@ -46,18 +47,20 @@ class TensorFactIndex(nn.Module):
 
 
 class RuleGrounder(nn.Module):
-    """A PBC grounder over string rules (``input_rule[i]``: rule ``i``'s index in ``rules``; ``input_body[i]``: the
-    input position of each of its body columns)."""
+    """A PBC grounder, or forward chaining's witnesses for a ``closure`` type, over string rules (``input_rule[i]``: rule
+    ``i``'s index in ``rules``; ``input_body[i]``: the input position of each of its body columns)."""
 
     def __init__(self, grounder_type: str, fact_index: TensorFactIndex, rules: list, vocab, device) -> None:
         super().__init__()
         facts = torch.stack([fact_index.fact_preds, fact_index.fact_subjs, fact_index.fact_objs], 1)
         self.kb = KB.from_strings(facts, rules, vocab.entity2id, vocab.relation2id, device=device)
-        self.pbc = PBC.parse(self.kb, grounder_type)
+        self.impl = (Forward(self.kb) if grounder_type.split(".")[0] == "closure"
+                     else PBC.parse(self.kb, grounder_type))
         self.fact_index = fact_index
         self.input_rule: List[int] = self.kb.rules.order.tolist()
         self.input_body: List[List[int]] = self.kb.rules.body_order
-        self._inner = SimpleNamespace(depth=self.pbc.depth, kb=SimpleNamespace(predicate_no=len(vocab.relation2id)))
+        depth = self.impl.depth if isinstance(self.impl, PBC) else 1      # (forward chaining's: one lookup)
+        self._inner = SimpleNamespace(depth=depth, kb=SimpleNamespace(predicate_no=len(vocab.relation2id)))
 
     def fast(self) -> bool:
         return self.kb.device.type == "cuda"
@@ -65,7 +68,7 @@ class RuleGrounder(nn.Module):
     def run_bc_many(self, queries: Tensor, query_mask: Tensor, *, depth: Optional[int] = None,
                     stats: Optional[list] = None) -> List[RuleGroundings]:
         """Each pool's groundings, for ``queries [S, Q, 3]``."""
-        g = self.pbc.ground(queries, query_mask, depth=depth, stats=stats)
+        g = self.impl.ground(queries, query_mask, depth=depth, stats=stats)
         S, R, M = queries.shape[0], len(self.kb.rules), g.body.shape[1]
         n_atoms, n_rows = g.atom_offsets.diff(), g.offsets[:, -1] - g.offsets[:, 0]
         row_pool = torch.repeat_interleave(torch.arange(S, device=g.rule.device), n_rows)
@@ -84,7 +87,7 @@ class RuleGrounder(nn.Module):
 
 
 def create_grounder(grounder_type: str, *, fact_index: TensorFactIndex, rules, kb, device, **_) -> RuleGrounder:
-    """A PBC grounder from a type string (``enum.fp_batch.w1.d2.flat``, ``enum.keras.w1.d2.r2.flat``, ...); the
+    """A grounder from a type string (``enum.fp_batch.w1.d2.flat``, ``enum.keras.w1.d2.r2.flat``, ``closure``, ...); the
     former sizing knobs (``max_groundings``, ``max_states``, ``chunk_size``, ...) are accepted and ignored."""
     return RuleGrounder(grounder_type, fact_index, rules, kb, device)
 

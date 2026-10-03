@@ -108,7 +108,7 @@ def _setup(seed: int = 0, E: int = 30, F: int = 160):
 def test_keras_walk_rounds_parse(grounder_type, rounds):
     """``.r<N>``: the proof walk's rounds (the later keras-ns walks depth rounds, the IJCAI-25 code depth - 1)."""
     rg, _ = _groundings(grounder_type, [(0, A, Z)])
-    assert rg.pbc.rounds == rounds
+    assert rg.impl.rounds == rounds
 
 
 @pytest.mark.parametrize("grounder_type", ["enum.keras.w1.d2.flat", "enum.keras.w1.d3.flat", "enum.keras.w1.d3.r3.flat"])
