@@ -5,10 +5,11 @@ unique; the live (goal, variant) pairs enumerate their free variables through th
 is enumerated in a fused kernel (``kernels.last_stage``) that also tests every candidate grounding (width, cycle,
 head-predicate provability; existence through a fact hash set) and writes only the kept ones. A kept grounding's
 unknown atoms (at most the width) are the next step's goals; a (goal, variant) row none of whose candidates can be kept
-is not walked (``kernels.live_count``). With fp_batch, the step before the last keeps only the groundings whose unknown
-atom can still be proved (a fact, an earlier step's goal, or a goal some rule could ground at the last step:
-``kernels.live_atoms``). With keras on a large pool, the last step writes only the groundings whose unknown atoms can be
-proved at all (``_keras_last_step``). The groundings are then filtered by the rules' variable bindings and pruned:
+is not walked (``kernels.live_count``). A step walks its candidates in chunks of at most ``ROWS`` rows. With fp_batch,
+the step before the last keeps only the groundings whose unknown atom can still be proved (an earlier step's goal, or
+a goal some rule could ground at the last step: ``kernels.live_atoms``). With keras (width <= 1), a step writing more
+than ``KERAS_STORE_ROWS`` groundings keeps only those whose unknown atom can be proved at all, grounding it again as
+the proved atoms grow (``_keras_closure``). The groundings are then filtered by the rules' variable bindings and pruned:
 fp_batch to the provable ones (``depth`` rounds of propagation from the facts), keras first to those whose unknown atom
 can be proved at all (``_keras_provable``), then by keras-ns's proof walk (``_keras_proved``). They are made canonical
 (unique atoms and groundings, sorted) and each pool's queries are added to its atoms.
@@ -18,13 +19,12 @@ what grounding it alone gives.
 """
 from __future__ import annotations
 
-import itertools
 from typing import List, Optional
 
 import torch
 from torch import Tensor
 
-from grounder.ops import decode, key, unique_rows
+from grounder.ops import decode, groups, key, unique_rows
 from grounder.pbc.guide import select
 from grounder.pbc.kernels import HashSet, expand, last_stage, live_atoms
 from grounder.types import Groundings
@@ -89,7 +89,9 @@ def _cheapest_variant(g, facts: FactTable, goals: Tensor, n: Tensor, rule: Tenso
     return n[keep], rule[keep]
 
 
-ROWS = 1 << 24       # the most candidate rows a step holds at once: it runs in chunks of goals and of rows
+ROWS = 1 << 24       # about the most candidate rows a step holds at once: it runs in chunks of goals and of rows
+WALK = 1 << 27       # the most candidates one walk of the fused kernel may keep (its output buffers: 8 bytes each)
+
 
 
 def _candidates(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[Tensor]):
@@ -98,7 +100,7 @@ def _candidates(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[
     t, V = g.tables, g.tables.V
     n, r = torch.nonzero(t.by_pred_mask[goals[:, 0]], as_tuple=True)        # the live (goal, variant) pairs
     rule = t.by_pred[goals[n, 0], r]
-    if width == 0 and g.prune != "keras":
+    if width == 0:
         n, rule = _cheapest_variant(g, facts, goals, n, rule)
     src = goals[n, 1:]                                                         # [T, 2 + bound free vars]
     no_free = ~t.has_free[rule]
@@ -113,12 +115,8 @@ def _candidates(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[
         one = no_free | ~t.fv_valid[rule, fv]            # a variant without it keeps its row once
         if fv == last - 1 and not facts.every:  # the variable before the last: one kernel, with the last one's slices
             start, count = facts.slots(t.fv_pred[rule, fv], bound, t.fv_dir[rule, fv], one)
-            # rows grouped so that each group expands to at most ROWS rows (a row larger than that alone)
-            group = (count.cumsum(0) - count) // ROWS
-            ends = torch.searchsorted(group, torch.arange(int(group[-1]) + 1 if group.numel() else 0,
-                                                          device=group.device), right=True).tolist()
             a = 0
-            for b in ends:
+            for b in groups(count, ROWS):
                 yield expand(src[a:b], rule[a:b], n[a:b], start[a:b], count[a:b], one[a:b], facts.values,
                              t.fv_src[:, last], t.fv_pred[:, last], t.fv_dir[:, last],
                              ~t.has_free | ~t.fv_valid[:, last], facts.start, facts.count, facts.P, facts.E,
@@ -139,47 +137,65 @@ def _candidates(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[
 
 
 def _chunks(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[Tensor]):
-    """``(first goal, cand)``: a step's candidate rows, a chunk of goals at a time (each goal's variants at most
-    ``ROWS`` rows), each chunk's rows in chunks of at most ``ROWS`` (``_candidates``; ``n`` local to the chunk)."""
-    per = max(1, ROWS // max(g.tables.by_pred.shape[1], 1))
-    for s in range(0, goals.shape[0], per):
-        for cand in _candidates(g, facts, goals[s:s + per], width, heads):
-            yield s, cand
+    """``(first goal, end goal, cand)``: a step's candidate rows (``_candidates``; ``n`` local to the chunk), a chunk
+    of goals at a time (about ``ROWS`` (goal, variant) rows)."""
+    s = 0
+    for e in groups(g.tables.n_by_pred[goals[:, 0]], ROWS):
+        for cand in _candidates(g, facts, goals[s:e], width, heads):
+            yield s, e, cand
+        s = e
 
 
-def _step(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[Tensor], want_next: bool,
-          cands=None, live=None, pool: Optional[Tensor] = None):
-    """One step over ``goals`` ``[N, 3]``: the kept groundings as (rule, goal row, body) and, with ``want_next``,
-    their unknown body atoms as (kept grounding, body slot). The candidate rows (``_chunks``, or ``cands``) are walked a
-    chunk at a time: the last free variable, with every test of the groundings, in ``kernels.last_stage`` (``live``:
-    an unknown atom must also be in this key set, keyed with its goal's ``pool``). Only the kept groundings of a chunk
-    outlive it."""
+def _walk(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[Tensor], cands=None, live=None,
+          pool: Optional[Tensor] = None, admit=None):
+    """One step over ``goals`` ``[N, 3]``, a chunk of candidate rows (``_chunks``, or ``cands``) at a time, walked
+    ``WALK`` candidates at a time: the kept groundings, ``ROWS`` at a time, as (rule [K], goal row [K], body
+    [K, M, 3]). The last free variable, with every test of the groundings, in ``kernels.last_stage`` (``live``: an
+    unknown atom must also be in this key set, keyed with its goal's ``pool``), then ``admit(goal row, body)``, a
+    ``[K]`` mask, if given. Only the kept groundings outlive their turn."""
     t, pad, M, V = g.tables, g.kb.pad, g.tables.M, g.tables.V
-    per = max(1, ROWS // max(t.by_pred.shape[1], 1))
     arg_src = t.arg_src.clamp(max=1 + V)
-    rules, ns, bodies = [], [], []
-    for s, (src, rule, n, start, count, one) in (cands if cands is not None else _chunks(g, facts, goals, width,
-                                                                                         heads)):
-        chunk = goals[s:s + per]
-        rows, vals = last_stage(src, rule, n, chunk, start, count, one, facts.values, arg_src, t.body_pred, t.n_body,
-                                g.enumerated, heads, facts.seen, pad, width, facts.count, facts.P, facts.E,
-                                cycle="unknown" if g.prune == "keras" else "all", live_set=live,
-                                seg=None if pool is None else pool[s:s + per])
-        n, rule = n[rows], rule[rows]
-        pad_cols = src.new_zeros(rows.shape[0], max(1 + V - src.shape[1], 0))   # (none when no rule has a free var)
-        src = torch.cat([src[rows], vals.unsqueeze(1), pad_cols], 1)[:, :2 + V]
-        args = src.unsqueeze(1).expand(-1, M, -1).gather(-1, arg_src[rule])
-        body = torch.cat([t.body_pred[rule].unsqueeze(-1), args], -1)             # [K, M, 3]
-        active = torch.arange(M, device=goals.device) < t.n_body[rule].unsqueeze(1)
-        rules.append(t.rule[rule])
-        ns.append(n + s)
-        bodies.append(body.masked_fill(~active.unsqueeze(-1), pad))
-    if not rules:
+    for s, e, (src, rule, n, start, count, one) in (cands if cands is not None else _chunks(g, facts, goals, width,
+                                                                                            heads)):
+        chunk = goals[s:e]
+        for rows, vals in last_stage(src, rule, n, chunk, start, count, one, facts.values, arg_src, t.body_pred,
+                                     t.n_body, g.enumerated, heads, facts.seen, pad, width, facts.count, facts.P,
+                                     facts.E, cycle="unknown" if g.prune == "keras" else "all", live_set=live,
+                                     seg=None if pool is None else pool[s:e], limit=WALK):
+            for a in range(0, rows.shape[0], ROWS):                    # its kept groundings, ROWS at a time
+                row, val = rows[a:a + ROWS], vals[a:a + ROWS]
+                nk, rk = n[row], rule[row]
+                pad_cols = src.new_zeros(row.shape[0], max(1 + V - src.shape[1], 0))   # (none: no rule has a free var)
+                bound = torch.cat([src[row], val.unsqueeze(1), pad_cols], 1)[:, :2 + V]
+                args = bound.unsqueeze(1).expand(-1, M, -1).gather(-1, arg_src[rk])
+                body = torch.cat([t.body_pred[rk].unsqueeze(-1), args], -1)            # [K, M, 3]
+                active = torch.arange(M, device=goals.device) < t.n_body[rk].unsqueeze(1)
+                body = body.masked_fill(~active.unsqueeze(-1), pad)
+                if admit is not None:
+                    ok = admit(nk + s, body)
+                    nk, rk, body = nk[ok], rk[ok], body[ok]
+                yield t.rule[rk], nk + s, body
+
+
+def _cat(parts) -> Tensor:
+    """``torch.cat`` of the parts, the one part itself (no copy) when there is one."""
+    return parts[0] if len(parts) == 1 else torch.cat(parts)
+
+
+def _unknown(g, facts: FactTable, body: Tensor):
+    """The (grounding, slot) pairs of the body atoms ``[K, M, 3]`` that are no facts."""
+    return torch.nonzero((body[..., 0] != g.kb.pad) & ~facts.seen.contains(body), as_tuple=True)
+
+
+def _step(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[Tensor], want_next: bool, **walk):
+    """``_walk``'s groundings of a step, together: (rule, goal row, body) and, with ``want_next``, their unknown body
+    atoms as (kept grounding, body slot)."""
+    parts = list(_walk(g, facts, goals, width, heads, **walk))
+    if not parts:
         z = goals.new_zeros(0)
-        return z, z, goals.new_zeros(0, M, 3), ((z, z) if want_next else None)
-    body = torch.cat(bodies) if len(bodies) > 1 else bodies[0]
-    nxt = torch.nonzero((body[..., 0] != pad) & ~facts.seen.contains(body), as_tuple=True) if want_next else None
-    return torch.cat(rules), torch.cat(ns), body, nxt
+        return z, z, goals.new_zeros(0, g.tables.M, 3), ((z, z) if want_next else None)
+    r, n, b = (_cat(x) for x in zip(*parts))
+    return r, n, b, (_unknown(g, facts, b) if want_next else None)
 
 
 def _live_tables(g, facts: FactTable):
@@ -218,57 +234,126 @@ def _live_goals(g, facts: FactTable, goals: Tensor) -> Tensor:
                       t.n_body, facts.seen)
 
 
-def _provable_next(g, facts: FactTable, pool: Tensor, r: Tensor, n: Tensor, b: Tensor, nxt, prior: Tensor,
-                   base: int):
-    """The groundings of the step before the last, less those whose unknown atom cannot be proved, so fp_batch would
-    drop them: the atom is not a fact, no rule could ground it at the last step, and it is no goal of an earlier step
-    (its only groundings would be the last step's). Their unknown atoms are the last step's goals."""
-    row, slot = nxt
-    atoms = b[row, slot]
-    k = key(atoms, base, pool[n[row]])
-    ok = HashSet.of_keys(prior).contains_keys(k)
-    ok |= _live_goals(g, facts, atoms)
-    keep = torch.ones(r.shape[0], dtype=torch.bool, device=r.device)
-    keep[row[~ok]] = False
-    new = torch.cumsum(keep, 0) - 1
-    return r[keep], n[keep], b[keep], (new[row[ok]], slot[ok])
+def _provable(g, facts: FactTable, pool: Tensor, prior: Tensor, base: int):
+    """fp_batch's ``admit`` for the step before the last: a grounding only if each unknown atom can be proved — a goal
+    of an earlier step or this one (``prior``, keyed with ``pool``), or one some rule could ground at the last step
+    (width 0). Else no grounding of the atom is kept (its only ones would be the last step's), so neither is this one;
+    the atom is no goal of the last step."""
+    known = HashSet.of_keys(prior)
+
+    def admit(n: Tensor, body: Tensor) -> Tensor:
+        row, slot = _unknown(g, facts, body)
+        atoms = body[row, slot]
+        ok = known.contains_keys(key(atoms, base, pool[n[row]])) | _live_goals(g, facts, atoms)
+        keep = torch.ones(body.shape[0], dtype=torch.bool, device=body.device)
+        keep[row[~ok]] = False
+        return keep
+    return admit
 
 
-KERAS_CLOSURE_MIN_ROWS = 1 << 18       # below it (training batches, Countries) writing every candidate costs less
+KERAS_STORE_ROWS = 1 << 24             # a step writing more groundings is grounded again in each round of the closure
+KERAS_CLOSURE_MIN_ROWS = 1 << 18       # a last step with fewer candidate rows (training batches, Countries) writes all
+KERAS_CACHE_ROWS = 1 << 25             # a step grounded again keeps up to this many candidate rows for the next round
 
 
-def _keras_last_step(g, facts: FactTable, goals: Tensor, pool: Tensor, width: int, heads: Optional[Tensor],
-                     atoms: List[Tensor], bodies: List[Tensor], pools: List[Tensor], base: int):
-    """The keras filter's last step over ``goals`` (of ``pool``), grounding only what ``_keras_provable`` keeps: its
-    groundings whose unknown atom lies in the least fixed point of the provable atoms (reached from the all-fact
-    groundings of every step), found by grounding again as the set grows (Kleene iteration from the empty set).
-    ``atoms`` / ``bodies`` / ``pools``: the earlier steps' groundings' heads, bodies and pools."""
-    gen = _chunks(g, facts, goals, width, heads)
-    first = list(itertools.islice(gen, 2))
-    cands = first if len(first) == 1 else None          # one chunk: reused by every round; more: made again each round
-    if cands is not None and cands[0][1][1].shape[0] < KERAS_CLOSURE_MIN_ROWS:   # few: writing them all costs less
-        return _step(g, facts, goals, width, heads, False, cands=cands)[:3]
-    del first, gen
-    head, body, bpool = torch.cat(atoms), torch.cat(bodies), torch.cat(pools)
-    row, slot = torch.nonzero((body[..., 0] != g.kb.pad) & ~facts.facts.contains(body), as_tuple=True)
-    ukey, hkey = key(body[row, slot], base, bpool[row]), key(head, base, bpool)
-    proved = hkey.new_zeros(0)
+def _cached(g, facts: FactTable, goals: Tensor, width: int, heads: Optional[Tensor]):
+    """A step's chunks of candidate rows as a list, to walk them again, when they are at most ``KERAS_CACHE_ROWS`` rows
+    in all; else None (made again each walk)."""
+    chunks, rows = [], 0
+    for c in _chunks(g, facts, goals, width, heads):
+        rows += c[2][1].shape[0]
+        if rows > KERAS_CACHE_ROWS:
+            return None
+        chunks.append(c)
+    return chunks
+
+
+def _keras_closure(g, facts: FactTable, stored: List[tuple], streamed: List[tuple], base: int):
+    """The keras filter (width <= 1) without writing what it drops: each ``streamed`` step's groundings whose unknown
+    atom lies in the least fixed point of the provable atoms — the heads of the groundings, ``stored`` ``(head, body,
+    pool)`` or streamed, whose unknown atom is in it — found by grounding the streamed steps ``(goals, pool, width,
+    heads, cands)`` (``cands``: ``_cached``'s) again as it grows (Kleene iteration from the empty set).
+    ``_keras_provable`` keeps the same."""
+    if stored:
+        head, body, bpool = (_cat(x) for x in zip(*stored))
+        row, slot = _unknown(g, facts, body)
+        ukey, hkey = key(body[row, slot], base, bpool[row]), key(head, base, bpool)
+    proved = torch.zeros(0, dtype=torch.long, device=facts.values.device)
     while True:
         live = HashSet.of_keys(proved)
-        r, n, b, _ = _step(g, facts, goals, width, heads, False, cands=cands, live=live, pool=pool)
-        ok = torch.ones_like(hkey, dtype=torch.bool)
-        ok[row[~live.contains_keys(ukey)]] = False
-        grown = torch.unique(torch.cat([hkey[ok], key(goals[n], base, pool[n])]))
+        out = [_step(g, facts, goals, width, heads, False, cands=c, live=live, pool=p)[:3]
+               for goals, p, width, heads, c in streamed]
+        grown = [key(goals[n], base, p[n]) for (_, n, _), (goals, p, *_) in zip(out, streamed)]
+        if stored:
+            ok = torch.ones_like(hkey, dtype=torch.bool)
+            ok[row[~live.contains_keys(ukey)]] = False
+            grown.append(hkey[ok])
+        grown = torch.unique(torch.cat(grown))
         if grown.shape[0] == proved.shape[0]:
-            return r, n, b
+            return out
         proved = grown
+
+
+def _keras_steps(g, facts: FactTable, k: Tensor, base: int, depth: int, stats: Optional[list]):
+    """``_ground_steps`` with keras (width <= 1, no guide): each step's goals, the unknown atoms of the last step's
+    groundings, found a chunk at a time; a step writing at most ``KERAS_STORE_ROWS`` groundings keeps them, a larger one
+    only those the keras filter can keep (``_keras_closure``), so it never sits in memory whole. So does the last step
+    unless it has fewer than ``KERAS_CLOSURE_MIN_ROWS`` candidate rows: what it drops would be most of what the proof
+    walk walks."""
+    steps = []                                          # (goals, pool, width, cached chunks, groundings or None)
+    for d in range(depth):
+        k = torch.unique(k)
+        if k.shape[0] == 0:
+            break
+        p, atoms = decode(k, base, pool=True)
+        last = d == depth - 1
+        width = g.last_width if last else g.width
+        if last and d > 0:
+            cands = _cached(g, facts, atoms, width, g.tables.heads)
+            if cands is None or sum(c[2][1].shape[0] for c in cands) >= KERAS_CLOSURE_MIN_ROWS:
+                steps.append((atoms, p, width, cands, None))
+                break
+            steps.append((atoms, p, width, None, _step(g, facts, atoms, width, g.tables.heads, False, cands=cands)[:3]))
+            break
+        parts, nxt, rows = [], [], 0
+        for part in _walk(g, facts, atoms, width, g.tables.heads):
+            if not last:
+                row, slot = _unknown(g, facts, part[2])
+                nxt.append(key(part[2][row, slot], base, p[part[1][row]]))
+                del row, slot
+            rows += part[0].shape[0]
+            parts = parts if parts is not None and rows <= KERAS_STORE_ROWS else None
+            if parts is not None:
+                parts.append(part)
+            del part                                    # (no chunk outlives its turn)
+        if parts is not None:
+            z = atoms.new_zeros(0)
+            parts = (tuple(_cat(x) for x in zip(*parts)) if parts else (z, z, atoms.new_zeros(0, g.tables.M, 3)))
+        steps.append((atoms, p, width, None if parts is not None else _cached(g, facts, atoms, width, g.tables.heads),
+                      parts))
+        k = _cat(nxt) if nxt else atoms.new_zeros(0)
+    if not steps:
+        z = k.new_zeros(0)
+        return z, k.new_zeros(0, 3), k.new_zeros(0, g.tables.M, 3), z
+    out = [None if s[4] is None else (s[4][0], s[0][s[4][1]], s[4][2], s[1][s[4][1]]) for s in steps]
+    big = [i for i, s in enumerate(steps) if s[4] is None]               # (rule, head, body, pool) per step
+    if big:
+        stored = [o[1:] for o in out if o is not None]                   # (head, body, pool)
+        streamed = [(atoms, p, width, g.tables.heads, cands) for atoms, p, width, cands, _ in (steps[i] for i in big)]
+        for i, (r, n, b) in zip(big, _keras_closure(g, facts, stored, streamed, base)):
+            out[i] = r, steps[i][0][n], b, steps[i][1][n]
+    if stats is not None:
+        stats.extend((d, int(s[0].shape[0]), int(o[0].shape[0])) for d, (s, o) in enumerate(zip(steps, out)))
+    return tuple(_cat(x) for x in zip(*out))
 
 
 def _ground_steps(g, facts: FactTable, goals: Tensor, pool: Tensor, base: int, depth: int, stats: Optional[list]):
     """Every step's kept groundings of the queries ``goals`` (of ``pool``): ``(rule [T], head [T, 3],
     body [T, M, 3], pool [T])``, possibly repeated; each step's (depth, goals, kept groundings) appended to ``stats``."""
-    rules, heads_, bodies, pools = [], [], [], []
     k = key(goals, base, pool)
+    if g.prune == "keras" and g.width <= 1 and depth >= 2 and g.guide is None:
+        return _keras_steps(g, facts, k, base, depth, stats)
+    rules, heads_, bodies, pools = [], [], [], []
     prior = []                                          # each step's goals
     for d in range(depth):
         if k.shape[0] == 0:
@@ -279,12 +364,13 @@ def _ground_steps(g, facts: FactTable, goals: Tensor, pool: Tensor, base: int, d
         p, atoms = decode(k, base, pool=True)
         width = g.last_width if last else g.width
         hpm = None if last and g.prune != "keras" else g.tables.heads
-        if last and d > 0 and g.prune == "keras" and g.width <= 1:
-            (r, n, b), nxt = _keras_last_step(g, facts, atoms, p, width, hpm, heads_, bodies, pools, base), None
+        admit = _provable(g, facts, p, torch.cat(prior), base) if d == depth - 2 and g.prune == "fp_batch" else None
+        if last and d > 0 and g.prune == "keras" and g.width <= 1:    # (the guide's: its selections are stored)
+            (r, n, b), = _keras_closure(g, facts, list(zip(heads_, bodies, pools)),
+                                        [(atoms, p, width, hpm, _cached(g, facts, atoms, width, hpm))], base)
+            nxt = None
         else:
-            r, n, b, nxt = _step(g, facts, atoms, width, hpm, not last)
-        if d == depth - 2 and g.prune == "fp_batch" and nxt[0].numel():
-            r, n, b, nxt = _provable_next(g, facts, p, r, n, b, nxt, torch.cat(prior), base)
+            r, n, b, nxt = _step(g, facts, atoms, width, hpm, not last, admit=admit)
         if g.guide is not None and r.numel():            # the guide's selection, then the next goals of what it kept
             fact = facts.facts.contains(b)
             keep = select(g.guide, fact, r, n, b, p[n], d, g.kb.pad)

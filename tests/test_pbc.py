@@ -67,11 +67,17 @@ def test_guide(name):
 @pytest.mark.parametrize("name", ["countries_s3", "family"])
 @pytest.mark.parametrize("prune", ["fp_batch", "keras"])
 def test_chunked_steps_change_nothing(name, prune, monkeypatch):
-    """A step walks its candidate rows in chunks (``engine.ROWS``): tiny chunks give the same groundings."""
+    """A step walks its candidate rows in chunks (``engine.ROWS``), and with keras grounds a step writing more than
+    ``engine.KERAS_STORE_ROWS`` groundings again in each round of the closure: tiny ones give the same groundings."""
     from grounder.pbc import engine
+    last_stage = engine.last_stage
     kb, q = _kb(name)
     whole = PBC(kb, depth=3, width=1, prune=prune).ground(q[:256])
-    monkeypatch.setattr(engine, "ROWS", 37)
+    monkeypatch.setattr(engine, "ROWS", 1000)
+    monkeypatch.setattr(engine, "KERAS_STORE_ROWS", 3000)
+    walks = []
+    monkeypatch.setattr(engine, "last_stage", lambda *a, **k: walks.append(1) or last_stage(*a, **k))
     chunked = PBC(kb, depth=3, width=1, prune=prune).ground(q[:256])
+    assert len(walks) > 6                                       # several per step
     for a, b in zip(whole, chunked):
         assert torch.equal(a, b)

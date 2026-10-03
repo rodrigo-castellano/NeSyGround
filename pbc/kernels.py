@@ -12,12 +12,14 @@ candidates -> 0.5M kept), so the kept ones are the only ones that reach memory.
 """
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Iterator, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 from torch import Tensor
+
+from grounder.ops import groups
 
 EMPTY = -1       # an empty slot (keys are non-negative)
 BLOCK = 128
@@ -437,7 +439,7 @@ def last_stage(src: Tensor, rule: Tensor, n: Tensor, goals: Tensor, start: Tenso
                values: Tensor, arg_src: Tensor, body_pred: Tensor, n_body: Tensor, known: Tensor,
                head_pred_mask: Optional[Tensor], facts: HashSet, pad: int, width: int, slot_count: Tensor, P: int,
                E: int, cycle: str = "all", live_set: Optional[HashSet] = None,
-               seg: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+               seg: Optional[Tensor] = None, limit: Optional[int] = None) -> Iterator[Tuple[Tensor, Tensor]]:
     """The kept ``(row, value)`` pairs of rows ``src [T, W]`` (rule ``rule [T]``, goal ``goals[n] [T, 3]``) whose
     source column ``W`` walks ``values[start : start + count]`` (``one``: a single 0); ``arg_src [R, M, 2]`` holds
     each body argument's source column (past ``W``: 0), ``known [R, M]`` the body atoms an enumeration drew from
@@ -446,31 +448,38 @@ def last_stage(src: Tensor, rule: Tensor, n: Tensor, goals: Tensor, start: Tenso
     holds its own goal is dropped (``"all"``), or only when that atom is not a fact or holds it twice (``"unknown"``:
     keras-ns, which draws one body atom from the facts and rejects the goal among the others; it adds a one-body rule's
     grounding with no test at all, its proof walk alone decides). ``live_set``: an unknown atom must also be in this
-    key set, keyed with its goal's batch ``seg [N]`` (``fast._key``)."""
+    key set, keyed with its goal's batch ``seg [N]`` (``fast._key``). Yields the pairs of consecutive groups of rows
+    with at most ``limit`` candidates that can be kept (bar a row with more), one walk each, so the output buffers of
+    one group are held at a time."""
     T, W = src.shape
     dev = src.device
     src, rule = src.contiguous(), rule.contiguous()
     live = live_count(src, rule, count, arg_src, body_pred, n_body, known, head_pred_mask, facts, width, slot_count, P,
                       E, skip_known=True, one_untested=cycle == "unknown")
-    total, n_live = torch.stack([live.sum(), (live > 0).sum()]).tolist() if T else (0, 0)
     known8, M = known.to(torch.int8).contiguous(), body_pred.shape[1]
     hpm = (head_pred_mask.to(torch.int8) if head_pred_mask is not None
            else torch.zeros(1, dtype=torch.int8, device=dev))
-    rows = torch.empty(total, dtype=torch.int32, device=dev)
-    vals = torch.empty(total, dtype=torch.int32, device=dev)
-    counter = torch.zeros(1, dtype=torch.int32, device=dev)
-    if n_live:
-        # the live rows by candidate count (a block's lanes walk as many; an 8-bit key: one radix pass)
-        order = torch.sort(live.clamp(max=255).to(torch.uint8))[1][T - n_live:].int()
-        _last_stage[(triton.cdiv(n_live, BLOCK),)](
-            order, src, W, rule, n.contiguous(), goals.contiguous(), start.contiguous(), live,
-            one.to(torch.int8).contiguous(), values, values.numel(), arg_src.contiguous(), body_pred.contiguous(),
-            n_body.contiguous(), known8, hpm, hpm.numel(), facts.table, facts.base, pad, width, rows, vals, counter,
-            n_live, live_set.table if live_set is not None else facts.table,
-            seg.contiguous() if live_set is not None else n,
-            M=M, MP=triton.next_power_of_2(M), U=UNROLL, HPM=head_pred_mask is not None,
-            LOG2T=facts.log2t, BLOCK=BLOCK, CYCLE={"all": 1, "unknown": 2}[cycle], LIVE=live_set is not None,
-            LIVE_LOG2T=live_set.log2t if live_set is not None else 4)
-    k = int(counter.item())
-    rows, vals = rows[:k], vals[:k]
-    return rows.long(), vals.long()
+    n, goals, start, one8 = n.contiguous(), goals.contiguous(), start.contiguous(), one.to(torch.int8).contiguous()
+    ends = [T] if limit is None or T == 0 else groups(live, limit)
+    a = 0
+    for b in ends:
+        part = live[a:b]
+        total, n_live = torch.stack([part.sum(), (part > 0).sum()]).tolist() if b > a else (0, 0)
+        rows = torch.empty(total, dtype=torch.int32, device=dev)
+        vals = torch.empty(total, dtype=torch.int32, device=dev)
+        counter = torch.zeros(1, dtype=torch.int32, device=dev)
+        if n_live:
+            # the live rows by candidate count (a block's lanes walk as many; an 8-bit key: one radix pass)
+            order = (torch.sort(part.clamp(max=255).to(torch.uint8))[1][b - a - n_live:] + a).int()
+            _last_stage[(triton.cdiv(n_live, BLOCK),)](
+                order, src, W, rule, n, goals, start, live, one8, values, values.numel(), arg_src.contiguous(),
+                body_pred.contiguous(), n_body.contiguous(), known8, hpm, hpm.numel(), facts.table, facts.base, pad,
+                width, rows, vals, counter, n_live, live_set.table if live_set is not None else facts.table,
+                seg.contiguous() if live_set is not None else n,
+                M=M, MP=triton.next_power_of_2(M), U=UNROLL, HPM=head_pred_mask is not None,
+                LOG2T=facts.log2t, BLOCK=BLOCK, CYCLE={"all": 1, "unknown": 2}[cycle], LIVE=live_set is not None,
+                LIVE_LOG2T=live_set.log2t if live_set is not None else 4)
+        k = int(counter.item())
+        yield rows[:k].long(), vals[:k].long()
+        a = b
+

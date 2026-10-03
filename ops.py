@@ -54,3 +54,13 @@ def unique_rows(cols: List[Tensor], radix: List[int]) -> List[Tensor]:
 
 
 __all__ = ["key", "decode", "unique_rows"]
+
+
+def groups(count: Tensor, limit: int) -> List[int]:
+    """The ends of consecutive groups of rows with ``count`` each, a group's rows but its last starting within
+    ``limit`` of its first (so at most ``limit`` in all, but for a row with more)."""
+    if count.numel() == 0:
+        return []
+    if int(count.sum()) <= limit:
+        return [count.numel()]
+    return torch.unique_consecutive((count.cumsum(0) - count) // limit, return_counts=True)[1].cumsum(0).tolist()

@@ -48,7 +48,6 @@ def select(guide: Guide, fact: Tensor, rule: Tensor, goal: Tensor, body: Tensor,
     if T == 0:
         return torch.ones(0, dtype=torch.bool, device=rule.device)
     unknown = (body[..., 0] != pad) & ~fact                                            # [T, M]
-    exempt = ~unknown.any(1)
     rows, inv = torch.unique(torch.cat([goal.unsqueeze(1), rule.unsqueeze(1), body.flatten(1)], 1), dim=0,
                              return_inverse=True)                         # canonical: by goal, rule, body atoms
     first = torch.full((rows.shape[0],), T, dtype=torch.long, device=rule.device).scatter_reduce(

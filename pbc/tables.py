@@ -12,7 +12,7 @@ later atom. Per variant ``i`` (rule-major, then anchor):
     arg_src [R', M, 2]        each body argument's column, in the rule's given body order (so every variant of a rule
                               writes its groundings' body columns alike)
     body_pred [R', M]         the body's predicates, in the given order
-    by_pred [P, K], by_pred_mask [P, K]   the variants of head predicate p
+    by_pred [P, K], by_pred_mask [P, K]   the variants of head predicate p (n_by_pred [P]: how many)
     heads [P]                 the predicates some rule concludes
     fv_used                   per free variable, whether some variant has it
     enumerated [R', M]        the body atoms a lookup draws from the facts (never tested: facts by construction)
@@ -75,6 +75,7 @@ class Tables:
         starts = offsets[:-1].unsqueeze(1)
         self.by_pred = by_pred[(starts + pos).clamp(0, max(len(variants) - 1, 0))]
         self.by_pred_mask = pos < offsets.diff().unsqueeze(1)
+        self.n_by_pred = offsets.diff()
         heads = torch.zeros(P, dtype=torch.bool)
         heads[torch.tensor([p.head_pred_idx for p in patterns], dtype=torch.long)] = True
         self.rule, self.n_body, self.has_free = rule, n_body, has_free
