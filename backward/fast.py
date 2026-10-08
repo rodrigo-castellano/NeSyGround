@@ -118,12 +118,38 @@ def _enumerated_atoms(g) -> Tensor:
     return known
 
 
+def _cheapest_variant(g, facts: _Facts, goals: Tensor, n: Tensor, rule: Tensor):
+    """At a width-0 step every body atom must be a fact, so each anchor variant of a rule keeps the same groundings (the
+    dedup merges them): keep one (goal, rule) row per goal and original rule, the variant whose first free variable
+    has the fewest facts to enumerate for this goal (ties: the first variant). Same groundings, a fraction of the rows
+    on a hub (YAGO3-10: a person's facts through a country's thousands)."""
+    orig = g._variant_to_orig_t[rule]
+    has = g.has_free[rule] & g.fv_enum_valid[rule, 0]
+    bound = goals[n, 1:].gather(1, g.fv_enum_bound_src[rule, 0].clamp(max=1).unsqueeze(1)).squeeze(1)
+    _, count = facts.slots(g.fv_enum_pred[rule, 0], bound, g.fv_enum_direction[rule, 0], ~has)
+    if n.numel() == 0:
+        return n, rule
+    # a rule's variants are consecutive (rule-major expansion), so a (goal, rule)'s rows are one run: no sort (a run
+    # split in two would keep two variants, which the dedup still merges)
+    key = n * (g._variant_to_orig_t.shape[0] + 1) + orig
+    inv = torch.cat([key.new_zeros(1), (key[1:] != key[:-1]).long()]).cumsum(0)
+    best = torch.full((int(inv[-1]) + 1,), torch.iinfo(count.dtype).max, dtype=count.dtype,
+                      device=count.device).scatter_reduce(0, inv, count, "amin")
+    row = torch.arange(n.shape[0], device=n.device)
+    cheapest = torch.where(count == best[inv], row, row.shape[0])
+    first = torch.full_like(best, row.shape[0]).scatter_reduce(0, inv, cheapest, "amin")
+    keep = row == first[inv]                                                    # original row order kept
+    return n[keep], rule[keep]
+
+
 def _candidates(g, facts: _Facts, goals: Tensor, width: int, head_pred_mask: Optional[Tensor]):
     """The rows of a step over ``goals`` ``[N, 3]`` whose last free variable :func:`_step` walks: ``(src, rule, n,
     start, count, one)``, the free variables but the last enumerated."""
     V = g.V
     n, r = torch.nonzero(g.pred_rule_mask[goals[:, 0]], as_tuple=True)       # the live (goal, rule) pairs
     rule = g.pred_rule_indices[goals[n, 0], r]
+    if width == 0 and getattr(g, "filter_mode", None) != "keras":
+        n, rule = _cheapest_variant(g, facts, goals, n, rule)
     src = goals[n, 1:]                                                          # [T, 2 + bound free vars]
     no_free = ~g.has_free[rule]
     enumerated = [fv for fv in range(V) if g._fv_any_valid[fv]]
