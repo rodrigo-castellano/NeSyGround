@@ -560,42 +560,42 @@
   {
    "node": "tests/datasets/test_atomic.py::test_prove_and_tnorm_produces_expected[query1-True-0.7]",
    "kind": "sld",
-   "in": "6337360620e5047f",
+   "in": "7ae37b60015ec9fe",
    "raw": "9bfc478a018c17ef",
    "canonical": "885dd56feffc45e8"
   },
   {
    "node": "tests/datasets/test_atomic.py::test_prove_and_tnorm_produces_expected[query2-False-None]",
    "kind": "sld",
-   "in": "13aa0b580f1dcfe5",
+   "in": "983428673104042f",
    "raw": "f9d7ffd922652722",
    "canonical": "10f41159d9f91704"
   },
   {
    "node": "tests/datasets/test_atomic.py::test_prove_and_tnorm_produces_expected[query3-False-None]",
    "kind": "sld",
-   "in": "4beebf162a75cf37",
+   "in": "65f5fe2927518baa",
    "raw": "4e77146e6dcf44b8",
    "canonical": "10f41159d9f91704"
   },
   {
    "node": "tests/datasets/test_causal_prob.py::test_prove_and_tnorm[query1-True]",
    "kind": "sld",
-   "in": "c67560cbccb369c4",
+   "in": "f0204eca17632fef",
    "raw": "73ac1670ea1f0d76",
    "canonical": "73c245bdaf1a5ea4"
   },
   {
    "node": "tests/datasets/test_causal_prob.py::test_prove_and_tnorm[query2-False]",
    "kind": "sld",
-   "in": "dec3fb269ef7a7c2",
+   "in": "402f1183bfd3f6a6",
    "raw": "95619957699c7022",
    "canonical": "db3c673a98fb2db5"
   },
   {
    "node": "tests/datasets/test_causal_prob.py::test_prove_and_tnorm[query3-False]",
    "kind": "sld",
-   "in": "a6bd737075992eeb",
+   "in": "6a57bd75e2b1e04f",
    "raw": "a3f02fefdfa34368",
    "canonical": "db3c673a98fb2db5"
   },
@@ -658,322 +658,322 @@
   {
    "node": "tests/datasets/test_countries.py::test_answer_stage_produces_expected_logic[query1-Uncertain]",
    "kind": "sld",
-   "in": "08aaf4409fadf083",
+   "in": "9c49fb12871c15e6",
    "raw": "23eb8c0bfc2d17e5",
    "canonical": "6c6020427ff767ce"
   },
   {
    "node": "tests/datasets/test_countries.py::test_answer_stage_produces_expected_logic[query3-True]",
    "kind": "sld",
-   "in": "6000b67171daf68d",
+   "in": "173b5cc7572324b7",
    "raw": "bd08044a427eeaa7",
    "canonical": "a65b90c45f8f36f5"
   },
   {
    "node": "tests/datasets/test_countries.py::test_answer_stage_produces_expected_logic[query4-True]",
    "kind": "sld",
-   "in": "2ffd6324568f1770",
+   "in": "928ec70222a10af6",
    "raw": "f896915389485eae",
    "canonical": "c1ad9fe213f8aa58"
   },
   {
    "node": "tests/datasets/test_countries.py::test_answer_stage_produces_expected_logic[query5-Uncertain]",
    "kind": "sld",
-   "in": "ede8b9fd83d6873e",
+   "in": "a0ada61f9250060c",
    "raw": "8637ed64216af29e",
    "canonical": "6c6020427ff767ce"
   },
   {
    "node": "tests/datasets/test_countries.py::test_answer_stage_produces_expected_logic[query6-True]",
    "kind": "sld",
-   "in": "b6c535a85744ec36",
+   "in": "6773f8ac0eed48f6",
    "raw": "49da31390053636d",
    "canonical": "c270e0456edd24a5"
   },
   {
    "node": "tests/datasets/test_countries.py::test_answer_stage_produces_expected_logic[query7-Uncertain]",
    "kind": "sld",
-   "in": "f1818b9f3ef5514e",
+   "in": "d4d5fe1103c9d428",
    "raw": "8428333280ba6eb9",
    "canonical": "6c6020427ff767ce"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[sbr_only-True-False-product-query0]",
    "kind": "sld",
-   "in": "676daf5e7581f3b4",
+   "in": "9a7f8ea75f53c789",
    "raw": "8e5b10cc9245f1de",
    "canonical": "71d0d8a56742e16c"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[sbr_only-True-False-product-query1]",
    "kind": "sld",
-   "in": "9137f60f5a31c522",
+   "in": "fd3b037033100e7b",
    "raw": "adfd1c038e81a615",
    "canonical": "892bc01bce376c58"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[sbr_only-True-False-product-query2]",
    "kind": "sld",
-   "in": "3b79f60cb5d76b49",
+   "in": "9bc3c7a72869fdb8",
    "raw": "c163e953fb4dea12",
    "canonical": "5b3449ed5b98cf23"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[cr_only-False-True-product-query0]",
    "kind": "sld",
-   "in": "676daf5e7581f3b4",
+   "in": "9a7f8ea75f53c789",
    "raw": "8e5b10cc9245f1de",
    "canonical": "71d0d8a56742e16c"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[cr_only-False-True-product-query1]",
    "kind": "sld",
-   "in": "9137f60f5a31c522",
+   "in": "fd3b037033100e7b",
    "raw": "adfd1c038e81a615",
    "canonical": "892bc01bce376c58"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[cr_only-False-True-product-query2]",
    "kind": "sld",
-   "in": "3b79f60cb5d76b49",
+   "in": "9bc3c7a72869fdb8",
    "raw": "c163e953fb4dea12",
    "canonical": "5b3449ed5b98cf23"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[hybrid1-True-True-product-query0]",
    "kind": "sld",
-   "in": "676daf5e7581f3b4",
+   "in": "9a7f8ea75f53c789",
    "raw": "8e5b10cc9245f1de",
    "canonical": "71d0d8a56742e16c"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[hybrid1-True-True-product-query1]",
    "kind": "sld",
-   "in": "9137f60f5a31c522",
+   "in": "fd3b037033100e7b",
    "raw": "adfd1c038e81a615",
    "canonical": "892bc01bce376c58"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[hybrid1-True-True-product-query2]",
    "kind": "sld",
-   "in": "3b79f60cb5d76b49",
+   "in": "9bc3c7a72869fdb8",
    "raw": "c163e953fb4dea12",
    "canonical": "5b3449ed5b98cf23"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[hybrid2_min-True-True-min-query0]",
    "kind": "sld",
-   "in": "676daf5e7581f3b4",
+   "in": "9a7f8ea75f53c789",
    "raw": "8e5b10cc9245f1de",
    "canonical": "71d0d8a56742e16c"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[hybrid2_min-True-True-min-query1]",
    "kind": "sld",
-   "in": "9137f60f5a31c522",
+   "in": "fd3b037033100e7b",
    "raw": "adfd1c038e81a615",
    "canonical": "892bc01bce376c58"
   },
   {
    "node": "tests/datasets/test_reasonprob.py::test_per_config_confidence[hybrid2_min-True-True-min-query2]",
    "kind": "sld",
-   "in": "3b79f60cb5d76b49",
+   "in": "9bc3c7a72869fdb8",
    "raw": "c163e953fb4dea12",
    "canonical": "5b3449ed5b98cf23"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[product-cr_only-query0]",
    "kind": "sld",
-   "in": "e6d95f45bd63efb4",
+   "in": "7ce2cb869d544372",
    "raw": "42b22a2ab0a0905a",
    "canonical": "6003aeda21384e7c"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[product-cr_only-query1]",
    "kind": "sld",
-   "in": "1dbcf678e4e4148a",
+   "in": "dd3271b4c819d546",
    "raw": "a4f2575391740389",
    "canonical": "5b2f4c9391c51e81"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[product-sbr_only-query0]",
    "kind": "sld",
-   "in": "e6d95f45bd63efb4",
+   "in": "7ce2cb869d544372",
    "raw": "42b22a2ab0a0905a",
    "canonical": "6003aeda21384e7c"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[product-sbr_only-query1]",
    "kind": "sld",
-   "in": "1dbcf678e4e4148a",
+   "in": "dd3271b4c819d546",
    "raw": "a4f2575391740389",
    "canonical": "5b2f4c9391c51e81"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[product-hybrid1-query0]",
    "kind": "sld",
-   "in": "e6d95f45bd63efb4",
+   "in": "7ce2cb869d544372",
    "raw": "42b22a2ab0a0905a",
    "canonical": "6003aeda21384e7c"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[product-hybrid1-query1]",
    "kind": "sld",
-   "in": "1dbcf678e4e4148a",
+   "in": "dd3271b4c819d546",
    "raw": "a4f2575391740389",
    "canonical": "5b2f4c9391c51e81"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[product-hybrid2-query0]",
    "kind": "sld",
-   "in": "e6d95f45bd63efb4",
+   "in": "7ce2cb869d544372",
    "raw": "42b22a2ab0a0905a",
    "canonical": "6003aeda21384e7c"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[product-hybrid2-query1]",
    "kind": "sld",
-   "in": "1dbcf678e4e4148a",
+   "in": "dd3271b4c819d546",
    "raw": "a4f2575391740389",
    "canonical": "5b2f4c9391c51e81"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[geomean-cr_only-query0]",
    "kind": "sld",
-   "in": "e6d95f45bd63efb4",
+   "in": "7ce2cb869d544372",
    "raw": "42b22a2ab0a0905a",
    "canonical": "6003aeda21384e7c"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[geomean-cr_only-query1]",
    "kind": "sld",
-   "in": "1dbcf678e4e4148a",
+   "in": "dd3271b4c819d546",
    "raw": "a4f2575391740389",
    "canonical": "5b2f4c9391c51e81"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[geomean-sbr_only-query0]",
    "kind": "sld",
-   "in": "e6d95f45bd63efb4",
+   "in": "7ce2cb869d544372",
    "raw": "42b22a2ab0a0905a",
    "canonical": "6003aeda21384e7c"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[geomean-sbr_only-query1]",
    "kind": "sld",
-   "in": "1dbcf678e4e4148a",
+   "in": "dd3271b4c819d546",
    "raw": "a4f2575391740389",
    "canonical": "5b2f4c9391c51e81"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[geomean-hybrid1-query0]",
    "kind": "sld",
-   "in": "e6d95f45bd63efb4",
+   "in": "7ce2cb869d544372",
    "raw": "42b22a2ab0a0905a",
    "canonical": "6003aeda21384e7c"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[geomean-hybrid1-query1]",
    "kind": "sld",
-   "in": "1dbcf678e4e4148a",
+   "in": "dd3271b4c819d546",
    "raw": "a4f2575391740389",
    "canonical": "5b2f4c9391c51e81"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[geomean-hybrid2-query0]",
    "kind": "sld",
-   "in": "e6d95f45bd63efb4",
+   "in": "7ce2cb869d544372",
    "raw": "42b22a2ab0a0905a",
    "canonical": "6003aeda21384e7c"
   },
   {
    "node": "tests/datasets/test_rulebert.py::test_per_config_tnorm_confidence[geomean-hybrid2-query1]",
    "kind": "sld",
-   "in": "1dbcf678e4e4148a",
+   "in": "dd3271b4c819d546",
    "raw": "a4f2575391740389",
    "canonical": "5b2f4c9391c51e81"
   },
   {
    "node": "tests/datasets/test_science_qa_grounder.py::test_prove_triples[queries1-True]",
    "kind": "sld",
-   "in": "8c812ef5a0529887",
+   "in": "9ebf6135bc71831a",
    "raw": "788139aa6958d94d",
    "canonical": "2690558f05a51a90"
   },
   {
    "node": "tests/datasets/test_science_qa_grounder.py::test_prove_triples[queries2-True]",
    "kind": "sld",
-   "in": "09fdd9c21d634d9c",
+   "in": "f6f9e79c96ef2f46",
    "raw": "61efcb3dbe66fa1c",
    "canonical": "10f41159d9f91704"
   },
   {
    "node": "tests/datasets/test_science_qa_grounder.py::test_prove_triples[queries3-False]",
    "kind": "sld",
-   "in": "30ee2480088fea3e",
+   "in": "30d4af0b98acd7ac",
    "raw": "696b1163be8c41a2",
    "canonical": "10f41159d9f91704"
   },
   {
    "node": "tests/prover/test_grounder_parity.py::TestFactMatching::test_missing_fact",
    "kind": "sld",
-   "in": "89c2cc1bedd5f572",
+   "in": "299d2e47d70702a1",
    "raw": "633969d4ebdd3174",
    "canonical": "c42df395717bb552"
   },
   {
    "node": "tests/prover/test_grounder_parity.py::TestRuleApplication::test_two_hop_rule",
    "kind": "sld",
-   "in": "2f6c37eab48fb798",
+   "in": "6d177ea769d90629",
    "raw": "81f8a0c4c68696ec",
    "canonical": "c4a3c18c98dbc82d"
   },
   {
    "node": "tests/prover/test_grounder_parity.py::TestRuleApplication::test_shares_currency_rule",
    "kind": "sld",
-   "in": "693904c9ebbf933c",
+   "in": "dddde58000c28750",
    "raw": "0124043de6e2c50b",
    "canonical": "f9438d737dbaed62"
   },
   {
    "node": "tests/prover/test_grounder_parity.py::TestRuleApplication::test_no_shared_currency",
    "kind": "sld",
-   "in": "1b684358afa0b278",
+   "in": "683e6698cd865a1c",
    "raw": "76e5631ddfcab70a",
    "canonical": "c42df395717bb552"
   },
   {
    "node": "tests/prover/test_grounder_parity.py::TestDepthLimit::test_recursive_rule_terminates",
    "kind": "sld",
-   "in": "f6c90e4d84de56b9",
+   "in": "09031e24a754d9ac",
    "raw": "c6a577ac2d949138",
    "canonical": "10f41159d9f91704"
   },
   {
    "node": "tests/prover/test_grounder_parity.py::TestCycleDetection::test_no_loop_on_pure_cycle",
    "kind": "sld",
-   "in": "9de920250284228c",
+   "in": "69003670d223f6d4",
    "raw": "3cd4882322b1726d",
    "canonical": "c42df395717bb552"
   },
   {
    "node": "tests/prover/test_grounder_parity.py::TestMultiHopChain::test_ancestor_one_hop",
    "kind": "sld",
-   "in": "49556f9e9cf5eeb3",
+   "in": "d2c2b5e0f541b06c",
    "raw": "e91705c2dc6cb784",
    "canonical": "3806879a74596ce9"
   },
   {
    "node": "tests/prover/test_grounder_parity.py::TestMultiHopChain::test_ancestor_two_hop",
    "kind": "sld",
-   "in": "1b21bae67dba5bbc",
+   "in": "e95d8940c6b23fa9",
    "raw": "e33d7a534eb58056",
    "canonical": "83796cdd30b698a9"
   },
   {
    "node": "tests/prover/test_grounder_parity.py::TestMultiHopChain::test_ancestor_three_hop",
    "kind": "sld",
-   "in": "e739e0364861764f",
+   "in": "2c3b06abc6975a2c",
    "raw": "68a3d87d59835e2f",
    "canonical": "723250eb9129517f"
   },

@@ -1,11 +1,13 @@
 """probfol-llm's forward-chaining and SLD calls into the grounder: record them on main, check a branch against them.
 
-    python tests/probfol_record.py record                     # on main (no shim): the reference
-    PYTHONPATH=~/tmp/gshim python tests/probfol_record.py     # check the grounder on the path against it
+    python tests/probfol_record.py           # check the grounder on the path against the recording
+    python tests/probfol_record.py record    # record a new reference (after an intended change)
+    python tests/probfol_record.py rekey     # key the recorded SLD calls by the SLD's inputs (the recording was
+                                             # taken through the former grounder's backward shell)
 
 Runs probfol-llm's own test suite in process, then ``GrounderExact`` on Industrial IoT (the staged join: rules of 3 to
 8 body atoms, constants) and on MetaQA (spmm, 3-body chains), with the grounder's entry points wrapped: forward
-chaining (``run_forward_chaining``) and SLD (the backward grounder's ``ground``). Each call is keyed by a digest of
+chaining (``run_forward_chaining``) and SLD (``SLD.prove``). Each call is keyed by a digest of
 its inputs (facts, rules, sizes, depth, queries) and recorded by a digest of its outputs, raw (the tensors probfol
 reads, as laid out) and canonical (forward chaining: the derived atoms, sorted; SLD: each query's valid proofs, sorted).
 Check mode requires every recorded call to recur with the same outputs, and probfol's tests to pass as they did.
@@ -62,11 +64,12 @@ class Recorder:
                            "canonical": _digest(*canonical)})
         self.tensors.append({"node": self.node, "kind": kind, "inputs": inputs, "raw": raw})
 
-    # ── the grounder's entry points as probfol calls them (the grounder at main's API) ──
+    # ── the grounder's entry points as probfol calls them ──
     def install(self) -> None:
+        import grounder.forward as forward
         import grounder.forward.router as router
-        from grounder.api.backward import BackwardGrounder
-        rec, run_fc, ground = self, router.run_forward_chaining, BackwardGrounder.ground
+        from grounder.sld import SLD
+        rec, run_fc, prove = self, router.run_forward_chaining, SLD.prove
 
         def run_forward_chaining(compiled_rules, facts_idx, num_entities, num_predicates, depth=10, device="cpu",
                                  **kw):
@@ -80,25 +83,52 @@ class Recorder:
                     (keys, n), (atoms[torch.argsort(atoms[:, 0] * E * E + atoms[:, 1] * E + atoms[:, 2])],))
             return out
 
-        def ground_(self_, request):
-            out = ground(self_, request)
-            kb, t = self_.kb, out.completed_tree_firings
-            if t is not None:
-                cfg = self_._build["config"]
-                proofs = []
-                for b in range(t.body.shape[0]):     # each query's valid proofs, as sorted tuples
-                    v = t.grounding_valid[b]
-                    proofs.append(sorted(zip(t.rule_idx[b][v].tolist(), t.head[b][v].tolist(),
-                                             t.body[b][v].tolist(), t.body_count[b][v].tolist())))
-                rec.add("sld", (kb.fact_index.facts_idx, kb.rules_heads_idx, kb.rules_bodies_idx, kb.rule_lens,
-                                kb.constant_no, kb.predicate_no, kb.padding_idx, repr(cfg), request.queries,
-                                request.query_mask),
-                        (t.body, t.grounding_valid, t.count, t.rule_idx, t.body_count, t.head, t.shapes.D),
-                        (repr(proofs), t.shapes.D))
-            return out
+        def prove_(self_, queries, mask=None, excluded=None):
+            p = prove(self_, queries, mask, excluded)
+            proofs = []
+            for b in range(p.body.shape[0]):           # each query's valid proofs, as sorted tuples
+                v = p.mask[b]
+                proofs.append(sorted(zip(p.rule[b][v].tolist(), p.head[b][v].tolist(), p.body[b][v].tolist(),
+                                         p.count[b][v].tolist())))
+            rec.add("sld", _sld_inputs(self_, queries, mask),
+                    (p.body, p.mask, p.mask.sum(1), p.rule, p.count, p.head, self_.depth),
+                    (repr(proofs), self_.depth))
+            return p
 
-        router.run_forward_chaining = run_forward_chaining
-        BackwardGrounder.ground = ground_
+        router.run_forward_chaining = forward.run_forward_chaining = run_forward_chaining
+        SLD.prove = prove_
+
+
+def _sld_inputs(sld, queries, mask) -> tuple:
+    """An SLD call's inputs: its program, sizes and queries."""
+    kb = sld.kb
+    return (kb.facts.atoms, kb.rules.heads, kb.rules.bodies, kb.rules.lens, kb.E, kb.pad, sld.depth, sld.prune,
+            sld.drop_facts, sld.S, sld.P, sld.L, sld.max_children, queries, mask)
+
+
+def rekey() -> None:
+    """The recorded SLD calls (made through the former grounder's backward shell) keyed by ``_sld_inputs`` of the
+    SLD probfol-llm now builds from the same tensors: ``KB(facts, rules, E=constant_no + 1, pad)``, the depth,
+    prune, proofs and atoms of the recorded config."""
+    import re
+    from grounder.kb import KB
+    from grounder.sld import SLD
+    ref = json.loads(REFERENCE.read_text())
+    tensors = torch.load(TENSORS, weights_only=False)
+    calls = [c for c in ref["calls"]]
+    for c, t in zip(calls, tensors):
+        if c["kind"] != "sld":
+            continue
+        facts, heads, bodies, lens, cno, _pno, pad, cfg, q, m = t["inputs"]
+        L = re.search(r"max_atoms=(\d+|None)", cfg)[1]
+        prune = re.search(r"filter='?(\w+)'?", cfg)[1]
+        sld = SLD(KB(facts, heads, bodies, lens, E=cno + 1, pad=pad), depth=int(re.search(r"SLD\(depth=(\d+)", cfg)[1]),
+                  prune="fp_batch" if prune == "fp_batch" else None,
+                  max_proofs=int(re.search(r"max_groundings_per_query=(\d+)", cfg)[1]),
+                  max_atoms=None if L == "None" else int(L))
+        c["in"] = _digest(*_sld_inputs(sld, q, m))
+    REFERENCE.write_text(json.dumps(ref, indent=1) + "\n")
+    print(f"rekeyed {sum(c['kind'] == 'sld' for c in calls)} SLD calls in {REFERENCE}")
 
 
 def run(rec: Recorder) -> dict:
@@ -128,6 +158,9 @@ def run(rec: Recorder) -> dict:
 
 
 def main() -> int:
+    if sys.argv[1:] == ["rekey"]:
+        rekey()
+        return 0
     record = sys.argv[1:] == ["record"]
     import grounder
     print(f"grounder: {Path(grounder.__file__).parent}")
