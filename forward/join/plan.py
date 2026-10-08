@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import List
 
-from grounder.data.rule_index import RulePattern
+from grounder.kb import RulePattern
 
 
 def _compute_join_order(bps, m: int) -> List[int]:

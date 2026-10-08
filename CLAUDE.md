@@ -60,8 +60,6 @@ Family: the paper uses the 47 hand-curated rules — `rules.txt` in data-swarm (
 - `api/rule_grounder.py`: the adapter torch-ns calls (`create_grounder`, `RuleGrounder`)
 - `docs/`: `design.md`
 - `tests/`: unit and regression tests
-- Still present, to be deleted once consumers move: the old general engine (`backward/`, `resolution/`,
-  `execution/`, `filters/`, `data/`, `base/`, `core.py`, `vocab/`)
 
 ## Running Experiments
 
@@ -90,7 +88,9 @@ tests/
 ├── test_keras_filter.py     the keras prune (keras-ns's BC_{w,d}): its cycle rule, one-body rules, walk rounds
 ├── test_rule_grounder.py    the torch-ns adapter (create_grounder, RuleGrounder)
 ├── test_sld.py              SLD's derive / prove on toy KBs
-├── counts.py                optional: grounding counts on real KGs against baselines/grounding_counts.json
+├── test_forward.py          Forward.ground's witnesses on a toy KB
+├── gate.py                  the gate: counts.py's and fc_fingerprint.py's cells exact, a speed ratchet (baselines/gate.json)
+├── counts.py                grounding counts on real KGs against baselines/grounding_counts.json
 ├── probfol_record.py        optional: probfol-llm's SLD / FC calls against their recorded outputs
 ├── fc_fingerprint.py        optional: forward chaining's closures against baselines
 └── guided_ab.py             older guided harness (imports the old engine)
@@ -98,11 +98,11 @@ tests/
 
 ```bash
 python -m pytest tests/ -q          # the suite (GPU: PBC's kernels are Triton)
-python tests/counts.py              # optional, < 90 s: Family / WN18RR / Countries S3 test queries (and a Family
-                                    # train slice) x fp_batch and keras grounders at depths 1-3, in batches of 256:
-                                    # each step's goals, the kept firings, atoms, firings per rule and an output
-                                    # hash exactly
-python tests/counts.py --update     # re-record after an intended change of what is grounded
+python tests/gate.py                # the gate, < 90 s: counts.py's cells (Family / WN18RR / Countries S3 x fp_batch
+                                    # and keras at depths 1-3: each step's goals, the kept firings, atoms, firings per
+                                    # rule, an output hash) and fc_fingerprint.py's closures exactly; a speed ratchet
+python tests/gate.py --update       # record the times after an intended speed change
+python tests/counts.py --update     # re-record the counts after an intended change of what is grounded
 ```
 
 Run `tests/counts.py` whenever grounding semantics, the prunes, PBC's engine or dataset loading may have changed; an
@@ -188,12 +188,11 @@ Public API aliases (for backward compatibility with experiments/model.py):
 - Keep mirrored grounder copies synchronized when the intent is shared behavior across repos.
 - Do not leave scratch artifacts inside package directories.
 - Prefer the smallest coherent change that keeps one owner per responsibility; avoid scattering one feature across multiple modules.
-- torch-kge-kernels is a sibling repo at `~/repos/torch-kge-kernels-swarm/main/`, installed as pip-editable. Edit it there, commit there, push there. The SHA pin in this repo's `pyproject.toml` must be bumped whenever the editable HEAD moves — the pre-commit hook (`scripts/check_editable_pins.py`, wired via `.pre-commit-config.yaml`) refuses commits when the pin and the editable HEAD disagree or when the editable HEAD is unpushed. Setup once with `conda activate gpu && pre-commit install`. Bypass only with `SKIP=check-editable-pins git commit ...` for genuinely unrelated commits during an in-flight cascade.
 
 ## Verification Checklist
 
 - any code change: `python -m pytest tests/ -q`.
-- grounding semantics, the prunes or PBC's engine changed: `python tests/counts.py` (exact counts and hashes).
+- grounding semantics, the prunes, PBC's engine or forward chaining changed: `python tests/gate.py` (exact counts,
+  hashes and closures; a speed ratchet: `--update` after an intended speed change).
 - before commit: both, then torch-ns's gate (`python tests/gate.py` there: a Family BC12 run end to end).
 - mirrored change intended: sync the other grounder copy or checkout and rerun its relevant tests
-- before any commit: the `check-editable-pins` pre-commit hook runs automatically (if installed) and blocks the commit if the `torch-kge-kernels` SHA pin in `pyproject.toml` has drifted from the editable install or points at an unpushed HEAD. To run it manually: `python scripts/check_editable_pins.py`.

@@ -1,4 +1,4 @@
-"""The backward grounder shell (``BackwardGrounder``), until PBC and SLD replace it."""
-from grounder.api.backward import BackwardGrounder
+"""torch-ns's entry point: ``create_grounder`` and ``RuleGrounder`` (``rule_grounder``)."""
+from grounder.api.rule_grounder import RuleGrounder, RuleGroundings, TensorFactIndex, create_grounder
 
-__all__ = ["BackwardGrounder"]
+__all__ = ["RuleGrounder", "RuleGroundings", "TensorFactIndex", "create_grounder"]

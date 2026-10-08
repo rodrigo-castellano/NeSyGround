@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
@@ -15,10 +16,32 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from grounder.base.types import RuleGroundings
 from grounder.forward import Forward
 from grounder.kb import KB
 from grounder.pbc import PBC
+
+
+@dataclass(frozen=True)
+class RuleGroundings:
+    """One pool's groundings in the layout torch-ns reads: the atom table, and per grounding its rule, head and body
+    rows (``body_atom_valid``: the real body slots), sorted by rule (``rule_offsets [R + 1]``); ``query_pool_idx``: the
+    pool's queries' rows."""
+    atom_table: Tensor              # [A, 3]
+    body_pool_idx: Tensor           # [N, M]
+    body_atom_valid: Tensor         # [N, M]
+    head_pool_idx: Tensor           # [N]
+    rule_idx: Tensor                # [N], ascending
+    rule_offsets: Tensor            # [R + 1]
+    num_atoms: int
+    num_rules: int
+    M_max: int
+    query_pool_idx: Optional[Tensor] = None   # [Q]
+    firing_valid: Optional[Tensor] = None     # [N], every grounding (none is masked)
+
+    def __post_init__(self) -> None:
+        if self.firing_valid is None:
+            object.__setattr__(self, "firing_valid", torch.ones(self.head_pool_idx.shape[0], dtype=torch.bool,
+                                                                device=self.head_pool_idx.device))
 
 
 class TensorFactIndex(nn.Module):
@@ -92,4 +115,4 @@ def create_grounder(grounder_type: str, *, fact_index: TensorFactIndex, rules, k
     return RuleGrounder(grounder_type, fact_index, rules, kb, device)
 
 
-__all__ = ["TensorFactIndex", "RuleGrounder", "create_grounder"]
+__all__ = ["TensorFactIndex", "RuleGrounder", "RuleGroundings", "create_grounder"]

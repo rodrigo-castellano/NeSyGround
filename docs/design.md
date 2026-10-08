@@ -212,13 +212,14 @@ The spmm engine (semi-naive, hybrid with full re-evaluation) when every rule has
 
 ```
 grounder/
-├── __init__.py      KB, PBC, SLD, Forward, Guide, Groundings, Proofs, Closure, errors
-├── types.py         Groundings, Proofs, Closure, Guide, Scorer, GroundingMemoryError, ConfigError
-├── ops.py           key/decode, AtomSet, unique, compact, fixpoint, canonical
-├── kb.py            KB, Facts, Rules, RulePattern, variants, parsing
-├── pbc/             PBC, parse; kernels.py, step.py, prune.py (fp_batch, keras), guide.py, sizing.py
-├── sld/             SLD; resolve.py (unify, substitute, rename apart), state.py (pack, drop facts, compact, trail)
-└── forward/         Forward; spmm/, join/
+├── __init__.py      KB, PBC, SLD, Forward, Guide, Groundings, Proofs, Closure
+├── types.py         Groundings, Proofs, Closure
+├── ops.py           key / decode, unique rows, groups, canonical, concat
+├── kb.py            KB, Facts, Rules, RulePattern, anchor variants, parsing
+├── pbc/             PBC, parse; tables.py, kernels.py (Triton), engine.py (steps, prunes), guide.py, sizing.py
+├── sld/             SLD; resolve.py (unify, substitute, lookups), state.py (pack, drop facts, compact, rename, trail)
+├── forward/         Forward (closure, ground); witness.py; spmm/, join/, router.py
+└── api/             rule_grounder.py: torch-ns's create_grounder / RuleGrounder / RuleGroundings
 ```
 
 ## Verification
