@@ -25,7 +25,6 @@ import torch
 from torch import Tensor
 
 from grounder.ops import canonical, concat, decode, groups, key
-from grounder.pbc.guide import select
 from grounder.pbc.kernels import HashSet, expand, last_stage, live_atoms
 from grounder.types import Groundings
 
@@ -295,7 +294,7 @@ def _keras_closure(g, facts: FactTable, stored: List[tuple], streamed: List[tupl
 
 
 def _keras_steps(g, facts: FactTable, k: Tensor, base: int, depth: int, stats: Optional[list]):
-    """``_ground_steps`` with keras (width <= 1, no guide): each step's goals, the unknown atoms of the last step's
+    """``_ground_steps`` with keras (width <= 1): each step's goals, the unknown atoms of the last step's
     groundings, found a chunk at a time; a step writing at most ``KERAS_STORE_ROWS`` groundings keeps them, a larger one
     only those the keras filter can keep (``_keras_closure``), so it never sits in memory whole. So does the last step
     unless it has fewer than ``KERAS_CLOSURE_MIN_ROWS`` candidate rows: what it drops would be most of what the proof
@@ -351,7 +350,7 @@ def _ground_steps(g, facts: FactTable, goals: Tensor, pool: Tensor, base: int, d
     """Every step's kept groundings of the queries ``goals`` (of ``pool``): ``(rule [T], head [T, 3],
     body [T, M, 3], pool [T])``, possibly repeated; each step's (depth, goals, kept groundings) appended to ``stats``."""
     k = key(goals, base, pool)
-    if g.prune == "keras" and g.width <= 1 and depth >= 2 and g.guide is None:
+    if g.prune == "keras" and g.width <= 1 and depth >= 2:
         return _keras_steps(g, facts, k, base, depth, stats)
     rules, heads_, bodies, pools = [], [], [], []
     prior = []                                          # each step's goals
@@ -365,18 +364,7 @@ def _ground_steps(g, facts: FactTable, goals: Tensor, pool: Tensor, base: int, d
         width = g.last_width if last else g.width
         hpm = None if last and g.prune != "keras" else g.tables.heads
         admit = _provable(g, facts, p, torch.cat(prior), base) if d == depth - 2 and g.prune == "fp_batch" else None
-        if last and d > 0 and g.prune == "keras" and g.width <= 1:    # (the guide's: its selections are stored)
-            (r, n, b), = _keras_closure(g, facts, list(zip(heads_, bodies, pools)),
-                                        [(atoms, p, width, hpm, _cached(g, facts, atoms, width, hpm))], base)
-            nxt = None
-        else:
-            r, n, b, nxt = _step(g, facts, atoms, width, hpm, not last, admit=admit)
-        if g.guide is not None and r.numel():            # the guide's selection, then the next goals of what it kept
-            fact = facts.facts.contains(b)
-            keep = select(g.guide, fact, r, n, b, p[n], d, g.kb.pad)
-            r, n, b, fact = r[keep], n[keep], b[keep], fact[keep]
-            if nxt is not None:
-                nxt = torch.nonzero((b[..., 0] != g.kb.pad) & ~fact, as_tuple=True)
+        r, n, b, nxt = _step(g, facts, atoms, width, hpm, not last, admit=admit)
         if stats is not None:
             stats.append((d, int(atoms.shape[0]), int(r.shape[0])))
         rules.append(r)

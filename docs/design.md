@@ -91,14 +91,13 @@ class PBC(Grounder):
     def __init__(self, kb, *, depth, width=1, last_width=0,
                  prune="fp_batch",     # "fp_batch" | "keras" | None
                  rounds=None,          # keras proof-walk rounds (.r<N>)
-                 bind="facts",         # "facts" | "all" (IJCAI's Full grounder) | a Guide (scored)
-                 guide=None)           # select: top k groundings per goal
+                 bind="facts")         # "facts" | "all" (IJCAI's Full grounder)
     sizing: Sizing                     # worst case per goal and step, bytes per slot, goals per call
     @classmethod
     def parse(cls, kb, type: str)      # "enum.keras.w1.d2.r2.flat" -> PBC(...)
 
 class SLD(Grounder):
-    def __init__(self, kb, *, depth, prune="fp_batch", drop_facts=True, bind=None, guide=None,
+    def __init__(self, kb, *, depth, prune="fp_batch", drop_facts=True,
                  max_states=256, max_children=550, max_proofs=64)
     def derive(self, states, next_var, excluded=None) -> (children, counts, next_var, rule)   # one step
     def prove(self, queries) -> Proofs
@@ -125,30 +124,6 @@ The one operation every engine shares. A free variable ranges over:
 |---|---|---|
 | `facts` | what a fact lookup returns (hard unification against the facts) | PBC's lookup; SLD's fact resolution |
 | `all` | every entity | IJCAI's Full grounder |
-| scored, `Guide(k)` | the top k entities by a model's score over all entities | soft unification (k = 1), learned grounding |
-
-## The model seam
-
-```python
-class Scorer(Protocol):                          # lives with the model (torch-ns, torch-kge, LOGIC2RL-KGE)
-    def score(self, atoms: Tensor) -> Tensor: ...                       # [N, 3] -> [N] in (0, 1]
-    def score_all(self, pred, arg, side) -> Tensor: ...                 # [N] -> [N, E]: one argument free
-
-@dataclass(frozen=True)
-class Guide:
-    scorer: Scorer
-    k: int | Tensor              # per group, or per query ([Q]: learned budgets)
-    tnorm: str = "min"           # a candidate's score over its unknown atoms: min | product
-    tau: float | None = None     # Gumbel top-k: Plackett-Luce sampling (training)
-    capture: list | None = None  # each decision's atoms, scores and kept mask (REINFORCE)
-```
-
-Applied at named points: **select** keeps the top k candidates per group, all-fact candidates always kept (PBC: a goal's
-groundings after `test`, and after each free variable when V ≥ 2; SLD: a state's children after `resolve`); **fill**
-binds free variables to their top k entities by `score_all` (PBC's `bind=Guide`; SLD's open rule children: soft
-unification). Replaces the old nesy hooks and the guided beam's setters; the models live in their own repositories.
-The per-goal beam replaces the old per-proof-state beam (PBC has no states): same properties (a subset of exhaustive;
-k = ∞ is exhaustive; monotone in depth), different outputs than the old engine's beam.
 
 ## Shared operations (`ops.py`)
 
@@ -184,7 +159,6 @@ the keras walk, sizing (PBC); the matrix ops and joins (Forward).
   rule concludes). It states what no call can exceed; the measured distribution states what calls of a protocol need.
 - **Calls** are split across pools, never within one (the prune is per pool). A pool that does not fit runs out of
   memory: the caller splits its calls, not a pool.
-- With a `Guide(k)`, a goal's successors are bounded by k × width.
 
 ## SLD
 
@@ -212,11 +186,11 @@ The spmm engine (semi-naive, hybrid with full re-evaluation) when every rule has
 
 ```
 grounder/
-├── __init__.py      KB, PBC, SLD, Forward, Guide, Groundings, Proofs, Closure
+├── __init__.py      KB, PBC, SLD, Forward, Groundings, Proofs, Closure
 ├── types.py         Groundings, Proofs, Closure
 ├── ops.py           key / decode, unique rows, groups, canonical, concat
 ├── kb.py            KB, Facts, Rules, RulePattern, anchor variants, parsing
-├── pbc/             PBC, parse; tables.py, kernels.py (Triton), engine.py (steps, prunes), guide.py, sizing.py
+├── pbc/             PBC, parse; tables.py, kernels.py (Triton), engine.py (steps, prunes), sizing.py
 ├── sld/             SLD; resolve.py (unify, substitute, lookups), state.py (pack, drop facts, compact, rename, trail)
 ├── forward/         Forward (closure, ground); witness.py; spmm/, join/, router.py
 └── api/             rule_grounder.py: torch-ns's create_grounder / RuleGrounder / RuleGroundings

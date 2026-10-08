@@ -11,7 +11,7 @@ full, a step's memory is bounded by streaming its work, and what does not fit ru
 | `Forward` | semi-naive forward chaining; `ground`: each derived atom's witness | `Closure`, `Groundings` |
 
 ```python
-from grounder import KB, PBC, SLD, Forward, Guide
+from grounder import KB, PBC, SLD, Forward
 
 kb = KB.from_strings(facts, rules, entity2id, relation2id, device="cuda")   # facts [F, 3]; rules as parsed
 
@@ -20,7 +20,6 @@ g = PBC.parse(kb, "enum.keras.w1.d2.flat")                          # torch-ns's
 proofs = SLD(kb, depth=3).prove(queries, mask)                      # [Q, 3] -> each query's proofs
 closure = Forward(kb, depth=10).closure()                           # the derived atoms
 witnessed = Forward(kb).ground(queries)                             # a derived query's first grounding
-guided = PBC(kb, depth=3, width=1, guide=Guide(scorer, k=4))        # a model keeps k groundings per goal
 ```
 
 `Groundings` holds each pool's atoms and its groundings (rule, head row, body rows), sorted and distinct; a pool is

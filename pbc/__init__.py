@@ -22,7 +22,6 @@ import torch.nn as nn
 from torch import Tensor
 
 from grounder.pbc import engine
-from grounder.pbc.guide import Guide, Scorer
 from grounder.pbc.tables import Tables
 from grounder.types import Groundings
 
@@ -31,13 +30,10 @@ class PBC(nn.Module):
     """BC_{w,d} over ``kb`` (see the module docstring): ``depth`` steps of ``width`` (``last_width`` at the last:
     default 0, keras ``width``), ``prune`` ``"fp_batch"`` | ``"keras"`` | None, ``rounds`` keras-ns's proof-walk rounds
     (default ``depth - 1``; the later keras-ns of XAI-25 / NeSy-25 walks ``depth``); ``bind`` ``"facts"`` (a free
-    variable ranges over what a fact lookup returns) | ``"all"`` (over every entity: IJCAI-25's Full grounder);
-    ``guide``: a ``Guide`` keeps, per goal and step, the all-fact groundings and the ``k`` best others by a model's
-    scores."""
+    variable ranges over what a fact lookup returns) | ``"all"`` (over every entity: IJCAI-25's Full grounder)."""
 
     def __init__(self, kb, *, depth: int, width: int = 1, last_width: Optional[int] = None,
-                 prune: Optional[str] = "fp_batch", rounds: Optional[int] = None, bind: str = "facts",
-                 guide: Optional[Guide] = None) -> None:
+                 prune: Optional[str] = "fp_batch", rounds: Optional[int] = None, bind: str = "facts") -> None:
         super().__init__()
         if depth < 1:
             raise ValueError(f"depth must be >= 1, got {depth}")
@@ -61,7 +57,7 @@ class PBC(nn.Module):
                 raise NotImplementedError("the keras prune: a rule with more than one body atom has one whose "
                                           "arguments are all head variables")
         self.kb, self.depth, self.width, self.last_width = kb, depth, width, last_width
-        self.prune, self.rounds, self.bind, self.guide = prune, rounds, bind, guide
+        self.prune, self.rounds, self.bind = prune, rounds, bind
         self.tables = Tables(kb)
         # the body atoms a lookup draws from the facts are facts, never tested — unless every entity is drawn
         self.enumerated = self.tables.enumerated if bind == "facts" else torch.zeros_like(self.tables.enumerated)
@@ -111,4 +107,4 @@ class PBC(nn.Module):
                 + ")")
 
 
-__all__ = ["PBC", "Guide", "Scorer"]
+__all__ = ["PBC"]

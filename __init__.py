@@ -10,8 +10,8 @@ See README.md and docs/design.md.
 """
 from grounder.forward import Forward
 from grounder.kb import KB
-from grounder.pbc import PBC, Guide
+from grounder.pbc import PBC
 from grounder.sld import SLD
 from grounder.types import Closure, Groundings, Proofs
 
-__all__ = ["KB", "PBC", "SLD", "Forward", "Guide", "Groundings", "Proofs", "Closure"]
+__all__ = ["KB", "PBC", "SLD", "Forward", "Groundings", "Proofs", "Closure"]

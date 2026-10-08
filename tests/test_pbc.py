@@ -1,4 +1,4 @@
-"""PBC on Countries S3 and Family: the Full grounder and the guide, by their properties (GPU)."""
+"""PBC on Countries S3 and Family: the Full grounder and chunked steps, by their properties (GPU)."""
 from __future__ import annotations
 
 import os
@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from grounder.kb import KB, parse_rules, parse_triples
-from grounder.pbc import PBC, Guide
+from grounder.pbc import PBC
 
 DATA = Path(os.environ.get("DATA_ROOT", Path.home() / "repos/data-swarm/main"))
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="PBC's kernels need the GPU")
@@ -32,12 +32,6 @@ def _rows(g):
     return set(map(tuple, t.tolist()))
 
 
-class _Score:
-    """A deterministic prior: an atom's score from its ids."""
-    def score(self, atoms):
-        return ((atoms * torch.tensor([7, 13, 31], device=atoms.device)).sum(1) % 97 + 1).float() / 98
-
-
 @pytest.mark.parametrize("name", ["countries_s3", "family"])
 def test_full_contains_facts_and_equals_them_at_width_0(name):
     kb, q = _kb(name)
@@ -48,20 +42,6 @@ def test_full_contains_facts_and_equals_them_at_width_0(name):
         assert facts <= full
         if width == 0:
             assert facts == full
-
-
-@pytest.mark.parametrize("name", ["countries_s3", "family"])
-def test_guide(name):
-    kb, q = _kb(name)
-    q = q[:128]
-    for prune in ("fp_batch", "keras"):
-        plain = _rows(PBC(kb, depth=3, width=1, prune=prune).ground(q))
-        assert _rows(PBC(kb, depth=3, width=1, prune=prune, guide=Guide(_Score(), k=10 ** 9)).ground(q)) == plain
-        capture = []
-        few = PBC(kb, depth=3, width=1, prune=prune, guide=Guide(_Score(), k=1, capture=capture)).ground(q)
-        assert _rows(few) <= plain and capture and all(bool((c["kept"] | ~c["exempt"]).all()) for c in capture)
-        again = PBC(kb, depth=3, width=1, prune=prune, guide=Guide(_Score(), k=1)).ground(q)
-        assert _rows(again) == _rows(few)                       # deterministic
 
 
 @pytest.mark.parametrize("name", ["countries_s3", "family"])

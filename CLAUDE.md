@@ -54,7 +54,7 @@ Family: the paper uses the 47 hand-curated rules — `rules.txt` in data-swarm (
 - `kb.py`: parsing, rule compilation (anchor variants), `Facts`, `Rules`, `KB`
 - `ops.py`, `types.py`: keys, decoding, grouping; `Groundings`, `Proofs`, `Closure`
 - `pbc/`: `PBC` — `tables.py` (per-variant tables), `kernels.py` (Triton: fact hash set, the fused last stage),
-  `engine.py` (the steps, streamed; the prunes; the canonical output), `guide.py` (`Guide`), `sizing.py` (worst case)
+  `engine.py` (the steps, streamed; the prunes; the canonical output), `sizing.py` (worst case)
 - `sld/`: `SLD` — `resolve.py` (unify, substitute, lookups), `state.py` (pack, compact, rename, trail, harvest)
 - `forward/`: `Forward` — `spmm/` (semi-naive sparse matmul), `join/` (staged join), `router.py`
 - `api/rule_grounder.py`: the adapter torch-ns calls (`create_grounder`, `RuleGrounder`)
@@ -83,7 +83,7 @@ its tests from this directory. Do not add training scripts here.
 
 ```
 tests/
-├── test_pbc.py              PBC on Countries S3 / Family: Full, the guide, chunked steps change nothing
+├── test_pbc.py              PBC on Countries S3 / Family: Full, chunked steps change nothing
 ├── test_pbc_oracle.py       PBC (fp_batch) against a brute-force reference on random KBs
 ├── test_keras_filter.py     the keras prune (keras-ns's BC_{w,d}): its cycle rule, one-body rules, walk rounds
 ├── test_rule_grounder.py    the torch-ns adapter (create_grounder, RuleGrounder)
@@ -92,8 +92,7 @@ tests/
 ├── gate.py                  the gate: counts.py's and fc_fingerprint.py's cells exact, a speed ratchet (baselines/gate.json)
 ├── counts.py                grounding counts on real KGs against baselines/grounding_counts.json
 ├── probfol_record.py        optional: probfol-llm's SLD / FC calls against their recorded outputs
-├── fc_fingerprint.py        optional: forward chaining's closures against baselines
-└── guided_ab.py             older guided harness (imports the old engine)
+└── fc_fingerprint.py        optional: forward chaining's closures against baselines
 ```
 
 ```bash
@@ -138,7 +137,6 @@ Placement rules:
 - parsing, rule compilation, fact and rule indexes: `kb.py`
 - shared tensor operations and output types: `ops.py`, `types.py`
 - a technique's steps, prunes and kernels: its package (`pbc/`, `sld/`, `forward/`)
-- models that guide grounding: outside this repo, through `pbc.Guide`'s `Scorer`
 
 ## Naming Convention
 
